@@ -164,6 +164,7 @@ src/refs.rs                golden-reference reader
 tools/dump_*.py            golden-reference writers (run against MLX)
 tools/epoch_schedule.py    how few barrier epochs a step's dependencies allow
 M5.md                      what changes on a GPU where nax_available() is true
+REBUILD.md                 rebuilding the artifact from its bf16 parent
 tools/gen_unicode.py       the Unicode tables the tokenizer needs
 refs/<case>/               the references themselves (not in git)
 tests/                     one test file per reference case
@@ -1284,7 +1285,20 @@ In order:
    - **Then bytes, which is the only lever left at batch 1.** That is the
      `fp_quantized` family in "Metal 4.1, fp8/fp4" above, and it is worth it
      only if MXFP4 holds quality where affine int4 did not.
-3. **The MTP stall**, which is now the only thing between speculative
+3. **Rebuild the artifact from its parent**, which is what unblocks the byte
+   lever above. `REBUILD.md` is the plan: the artifact records the recipe that
+   forged it, the parent is `ornith-ai/Ornith-1.5-35B-A3B@10fbf86f` and its
+   tensor inventory has been checked against that recipe remotely, and
+   `body_mode` is one word in the recipe -- mlx quantizes in `affine`,
+   `mxfp4`, `nvfp4` or `mxfp8`. The prize is the 260 modules held at 8 bits:
+   if a better 4-bit format holds quality where affine int4 did not, they drop
+   to 4 and take ~35% of a step's traffic with them.
+
+   Read Phase 0 before deleting anything. Every test here compares against MLX
+   on the same artifact, which validates the port and not the artifact, so a
+   bad rebuild passes the whole suite -- and the material for the only check
+   that would catch it exists only while the current artifact does.
+4. **The MTP stall**, which is now the only thing between speculative
    decoding and a wall-clock win. FR-Spec is done and `--mtp-depth 1
    --frspec` does 14% less GPU work a token than autoregression; what it
    does not do is convert that into tok/s, because the loop leaves the GPU
