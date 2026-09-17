@@ -1372,22 +1372,38 @@ bias` into fused multiply-adds, and what order `simd_sum` folds 32 lanes in.
 So the probe tries both contractions against three plausible trees --
 butterfly, halving, lane order -- six combinations in all.
 
-**All six reproduce the GPU on all 8192 rows, bit for bit.** Neither unknown
-has to be pinned, because the output is bfloat16 and its rounding absorbs the
-~1e-6 the orderings differ by. The probe also validates the layout reading as
-a side effect: a wrong transcription of the affine indexing would be wildly
-off, not exact.
+The activation and the expected output are MLX's own, out of
+`refs/quantized_matmul`, so this is the same `max_abs == 0.0` against MLX that
+every other test here makes rather than this port's GPU standing in for it.
+Three real matrices, 10496 rows:
 
-The margin is real but not generous. The worst row's spread between orderings
-is 2.0x the distance to a rounding tie, and 3 rows of 8192 -- 0.04% -- sit
-close enough that a different activation could land them on the other side.
-None did here. So this is not a proof, it is a strong measurement, and the
-thing that would catch a regression is the one already in place:
-`tests/quantized.rs` compares against MLX on real weights at `max_abs == 0.0`,
-and a CPU-split path would live or die by it.
+| | butterfly | halving | lane order |
+|---|---|---|---|
+| `in_proj_qkv`, 8192 x 2048 | **8192/8192** | 8191 without fma | 8191 with fma |
+| `out_proj`, 2048 x 4096 | 2048/2048 | 2048/2048 | 2048/2048 |
+| `gate`, 256 x 2048 | 256/256 | 256/256 | 256/256 |
 
-The probe's activation is synthetic, so the honest next check before any
-kernel is a real hidden state out of a decode step.
+**The butterfly fold reproduces MLX exactly on every row under either
+contraction** -- 10496 of 10496. The other two trees each miss one row, both in
+`in_proj_qkv`, by 1.2e-7 and 2.4e-4. So the fold is not free and has to be the
+butterfly, which is also what a `shuffle_xor` all-reduce would do; whether the
+compiler contracts into fused multiply-adds then does not matter, which leaves
+the faster NEON form available.
+
+It is worth noting what the synthetic version of this probe said first: all
+six orderings passed, at a worst spread-to-tie ratio of 2.0. On MLX's real
+activation the ratio is 14.0 and two orderings break. A made-up activation
+would have licensed the wrong conclusion here, which is the same lesson
+`dump_sampler.py` already carries about drawing from a peaked distribution.
+
+The probe also validates the layout reading as a side effect: a wrong
+transcription of the affine indexing would be wildly off, not exact.
+
+This is a strong measurement and not a proof -- one activation per matrix, and
+3 rows of 8192 sit close enough to a tie that another could land the other
+way. What would catch a regression is already in place: `tests/quantized.rs`
+compares against MLX on real weights at `max_abs == 0.0`, and a CPU-split path
+would live or die by it.
 
 So: the physics is measured and favourable, the arithmetic is plausible, and
 **the verification gate is open** -- what is left is the NEON kernel and the

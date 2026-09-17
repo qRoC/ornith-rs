@@ -18,15 +18,20 @@
 //!   2. what order `simd_sum` folds its 32 lanes in.
 //!
 //! So this tries every combination and reports which, if any, reproduces the
-//! GPU exactly. It is deliberately a straight transcription -- no NEON, no
-//! threads -- because the question is arithmetic, not throughput.
+//! reference exactly. It is deliberately a straight transcription -- no NEON,
+//! no threads -- because the question is arithmetic, not throughput.
+//!
+//! The activation and the expected output are MLX's own, out of
+//! `refs/quantized_matmul`, so the comparison is the same `max_abs == 0.0`
+//! against MLX that every other test in this port makes -- not against this
+//! port's GPU standing in for it.
 //!
 //! Run: `cargo run --release --bin cpu_row`
 
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
 use ornith_rs::ops::quantized::{QuantMatrix, quantized_matmul};
-use ornith_rs::refs::model_dir;
+use ornith_rs::refs::{RefCase, model_dir};
 use ornith_rs::weights::WeightStore;
 
 const ROWS_CHECKED: usize = 8192;
@@ -186,51 +191,65 @@ fn margin_to_tie(v: f32) -> f32 {
 
 fn main() {
     let ctx = Context::new().expect("metal");
+    let Some(case) = RefCase::open_or_skip("quantized_matmul") else { return };
     let dir = model_dir();
     if !dir.exists() {
         eprintln!("model not present");
         return;
     }
     let mut ws = WeightStore::open(&dir, &[]).expect("weights");
-    let qw: QuantMatrix = ws.quant_matrix(&ctx, "language_model.model.layers.0.linear_attn.in_proj_qkv");
-    assert_eq!(qw.bits, 8, "this probe is the 8-bit path");
-    assert_eq!(qw.group_size, 64);
+    for tag in ["in_proj_qkv", "out_proj", "gate"] {
+        probe(&ctx, &case, &mut ws, tag);
+    }
+}
+
+/// One reference matrix, every ordering, against MLX.
+fn probe(ctx: &Context, case: &RefCase, ws: &mut WeightStore, tag: &str) {
+    let path = case
+        .meta()
+        .and_then(|m| m.path(&format!("{tag}.path")))
+        .and_then(|v| v.as_str())
+        .expect("path in the reference meta")
+        .to_string();
+    let qw: QuantMatrix = ws.quant_matrix(ctx, &path);
+    if qw.bits != 8 || qw.group_size != 64 {
+        println!("{tag}: {}-bit group {}, not this probe's path\n", qw.bits, qw.group_size);
+        return;
+    }
     let k = qw.in_dims();
     let n = qw.out_dims();
     assert_eq!(k % 256, 0, "the block loop wants a multiple of 256");
-    println!("in_proj_qkv: {n} rows of {k}, 8-bit group 64");
 
-    // A real-looking activation: the kernel's arithmetic is what is on trial,
-    // so the values have to exercise the rounding rather than be tidy.
-    let xs: Vec<u16> = (0..k)
-        .map(|i| {
-            let v = ((i as f32 * 0.7391).sin() * 1.37 + 0.11) as f32;
-            f32_to_bf16(v)
-        })
-        .collect();
-    let x = Array::from_slice(&ctx, &xs, &[1, k], Dtype::BF16);
-    let y = quantized_matmul(&ctx, &x, &qw);
+    // MLX's own activation and MLX's own answer for it.
+    let x = case.array(ctx, &format!("{tag}_x_m1"));
+    let want = case.f32(&format!("{tag}_y_m1"));
+    assert_eq!(want.len(), n);
+    let gpu_y = quantized_matmul(ctx, &x, &qw);
     ctx.sync();
+    println!("{tag}: {n} rows of {k}, 8-bit group 64 -- MLX's activation and answer");
 
-    let gpu = unsafe { y.buf.as_slice::<u16>(y.offset, n) }.to_vec();
+    let xs = unsafe { x.buf.as_slice::<u16>(x.offset, k) }.to_vec();
+    let gpu = unsafe { gpu_y.buf.as_slice::<u16>(gpu_y.offset, n) }.to_vec();
     let wb = unsafe { qw.w.buf.as_slice::<u8>(qw.w.offset, n * k) };
     let sc = unsafe { qw.scales.buf.as_slice::<u16>(qw.scales.offset, n * k / 64) };
     let bi = unsafe { qw.biases.buf.as_slice::<u16>(qw.biases.offset, n * k / 64) };
 
+    let gpu_vs_mlx = (0..n).filter(|&r| bf16_to_f32(gpu[r]) == want[r]).count();
+    println!("  this port's GPU against MLX: {gpu_vs_mlx}/{n} exact");
+
     let checked = ROWS_CHECKED.min(n);
-    println!("\nchecking {checked} rows against the GPU:");
-    println!("  {:>5}  {:>11}  {:>8}  {}", "fma", "simd_sum", "exact", "worst row");
+    println!("\nthe CPU against MLX, {checked} rows:");
+    println!("  {:>5}  {:>11}  {:>11}  {}", "fma", "simd_sum", "exact", "worst row");
     for fma in [true, false] {
         for tree in [Tree::Butterfly, Tree::Halving, Tree::Sequential] {
             let mut exact = 0usize;
             let mut worst = 0.0f32;
             for r in 0..checked {
-                let got = row(wb, sc, bi, &xs, k, r, fma, tree);
-                if got == gpu[r] {
+                let got = bf16_to_f32(row(wb, sc, bi, &xs, k, r, fma, tree));
+                if got == want[r] {
                     exact += 1;
                 } else {
-                    let d = (bf16_to_f32(got) - bf16_to_f32(gpu[r])).abs();
-                    worst = worst.max(d);
+                    worst = worst.max((got - want[r]).abs());
                 }
             }
             let name = match tree {
@@ -239,16 +258,12 @@ fn main() {
                 Tree::Sequential => "sequential",
             };
             println!(
-                "  {:>5}  {name:>11}  {exact:>4}/{checked:<3}  {worst:.3e}",
+                "  {:>5}  {name:>11}  {exact:>5}/{checked:<5}  {worst:.3e}",
                 if fma { "yes" } else { "no" }
             );
         }
     }
 
-    // How much room there actually is. If the spread between orderings is far
-    // below the distance to a rounding tie, the bfloat16 output absorbs the
-    // difference and neither unknown has to be pinned; if they are the same
-    // size, some rows would flip on other inputs and it does.
     let mut worst_spread = 0.0f32;
     let mut worst_ratio = 0.0f32;
     let mut at_risk = 0usize;
