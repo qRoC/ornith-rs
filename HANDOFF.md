@@ -79,7 +79,7 @@ src/main.rs                the console chat
 src/refs.rs                golden-reference reader
 tools/dump_*.py            golden-reference writers (run against MLX)
 tools/gen_unicode.py       the Unicode tables the tokenizer needs
-refs/<case>/               the references themselves
+refs/<case>/               the references themselves (not in git)
 tests/                     one test file per reference case
 ```
 
@@ -492,6 +492,9 @@ taps (this `vision_config` ships none), and mlx's graph-level fusion engine
 - Generate references with the **vendored** mlx-lm, not the installed one:
   `cd tools && PYTHONPATH=../../vendor/mlx-lm python3 dump_<case>.py`.
   Vendored is 0.32.0 (has the packed gated-delta kernel); installed is 0.31.3.
+- `refs/` is not in the repository -- 510 MB of raw tensors, and every case
+  has a writer. A fresh checkout has to run the `dump_*.py` above before
+  `cargo test` has anything to compare against.
 - `cargo test --release` runs everything but the full-model and end-to-end
   tests. Those need `--ignored` *and* `--test-threads=1`, because each one
   loads the whole 25.5 GB model and two at once do not fit:
