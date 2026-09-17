@@ -611,13 +611,47 @@ no slow one to find. The 8-bit `qmv_fast` is 38% of the time and reads about
 38% of the traffic -- the gated-delta `in_proj` alone is 1.07 GB of the 2.83.
 A guess that the expert gather was the anomaly did not survive the measurement.
 
-**The small kernels are the anomaly, from the other side**: `rms_norm`, `add`,
-`slice`, `swiglu`, `sigmoid_gate`, `scalar_mul` and the two reductions come to
-~2.2 ms, 16% of the time, while moving ~0.2% of the bytes. Take out the
-command-buffer inflation (~1.5 us x ~500 dispatches) and it is **~1.2 ms, ~11%
-of a real step**, which is what a fusion could go after. Not the bandwidth --
-the hidden state is 2048 values, 4 KB, and all of those kernels together push
-~4 MB a token against 2.83 GB of weights. The launches.
+**The small kernels look like the anomaly from the other side**: `rms_norm`,
+`add`, `slice`, `swiglu`, `sigmoid_gate`, `scalar_mul` and the two reductions
+come to ~2.2 ms, 16% of the time here, while moving ~0.2% of the bytes -- the
+hidden state is 2048 values, 4 KB, and all of them together push ~4 MB a token
+against 2.83 GB of weights.
+
+**That 16% is not 16% of a real step, and this table cannot tell you what is.**
+One dispatch per command buffer is one dispatch at a time; a concurrent encoder
+runs the small kernels *underneath* the big ones, which are waiting on memory
+and leave the arithmetic idle. Fusing five of the router's dispatches into one
+removed 160 dispatches a token and moved the wall clock by about half a
+percent, against the 5-6% this table was read to promise. Read the table for
+which kernels exist and what they cost in isolation; for what removing one
+*buys*, there is no substitute for removing it and measuring.
+
+### Fusing the router's tail, and why it is not here
+
+Tried and reverted, so that it is not tried again for the same reasons.
+
+The router's tail is five dispatches a layer -- a full argsort of all 256
+experts, the slice of its last k, a gather, a row sum and a divide -- two
+hundred a token, the argsort alone at 12 us to order 256 numbers. Only the
+last k of that order is ever read, so one kernel can replace the sort with k
+rounds of selection, and it is bit-exact: mlx's block sort is stable ascending
+(`LessThan` compares values alone, `ThreadSort` swaps only on a strict `<`,
+`merge_step` takes from the right run only when `b < a`), so its last k are
+exactly the k largest under "by value, then by index"; the sum matches
+`row_reduce_small`, which accumulates in the output dtype and so rounds to
+bfloat16 after every addition, in index order; the divide matches
+`div_by_row`. It was written, it passed `tests/moe.rs` against MLX's own
+indices and weights at every T, and it took a step from 1669 dispatches to
+1509 and from 1216 barriers to 1098.
+
+It bought **half a percent** -- 88.9 tok/s against 88.4 -- and cost the one
+property this port has, which is that it does what mlx does. The reason is in
+the paragraph above: at 96% GPU and bound by weight reads, those five small
+dispatches were never on the critical path. They ran underneath the `qmv`
+kernels that were waiting on memory.
+
+The lever here is bytes, not launches, and no rearrangement of the small
+kernels changes that.
 
 
 ## What is left
@@ -629,37 +663,7 @@ In order:
    other work on it; by the end a run of one binary varied by more than the
    thing being measured, so the wall-clock figures are the shape of the
    answer, not the answer.
-2. **Fuse the elementwise chain, in three steps.** Worth ~5-6%, the second
-   largest lever after the weight reading itself, which is not removable.
-   Ordered by size, each landing with its own golden test:
-
-   1. **The router's tail**, the biggest single piece and self-contained:
-      `softmax -> argsort -> slice_tail -> take_along -> sum -> div` over 256
-      experts, ~4 dispatches x 40 layers, and the argsort alone is 12 us to
-      sort 256 numbers, 3.4% of the step. One kernel per layer: 256 logits in,
-      8 indices and 8 normalised weights out, one threadgroup. The catch is
-      that mlx's `argpartition` is a full argsort, so the permutation is fully
-      determined and the fused kernel has to reproduce it exactly -- including
-      the tie-break.
-   2. **`add` residual + the `rms_norm` after it**, 2 per layer x 40 = 80
-      dispatches. The fused kernel writes both, since `h` is still needed as
-      the next residual.
-   3. **`rms_norm(q, no weight)` + `scalar_mul`** in the gated-delta path,
-      2 per layer x 30 = 60 dispatches.
-
-   Two things have to be said out loud about this one. It is **a deliberate
-   departure from 1:1 with mlx**: these are fusions `mx.compile` does not make,
-   so the port would be doing something its source does not. The numbers stay
-   identical, the correspondence does not. And a fused bfloat16 kernel has to
-   reproduce mlx's *chain of arrays*, not its expression -- every intermediate
-   gets its own `bfloat16_t` variable, or Metal keeps it at float precision and
-   the result drifts, which is exactly how `gelu_pytorch_tanh` disagreed on 9
-   of 65536 inputs until every step was named.
-
-   What mlx does fuse is already here, by hand, in
-   `kernels/ornith_elementwise.metal` -- `swiglu`, `precise_swiglu`,
-   `sigmoid_gate`, `silu`, `scalar_mul`. This item is only about going past it.
-3. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
+2. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
    `lm_head` over a ranked sub-vocabulary, which is what removes the ~540 MB
    per draft step. The artifact ships no ranked vocabulary, so it would have
    to be derived.
