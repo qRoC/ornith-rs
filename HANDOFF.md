@@ -67,6 +67,12 @@ different Mac fails loudly instead of silently diverging:
 
 ### Metal 4.1, fp8/fp4, and what changes on an M5
 
+`M5.md` is the working sheet for the move, with mlx's routing conditions
+quoted line by line. Its headline is worth having here: **every route into the
+`*_nax` kernels is guarded by a width a decode step does not have**, so they
+are a prefill lever. This section is the other half, the low-precision
+formats.
+
 Metal 4.1 does expose fp8 (E4M3), fp4 and block-scaled MXFP4 -- in the tensor
 path, the MPP `matmul2d` operation over `cooperative_tensor` fragments. Two
 gates keep it off this machine, and both are worth knowing before the move:
@@ -157,6 +163,7 @@ src/main.rs                the console chat
 src/refs.rs                golden-reference reader
 tools/dump_*.py            golden-reference writers (run against MLX)
 tools/epoch_schedule.py    how few barrier epochs a step's dependencies allow
+M5.md                      what changes on a GPU where nax_available() is true
 tools/gen_unicode.py       the Unicode tables the tokenizer needs
 refs/<case>/               the references themselves (not in git)
 tests/                     one test file per reference case
