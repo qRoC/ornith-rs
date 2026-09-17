@@ -67,6 +67,50 @@ fn matrix_bytes(qw: &QuantMatrix) -> usize {
         + qw.biases.numel() * qw.biases.dtype.size()
 }
 
+/// What the CPU can pull from the same memory, one pass over `bytes`.
+///
+/// Plain summed reads across `threads` P-cores. Not a matmul and not meant to
+/// be one: the question is only whether the memory system has capacity left
+/// when the GPU is already reading, which is what decides whether handing the
+/// CPU a share of the work could ever add throughput rather than take it.
+fn cpu_stream(bytes: usize, threads: usize) -> f64 {
+    let n = bytes / 8;
+    let data: Vec<u64> = (0..n as u64).collect();
+    let chunk = n.div_ceil(threads);
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for part in data.chunks(chunk) {
+            s.spawn(move || {
+                let mut acc = 0u64;
+                for v in part {
+                    acc = acc.wrapping_add(*v);
+                }
+                std::hint::black_box(acc);
+            });
+        }
+    });
+    bytes as f64 / t0.elapsed().as_secs_f64() / 1e9
+}
+
+/// The GPU read again, but as a prepared closure so it can be timed while the
+/// CPU is reading too.
+fn gpu_reader(ctx: &Context, bytes: usize) -> impl Fn() + '_ {
+    let n4 = bytes / 16;
+    let x = Array::empty(ctx, &[n4 * 4], Dtype::U32);
+    zero(ctx, &x);
+    let threads = 1usize << 18;
+    let out = Array::empty(ctx, &[threads], Dtype::U32);
+    ctx.sync();
+    move || {
+        ctx.kernel("stream_read")
+            .arr(&x)
+            .out(&out)
+            .bytes(&(n4 as u32))
+            .threads((threads, 1, 1), (256, 1, 1));
+        ctx.sync();
+    }
+}
+
 fn main() {
     let ctx = Context::new().expect("metal");
     println!("{}, {} -- peak {PEAK} GB/s\n", ctx.device_name(), ctx.arch);
@@ -77,6 +121,40 @@ fn main() {
         let gbs = stream(&ctx, mb << 20);
         println!("  {mb:>8}  {gbs:>10.1}  {:>7.0}%", 100.0 * gbs / PEAK);
     }
+
+    // Can a second engine add anything, or is the memory system the wall?
+    // A decode step gets ~250 GB/s of a possible 465, so the bus is not full
+    // and the question is fair. If CPU and GPU together beat the GPU alone,
+    // handing the CPU a share of the work has somewhere to put it; if the two
+    // only divide one budget, the idea is dead before any kernel is written.
+    const MB: usize = 1024;
+    let cores = 12; // this part's P-cores
+    println!("\nthe CPU on the same memory, and both at once ({MB} MB each):");
+    let gpu_alone = {
+        let run = gpu_reader(&ctx, MB << 20);
+        let t0 = std::time::Instant::now();
+        run();
+        (MB << 20) as f64 / t0.elapsed().as_secs_f64() / 1e9
+    };
+    let cpu_alone = cpu_stream(MB << 20, cores);
+    let (gpu_both, cpu_both) = {
+        let run = gpu_reader(&ctx, MB << 20);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| cpu_stream(MB << 20, cores));
+            let t0 = std::time::Instant::now();
+            run();
+            let g = (MB << 20) as f64 / t0.elapsed().as_secs_f64() / 1e9;
+            (g, h.join().unwrap())
+        })
+    };
+    println!("  {:>28}  {:>10.1}", "GPU alone", gpu_alone);
+    println!("  {:>28}  {:>10.1}", "CPU alone (12 threads)", cpu_alone);
+    println!("  {:>28}  {:>10.1}", "GPU while the CPU reads", gpu_both);
+    println!("  {:>28}  {:>10.1}", "CPU while the GPU reads", cpu_both);
+    println!(
+        "  {:>28}  {:>10.1}  against {:.1} for the GPU alone",
+        "together", gpu_both + cpu_both, gpu_alone
+    );
 
     let dir = model_dir();
     if !dir.exists() {

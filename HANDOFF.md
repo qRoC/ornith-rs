@@ -1320,8 +1320,54 @@ is not worth it: the tower runs once per image rather than once per token, so
 it is not on the decode path at all, and moving it would trade the token-for-
 token agreement with MTPLX for fp16.
 
-AMX is out for the same reasons and one more: it is CPU-side, on the same
-memory, with no quantised matmul, and mlx does not use it on the GPU path.
+AMX was dismissed for the same reasons and one more -- "it is CPU-side, on the
+same memory" -- and that last clause was wrong. See below.
+
+### The CPU on the same memory, which is not the objection it looked like
+
+`--bin bandwidth` measures it now: a 1 GB streaming read from each side,
+alone and at once, on this part.
+
+| | GB/s |
+|---|---|
+| GPU alone | 417.3, 419.2, 425.0, 393.2 |
+| CPU alone, 12 threads | 180.9-236.0 |
+| GPU while the CPU reads | 248-344 |
+| CPU while the GPU reads | 148-236 |
+| **together** | **542.9, 516.3, 516.9**, 396.3 |
+
+Three runs of four put the pair at 516-543 GB/s against 417-425 for the GPU
+alone -- 23-30% more, with the top of it within a whisker of the 546 on the
+box. **The GPU cannot pull this machine's memory on its own**, and the CPU
+makes up part of the difference rather than taking it away. "Same memory" is
+not a reason; it was assumed here and it does not hold.
+
+That reopens exactly one idea, and it is the largest one left: hand the CPU a
+slice of a decode step's *output rows* while the GPU takes the rest. Decode is
+the path with somewhere to put it -- it gets ~250 GB/s of a possible 465 --
+and prefill is not, since prefill's idle is memory pressure rather than a
+bandwidth ceiling.
+
+Two things stand between the measurement and a win, and they are not small.
+
+- **The kernel.** Accelerate has no quantised matmul, so this is a hand-written
+  NEON dequantise-and-dot over the affine layout, and the CPU would be limited
+  by that arithmetic rather than by the streaming figure above. A back of the
+  envelope on 4-bit g32 -- 20 bytes read per 32 FMAs, ~8 fp32 FMAs a cycle a
+  core, 12 cores -- lands near 60 GB/s of weight consumption, against the
+  GPU's 250. So the honest expectation is something like +25%, not +30% of
+  542.
+- **The verification.** `max_abs == 0.0` against MLX is the rule that has not
+  moved, and a CPU row accumulates in a different order than the Metal
+  kernel's simdgroup reduction. Splitting by output rows at least keeps each
+  row's reduction self-contained, so reproducing the kernel's exact order on
+  the CPU is *possible* rather than obviously impossible -- but it is a
+  research question, not a port. mlx-dspark hit the same wall from the prefill
+  side and took the other branch: its CPU co-prefill is explicitly not
+  bit-identical, and it is off in their library API for that reason.
+
+So: the physics is measured and favourable, the arithmetic is plausible, and
+the verification is the thing to decide about before writing a line of it.
 
 ---
 
