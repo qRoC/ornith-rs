@@ -29,7 +29,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use ornith_rs::chat::{Content, Message, Part, Role, apply_chat_template};
-use ornith_rs::generate::{DEFAULT_PREFILL_STEP_SIZE, Greedy, Sampler, generate_step};
+use ornith_rs::generate::{DEFAULT_PREFILL_STEP_SIZE, Greedy, Sampler, generate_step, prefill_step_size};
 use ornith_rs::metal::{Context, Kind, Why};
 use ornith_rs::model::cache::LayerCache;
 use ornith_rs::model::config::TextConfig;
@@ -582,6 +582,22 @@ impl Session<'_> {
                     prompt_time = t0.elapsed().as_secs_f64();
                     // Prefill has its own shapes and dispatch counts; the
                     // decode steps are what the counters are meant to describe.
+                    // Report what the prompt cost first, though -- it is a
+                    // different regime and nothing else measures it.
+                    if ctx.prof_on() && total > 0 {
+                        let (_, disp, gpu, wait) = ctx.prof_totals();
+                        let (gap, _) = ctx.prof_gaps();
+                        eprintln!(
+                            "\r[prof: prompt {total} tokens in {:.2} s, {:.2} gpu ({:.0}%), \
+                             {:.2} idle, {:.2} blocked; {:.0} dispatches a token]",
+                            prompt_time,
+                            gpu,
+                            100.0 * gpu / prompt_time.max(1e-9),
+                            gap,
+                            wait,
+                            disp as f64 / total as f64,
+                        );
+                    }
                     ctx.prof_reset();
                 } else if total > DEFAULT_PREFILL_STEP_SIZE {
                     eprint!("\rprompt {done}/{total}");
@@ -613,7 +629,7 @@ impl Session<'_> {
                         sampler,
                         self.depth,
                         self.max_tokens,
-                        DEFAULT_PREFILL_STEP_SIZE,
+                        prefill_step_size(),
                         self.policy,
                         splice.as_deref_mut(),
                         progress,
@@ -627,7 +643,7 @@ impl Session<'_> {
                     fresh,
                     sampler,
                     self.max_tokens,
-                    DEFAULT_PREFILL_STEP_SIZE,
+                    prefill_step_size(),
                     splice.as_deref_mut(),
                     progress,
                     &mut emit,

@@ -25,6 +25,14 @@ use crate::vision::splice::{VisionSplice, spliced_chunk_embeddings};
 
 pub const DEFAULT_PREFILL_STEP_SIZE: usize = 2048;
 
+/// `ORNITH_PREFILL` overrides it, for measuring what the chunk width costs.
+pub fn prefill_step_size() -> usize {
+    std::env::var("ORNITH_PREFILL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PREFILL_STEP_SIZE)
+}
+
 /// Picks the next token id from the logits of the last position.
 pub trait Sampler {
     fn sample(&mut self, ctx: &Context, logits: &Array) -> u32;

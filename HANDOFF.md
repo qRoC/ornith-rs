@@ -835,6 +835,42 @@ plus ~5.3 ms of serialisation plus ~1.7 ms of dispatch and commit overhead.
 
 ---
 
+### The prompt, which nothing here had ever measured
+
+`ORNITH_PROF=1` now reports the prefill phase before it resets the counters
+for decode, and `ORNITH_PREFILL=<n>` overrides the chunk width. The first look
+at it says the same thing the rest of this document has been converging on.
+
+2600 raw tokens, chunk 2048, three runs: **2.05-2.34 s of GPU busy against a
+wall of 4.19-7.38 s** -- 33% to 49% busy, where a decode step holds 95%. The
+GPU work alone corresponds to ~1230 tokens a second; the wall gives 380-614.
+
+`mlx_lm.generate` on the same prompt and the same machine gets **809 tok/s**.
+So the port is not doing more work at prefill than mlx-lm -- by GPU busy it is
+doing it faster -- it is waiting, and the waiting is what the gap is made of.
+
+What the chunk does, paired runs:
+
+| chunk | GPU busy | pooled peak | note |
+|---|---|---|---|
+| 256 | 3.17 s | 631 MB | too narrow to amortize the weight reads |
+| 512 | 2.48 s | 658 MB | still narrow |
+| 1024 | 2.11, 2.11, 2.11 s | 881 MB | level, and the steadiest thing measured |
+| 2048 | 2.05, 2.09, 2.34 s | 1307 MB | least work when undisturbed, and the one that swings |
+
+The default stays at 2048, which is mlx-lm's `prefill_step_size`, because
+2048 does marginally less GPU work and the instability is the machine's rather
+than the code's -- 1307 MB of transients on a machine sitting 16.35 GB into a
+17.4 GB swap file. 1024 is the setting to reach for when memory is tight: a
+third less peak for 3% more GPU work, and it did not swing once.
+
+**Which makes this the third face of one problem.** MTP's four-fold wall swing,
+FR-Spec's collapsed runs and prefill's half-idle GPU are all the same thing,
+and in all three the GPU busy figure stayed flat while the wall moved. Memory
+pressure is the dominant error term in every wall-clock number this port
+produces on this machine, and the swap file is the first thing to read before
+believing one.
+
 ### Which kernels the time is in
 
 `ORNITH_PROF=1 ORNITH_COMMIT_EVERY=1` gives one dispatch per command buffer,
