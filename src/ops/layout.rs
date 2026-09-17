@@ -31,6 +31,13 @@ pub fn slice_inner(ctx: &Context, x: &Array, start: usize, len: usize) -> Array 
     if start == 0 && len == row {
         return x.clone();
     }
+    // One row's slice is already contiguous, so it is a view rather than a
+    // copy: the kernel would move a few kilobytes and cost a dispatch. Decode
+    // runs a single token, which is where most of these come from -- the
+    // gated-delta q/k/v split alone is three per layer.
+    if x.numel() == row {
+        return x.inner_view(start, len);
+    }
     let mut shape = x.shape.clone();
     let n = shape.len();
     shape[n - 1] = len;

@@ -69,6 +69,24 @@ impl Array {
         Array { buf: self.buf.clone(), offset: self.offset, shape: shape.to_vec(), dtype: self.dtype }
     }
 
+    /// `a[..., start..start + len]` as a view, which is only contiguous --
+    /// and so only expressible here -- when there is a single row. That is
+    /// exactly the decode case, where every array the model slices is one
+    /// token wide.
+    pub fn inner_view(&self, start: usize, len: usize) -> Array {
+        let row = *self.shape.last().expect("inner_view on a scalar");
+        assert!(start + len <= row);
+        assert_eq!(self.numel(), row, "inner_view needs a single row");
+        let mut shape = self.shape.clone();
+        *shape.last_mut().unwrap() = len;
+        Array {
+            buf: self.buf.clone(),
+            offset: self.offset + start * self.dtype.size(),
+            shape,
+            dtype: self.dtype,
+        }
+    }
+
     /// `a[i]` along the leading axis, as a contiguous view.
     pub fn index(&self, i: usize) -> Array {
         assert!(self.ndim() >= 1 && i < self.shape[0], "index {i} out of range for {:?}", self.shape);
