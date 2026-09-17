@@ -13,15 +13,25 @@ use std::rc::Rc;
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
-use crate::ops::quantized::QuantMatrix;
+use crate::ops::quantized::{QuantMatrix, QuantMode};
 use crate::safetensors::{SafeTensors, TensorInfo, shards_from_index};
 
 pub struct WeightStore {
     st: SafeTensors,
-    /// Per-module `{bits, group_size}` from config.json's `quantization`.
-    quant: HashMap<String, (usize, usize)>,
-    default_quant: (usize, usize),
+    /// Per-module `{bits, group_size, mode}` from config.json's
+    /// `quantization`.
+    quant: HashMap<String, QuantSpec>,
+    default_quant: QuantSpec,
     cache: HashMap<String, Array>,
+}
+
+/// One module's entry in config.json's `quantization` block, as mlx-lm's
+/// `quantize_model` writes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QuantSpec {
+    pub group_size: usize,
+    pub bits: usize,
+    pub mode: QuantMode,
 }
 
 impl WeightStore {
@@ -35,16 +45,33 @@ impl WeightStore {
             .map_err(|e| format!("config.json: {e}"))?;
         let cfg = crate::json::parse(&cfg_raw).map_err(|e| format!("config.json: {e}"))?;
         let q = cfg.get("quantization").ok_or("config.json has no quantization block")?;
-        let default_quant = (
-            q.get("group_size").and_then(|v| v.as_usize()).ok_or("quantization.group_size")?,
-            q.get("bits").and_then(|v| v.as_usize()).ok_or("quantization.bits")?,
-        );
+        // `mode` is absent from artifacts forged before mlx grew the fp
+        // modes; mlx-lm's own loader defaults it to affine, so this does too.
+        let default_quant = QuantSpec {
+            group_size: q
+                .get("group_size")
+                .and_then(|v| v.as_usize())
+                .ok_or("quantization.group_size")?,
+            bits: q.get("bits").and_then(|v| v.as_usize()).ok_or("quantization.bits")?,
+            mode: QuantMode::from_config(
+                q.get("mode").and_then(|v| v.as_str()).unwrap_or("affine"),
+            ),
+        };
         let mut quant = HashMap::new();
         for (k, v) in q.as_obj().ok_or("quantization is not an object")? {
             if let Some(o) = v.as_obj() {
-                let gs = o.get("group_size").and_then(|v| v.as_usize()).unwrap_or(default_quant.0);
-                let bits = o.get("bits").and_then(|v| v.as_usize()).unwrap_or(default_quant.1);
-                quant.insert(k.clone(), (gs, bits));
+                let spec = QuantSpec {
+                    group_size: o
+                        .get("group_size")
+                        .and_then(|v| v.as_usize())
+                        .unwrap_or(default_quant.group_size),
+                    bits: o.get("bits").and_then(|v| v.as_usize()).unwrap_or(default_quant.bits),
+                    mode: o
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .map_or(default_quant.mode, QuantMode::from_config),
+                };
+                quant.insert(k.clone(), spec);
             }
         }
         Ok(WeightStore { st, quant, default_quant, cache: HashMap::new() })
@@ -62,9 +89,9 @@ impl WeightStore {
         self.st.names()
     }
 
-    /// `(group_size, bits)` for a module path, with the same per-module
+    /// The quantization spec for a module path, with the same per-module
     /// override lookup mlx-lm's loader does.
-    pub fn quant_config(&self, path: &str) -> (usize, usize) {
+    pub fn quant_config(&self, path: &str) -> QuantSpec {
         *self.quant.get(path).unwrap_or(&self.default_quant)
     }
 
@@ -93,14 +120,47 @@ impl WeightStore {
     }
 
     /// Load `<path>.weight` / `.scales` / `.biases` as one quantized matrix.
+    ///
+    /// The zero point is affine's alone: `mx.quantize` returns three arrays in
+    /// affine mode and two in nvfp4, and `nn.QuantizedLinear` stores
+    /// `self.biases = None` for the latter, so the artifact holds no
+    /// `.biases` tensor at all. Both are checked here rather than inferred, so
+    /// a module whose tensors disagree with the mode config.json claims fails
+    /// at load instead of producing numbers.
     pub fn quant_matrix(&mut self, ctx: &Context, path: &str) -> QuantMatrix {
-        let (group_size, bits) = self.quant_config(path);
+        let spec = self.quant_config(path);
+        let biases_name = format!("{path}.biases");
+        let has_biases = self.has(&biases_name);
+        match spec.mode {
+            QuantMode::Affine => assert!(
+                has_biases,
+                "{path} is affine but the artifact has no {biases_name}"
+            ),
+            QuantMode::Nvfp4 => assert!(
+                !has_biases,
+                "{path} is nvfp4 but the artifact has a {biases_name}; nvfp4 \
+                 has no zero point, so this is not the layout mlx produces"
+            ),
+        }
+        // The optional global scale is the other way a quantized module can
+        // carry a third tensor, and the fp kernels take it in the slot the
+        // zero point would use. mlx_lm.convert never emits one -- it neither
+        // passes `global_scale` to `mx.quantize` nor sets `quantize_input` --
+        // so finding one means this loader is reading an artifact it was not
+        // written for.
+        let gs_name = format!("{path}.global_scale");
+        assert!(
+            !self.has(&gs_name),
+            "{path} carries a {gs_name}; the fp kernels' has_global_scale \
+             specialisations are not instantiated (see fp_quantized_inst.metal)"
+        );
         QuantMatrix {
             w: self.tensor(ctx, &format!("{path}.weight")),
             scales: self.tensor(ctx, &format!("{path}.scales")),
-            biases: self.tensor(ctx, &format!("{path}.biases")),
-            group_size,
-            bits,
+            biases: has_biases.then(|| self.tensor(ctx, &biases_name)),
+            mode: spec.mode,
+            group_size: spec.group_size,
+            bits: spec.bits,
         }
     }
 

@@ -30,7 +30,7 @@
 
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
-use ornith_rs::ops::quantized::{QuantMatrix, quantized_matmul};
+use ornith_rs::ops::quantized::{QuantMatrix, QuantMode, quantized_matmul};
 use ornith_rs::refs::{RefCase, model_dir};
 use ornith_rs::weights::WeightStore;
 
@@ -212,10 +212,17 @@ fn probe(ctx: &Context, case: &RefCase, ws: &mut WeightStore, tag: &str) {
         .expect("path in the reference meta")
         .to_string();
     let qw: QuantMatrix = ws.quant_matrix(ctx, &path);
-    if qw.bits != 8 || qw.group_size != 64 {
-        println!("{tag}: {}-bit group {}, not this probe's path\n", qw.bits, qw.group_size);
+    // The hand-written CPU row below is affine int8 g64 arithmetic -- scale
+    // times code plus zero point -- so it has nothing to say about an nvfp4
+    // module, which has no zero point and an E4M3 scale.
+    if qw.mode != QuantMode::Affine || qw.bits != 8 || qw.group_size != 64 {
+        println!(
+            "{tag}: {:?} {}-bit group {}, not this probe's path\n",
+            qw.mode, qw.bits, qw.group_size
+        );
         return;
     }
+    let biases = qw.biases.as_ref().expect("affine has a zero point");
     let k = qw.in_dims();
     let n = qw.out_dims();
     assert_eq!(k % 256, 0, "the block loop wants a multiple of 256");
@@ -232,7 +239,7 @@ fn probe(ctx: &Context, case: &RefCase, ws: &mut WeightStore, tag: &str) {
     let gpu = unsafe { gpu_y.buf.as_slice::<u16>(gpu_y.offset, n) }.to_vec();
     let wb = unsafe { qw.w.buf.as_slice::<u8>(qw.w.offset, n * k) };
     let sc = unsafe { qw.scales.buf.as_slice::<u16>(qw.scales.offset, n * k / 64) };
-    let bi = unsafe { qw.biases.buf.as_slice::<u16>(qw.biases.offset, n * k / 64) };
+    let bi = unsafe { biases.buf.as_slice::<u16>(biases.offset, n * k / 64) };
 
     let gpu_vs_mlx = (0..n).filter(|&r| bf16_to_f32(gpu[r]) == want[r]).count();
     println!("  this port's GPU against MLX: {gpu_vs_mlx}/{n} exact");

@@ -1,10 +1,17 @@
-//! `mx.quantized_matmul` for affine quantization.
+//! `mx.quantized_matmul`, for the two quantization modes this port carries.
 //!
 //! Port of `QuantizedMatmul::eval_gpu` and the `qmv*` / `qmm*` dispatch helpers
 //! in `vendor/mlx/mlx/backend/metal/quantized.cpp`. The kernels themselves are
-//! mlx's, compiled from `kernels/mlx/.../quantized.h` via
-//! `kernels/quantized_inst.metal`; what lives here is only the decision of
-//! *which* kernel runs and with which grid.
+//! mlx's, compiled from `kernels/mlx/.../quantized.h` and `.../fp_quantized.h`
+//! via `kernels/quantized_inst.metal` and `kernels/fp_quantized_inst.metal`;
+//! what lives here is only the decision of *which* kernel runs and with which
+//! grid.
+//!
+//! mlx has four modes -- `affine`, `mxfp4`, `nvfp4`, `mxfp8`. Two are
+//! implemented here and two are deliberately absent, priced and rejected in
+//! `REBUILD.md` Phase 4: mxfp4 measures 20-22% weight error against affine
+//! int4's 8-9%, and mxfp8 buys 0.8% of a step's bytes for 4.6x the error of
+//! the affine int8 it would replace.
 //!
 //! Affine layout, as produced by `mx.quantize(w, group_size, bits, "affine")`:
 //!
@@ -13,19 +20,68 @@
 //!   scales: [..., O, I / group_size] same dtype as the activations
 //!   biases: [..., O, I / group_size]
 //!
-//! and a weight element is `scale * q + bias`. `transpose = true` means the
-//! stored matrix is [O, I] and the product is `x @ w.T`, which is the layout
-//! every linear layer in this model uses.
+//! and a weight element is `scale * q + bias`.
+//!
+//! nvfp4 (`mx.quantize(w, 16, 4, "nvfp4")`) is **two tensors, not three**:
+//!
+//!   w:      [..., O, I / 8]   uint32, 8 E2M1 values per word
+//!   scales: [..., O, I / 16]  uint8, one E4M3 scale per group of 16
+//!
+//! There is no zero point, so `nn.QuantizedLinear` leaves `self.biases = None`
+//! and the artifact stores no `.biases` tensor. mlx's fp kernels keep a third
+//! buffer slot for an optional scalar *global* scale, which only
+//! `mx.quantize(..., global_scale=...)` or `nn.quantize(quantize_input=True)`
+//! ever produce -- `mlx_lm.convert` passes neither, so that slot is left
+//! unbound exactly as `quantized.cpp` leaves it, and [`QuantMatrix::nvfp4`]
+//! rejects an artifact that did carry one.
+//!
+//! `transpose = true` means the stored matrix is [O, I] and the product is
+//! `x @ w.T`, which is the layout every linear layer in this model uses.
 
 use crate::array::Array;
-use crate::metal::Context;
+use crate::metal::{Context, Dispatch};
+
+/// Which of mlx's quantization modes a weight is stored in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuantMode {
+    Affine,
+    Nvfp4,
+}
+
+impl QuantMode {
+    /// The `mode` string mlx writes into `config.json` and prefixes every
+    /// kernel name with (`quantization_mode_to_string`).
+    pub fn from_config(s: &str) -> QuantMode {
+        match s {
+            "affine" => QuantMode::Affine,
+            "nvfp4" => QuantMode::Nvfp4,
+            // mxfp4 and mxfp8 are real mlx modes with real kernels; this port
+            // does not instantiate them, so say so rather than fall through to
+            // a kernel name that will not resolve.
+            "mxfp4" | "mxfp8" => panic!(
+                "quantization mode {s:?} is an mlx mode this port does not \
+                 carry -- see REBUILD.md Phase 4 for why it was not built"
+            ),
+            _ => panic!("unknown quantization mode {s:?}"),
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            QuantMode::Affine => "affine",
+            QuantMode::Nvfp4 => "nvfp4",
+        }
+    }
+}
 
 /// A quantized weight matrix plus its quantization parameters.
 #[derive(Clone)]
 pub struct QuantMatrix {
     pub w: Array,
     pub scales: Array,
-    pub biases: Array,
+    /// The zero point, affine only. nvfp4 has none and stores two tensors.
+    pub biases: Option<Array>,
+    pub mode: QuantMode,
     pub group_size: usize,
     pub bits: usize,
 }
@@ -37,7 +93,8 @@ impl QuantMatrix {
     }
 
     /// Input features, recovered from the scales: mlx's
-    /// `QuantizedLinear.input_dims` does the same.
+    /// `QuantizedLinear.input_dims` does the same. The scales carry one entry
+    /// per group in both modes, so this needs no mode branch.
     pub fn in_dims(&self) -> usize {
         self.scales.shape[self.scales.ndim() - 1] * self.group_size
     }
@@ -47,13 +104,57 @@ impl QuantMatrix {
         if self.w.ndim() >= 3 { self.w.shape[0] } else { 1 }
     }
 
-    fn suffix(&self, type_string: &str) -> String {
-        format!("{}_gs_{}_b_{}", type_string, self.group_size, self.bits)
+    /// `<mode>_<name>_<type>_gs_<g>_b_<bits>`, the stem every kernel name in
+    /// both instantiation files is built from.
+    fn kernel(&self, name: &str, type_string: &str) -> String {
+        format!(
+            "{}_{name}_{type_string}_gs_{}_b_{}",
+            self.mode.prefix(),
+            self.group_size,
+            self.bits
+        )
+    }
+
+    /// Bind `w`, `scales`, and the third slot mlx reserves for the zero point
+    /// (affine) or the optional global scale (fp). With neither present the
+    /// slot is left unbound, which is what `quantized.cpp` does.
+    ///
+    /// Used by every kernel that has that slot. [`Self::bind_ws`] is for the
+    /// three that do not.
+    fn bind_wsb<'a>(&self, d: Dispatch<'a>) -> Dispatch<'a> {
+        let d = d.arr(&self.w).arr(&self.scales);
+        match &self.biases {
+            Some(b) => d.arr(b),
+            None => d.skip(),
+        }
+    }
+
+    /// Bind `w` and `scales` for the kernels whose fp form drops the third
+    /// slot entirely rather than leaving it unbound: `qmv_wide` and
+    /// `qmm_t_splitk`, neither of which takes a global scale.
+    fn bind_ws<'a>(&self, d: Dispatch<'a>) -> Dispatch<'a> {
+        let d = d.arr(&self.w).arr(&self.scales);
+        match &self.biases {
+            Some(b) => d.arr(b),
+            None => d,
+        }
+    }
+
+    /// The strides `add_strides_and_shapes` appends for the scales and, when
+    /// there is one, the zero point.
+    fn group_strides(&self) -> ([i64; 1], Option<[i64; 1]>) {
+        let s = [(self.scales.shape[1] * self.scales.shape[2]) as i64];
+        let b = self
+            .biases
+            .as_ref()
+            .map(|b| [(b.shape[1] * b.shape[2]) as i64]);
+        (s, b)
     }
 }
 
 /// `pack_factor<bits, 32>() * (bits == 2 ? 1 : 2) * SIMD_SIZE`, the K step of
-/// `qmv_fast_impl`. Copied from `qmv_fast_k_alignment` in quantized.cpp.
+/// `qmv_fast_impl`. Copied from `qmv_fast_k_alignment` in quantized.cpp, which
+/// keys off the bit width alone and so is shared by both modes.
 fn qmv_fast_k_alignment(bits: usize) -> usize {
     let pack_factor = match bits {
         3 | 5 => 8,
@@ -110,12 +211,24 @@ fn qmv_batch_limit(ctx: &Context, d: usize, o: usize) -> usize {
     }
 }
 
-/// affine `qmv_wide` only beats `qmv` on gen-15 and up.
-fn use_qmv_wide(ctx: &Context) -> bool {
-    ctx.arch_gen >= 15
+/// `use_qmv_wide` from quantized.cpp: affine `qmv_wide` only beats `qmv` on
+/// gen-15 and up, and the comment there reads "fp benefits on every gen".
+fn use_qmv_wide(ctx: &Context, mode: QuantMode) -> bool {
+    mode != QuantMode::Affine || ctx.arch_gen >= 15
 }
 
-/// `x @ w.T` with `w` affine-quantized. `x` is [..., K], the result [..., N].
+/// `k_lanes`: lanes reducing K per output row, so `32 / k_lanes` rows per
+/// simdgroup. quantized.cpp picks 8 for affine and 16 for the fp modes --
+/// "the affine subchunk decode has enough ALU per weight load to favor more
+/// rows per simdgroup (kl8); the fp modes' vectorized dot is balanced at 16".
+fn qmv_wide_k_lanes(mode: QuantMode) -> usize {
+    match mode {
+        QuantMode::Affine => 8,
+        QuantMode::Nvfp4 => 16,
+    }
+}
+
+/// `x @ w.T` with `w` quantized. `x` is [..., K], the result [..., N].
 pub fn quantized_matmul(ctx: &Context, x: &Array, qw: &QuantMatrix) -> Array {
     assert_eq!(qw.w.ndim(), 2, "batched weights go through gather_qmm");
     let k = x.dim(-1);
@@ -142,10 +255,11 @@ pub fn quantized_matmul(ctx: &Context, x: &Array, qw: &QuantMatrix) -> Array {
 fn dispatch_qmv(ctx: &Context, x: &Array, qw: &QuantMatrix, out: &Array, m: usize, n: usize, k: usize) {
     assert!(
         k != 128 && k != 64,
-        "K={k} would route to affine_qmv_quad in mlx; no layer of this model \
-         has a 64- or 128-wide input, so that kernel is not instantiated"
+        "K={k} would route to {}_qmv_quad in mlx; no layer of this model \
+         has a 64- or 128-wide input, so that kernel is not instantiated",
+        qw.mode.prefix()
     );
-    if m >= 2 && use_qmv_wide(ctx) {
+    if m >= 2 && use_qmv_wide(ctx, qw.mode) {
         qmv_wide(ctx, x, qw, out, m, n, k);
     } else {
         qmv(ctx, x, qw, out, m, n, k);
@@ -154,18 +268,22 @@ fn dispatch_qmv(ctx: &Context, x: &Array, qw: &QuantMatrix, out: &Array, m: usiz
 
 /// `qmv` / `qmv_fast`: one output vector per threadgroup row.
 fn qmv(ctx: &Context, x: &Array, qw: &QuantMatrix, out: &Array, m: usize, n: usize, k: usize) {
-    let bn = 8; // 2 * results_per_simdgroup, with results_per_simdgroup = 4
     let bk = 32;
-    let fast = n % bn == 0 && k % qmv_fast_k_alignment(qw.bits) == 0;
+    let fast = n % 8 == 0 && k % qmv_fast_k_alignment(qw.bits) == 0;
+    // `use_narrow_qmv` in quantized.cpp halves results_per_simdgroup (and so
+    // bn) to relieve register pressure, but only on an M5 Max: gen 17, an 's'
+    // part, and nvfp4. This machine is applegpu_g16s -- gen 16 -- so the
+    // branch is unreachable and `nvfp4_qmv_fast_..._r_2` is not instantiated.
+    let narrow = fast && n >= 4096 && ctx.arch_gen == 17
+        && ctx.arch.as_bytes().last() == Some(&b's')
+        && qw.mode == QuantMode::Nvfp4;
+    assert!(!narrow, "this GPU would take mlx's narrow (results_per_simdgroup = 2) qmv");
+    let bn = 8; // 2 * results_per_simdgroup, with results_per_simdgroup = 4
     let name = format!(
-        "affine_{}_{}_batch_0",
-        if fast { "qmv_fast" } else { "qmv" },
-        qw.suffix(x.type_string())
+        "{}_batch_0",
+        qw.kernel(if fast { "qmv_fast" } else { "qmv" }, x.type_string())
     );
-    ctx.kernel(&name)
-        .arr(&qw.w)
-        .arr(&qw.scales)
-        .arr(&qw.biases)
+    qw.bind_wsb(ctx.kernel(&name))
         .arr(x)
         .out(out)
         .bytes(&(k as i32))
@@ -175,20 +293,20 @@ fn qmv(ctx: &Context, x: &Array, qw: &QuantMatrix, out: &Array, m: usize, n: usi
 
 /// `qmv_wide`: several input vectors share one weight read. This is the path a
 /// 2..limit row batch takes -- MTP verification and speculative batches.
+///
+/// The fp kernels have no global-scale slot here, so `bind_ws` rather than
+/// `bind_wsb`.
 fn qmv_wide(ctx: &Context, x: &Array, qw: &QuantMatrix, out: &Array, m: usize, n: usize, k: usize) {
     let n_tiles = m.div_ceil(5);
     let vecs_per_tg = m.div_ceil(n_tiles);
-    let k_lanes = 8; // affine
+    let k_lanes = qmv_wide_k_lanes(qw.mode);
     let num_simdgroups = 2;
     let rows_per_tg = (32 / k_lanes) * num_simdgroups;
     let name = format!(
-        "affine_qmv_wide_{}_nv_{vecs_per_tg}_kl_{k_lanes}_batch_0",
-        qw.suffix(x.type_string())
+        "{}_nv_{vecs_per_tg}_kl_{k_lanes}_batch_0",
+        qw.kernel("qmv_wide", x.type_string())
     );
-    ctx.kernel(&name)
-        .arr(&qw.w)
-        .arr(&qw.scales)
-        .arr(&qw.biases)
+    qw.bind_ws(ctx.kernel(&name))
         .arr(x)
         .out(out)
         .bytes(&(k as i32))
@@ -204,13 +322,10 @@ pub fn qmm_t(ctx: &Context, x: &Array, qw: &QuantMatrix, out: &Array, m: usize, 
     let (bm, bn) = (32, 32);
     let aligned = n % 32 == 0;
     let name = format!(
-        "affine_qmm_t_{}_alN_{aligned}_batch_0",
-        qw.suffix(x.type_string())
+        "{}_alN_{aligned}_batch_0",
+        qw.kernel("qmm_t", x.type_string())
     );
-    ctx.kernel(&name)
-        .arr(&qw.w)
-        .arr(&qw.scales)
-        .arr(&qw.biases)
+    qw.bind_wsb(ctx.kernel(&name))
         .arr(x)
         .out(out)
         .bytes(&(k as i32))
@@ -226,6 +341,10 @@ fn qmm_splitk(ctx: &Context, x: &Array, qw: &QuantMatrix, out: &Array, m: usize,
     let n_tiles = n.div_ceil(bn);
     let m_tiles = m.div_ceil(bm);
     let mut split_k = (512 / (n_tiles * m_tiles)).max(1);
+    // Each partition must be a whole number of BK-wide (32) K-tiles as well as
+    // whole quantization groups -- the splitk kernels do not bound K, so a
+    // partition below BK (nvfp4's group_size is 16) would over-read into the
+    // next group's weights.
     let k_align = if qw.group_size > 32 { qw.group_size } else { 32 };
     split_k = split_k.min(k / k_align);
     while split_k > 1 && k % (split_k * k_align) != 0 {
@@ -242,13 +361,10 @@ fn qmm_splitk(ctx: &Context, x: &Array, qw: &QuantMatrix, out: &Array, m: usize,
 
     let aligned = n % 32 == 0;
     let name = format!(
-        "affine_qmm_t_splitk_{}_alN_{aligned}",
-        qw.suffix(x.type_string())
+        "{}_alN_{aligned}",
+        qw.kernel("qmm_t_splitk", x.type_string())
     );
-    ctx.kernel(&name)
-        .arr(&qw.w)
-        .arr(&qw.scales)
-        .arr(&qw.biases)
+    qw.bind_ws(ctx.kernel(&name))
         .arr(x)
         .out(&partials)
         .bytes(&(k as i32))
@@ -289,7 +405,7 @@ mod tests {
         assert_eq!(qmv_batch_limit(&ctx, 4096, 2048), 15);
         // lm_head: K=2048 N=248320
         assert_eq!(qmv_batch_limit(&ctx, 2048, 248320), 13);
-        assert!(use_qmv_wide(&ctx));
+        assert!(use_qmv_wide(&ctx, QuantMode::Affine));
         assert!(!ctx.nax_available(), "M4 must not reach the nax kernels");
 
         // 8-bit weights with K=2048 are qmv_fast eligible; the router gate
@@ -298,6 +414,25 @@ mod tests {
         assert_eq!(256 % 8, 0);
         // shared_expert.down_proj: K=512, 8-bit -> 512 % 256 == 0, fast.
         assert_eq!(512 % qmv_fast_k_alignment(8), 0);
+    }
+
+    /// The two places the fp modes take a different branch from affine for
+    /// the *same* shape, both of which are mode- and not gen-dependent here.
+    #[test]
+    fn nvfp4_dispatch_differs_from_affine() {
+        let ctx = Context::new().unwrap();
+        // `use_qmv_wide` is unconditional for fp; on gen 14 and below affine
+        // would fall back to qmv while nvfp4 would not.
+        assert!(use_qmv_wide(&ctx, QuantMode::Nvfp4));
+        assert_eq!(qmv_wide_k_lanes(QuantMode::Affine), 8);
+        assert_eq!(qmv_wide_k_lanes(QuantMode::Nvfp4), 16);
+        // Every 4-bit module in the nvfp4 variant is qmv_fast eligible: the
+        // alignment is 512 and the narrowest K in the body is the shared
+        // expert's and the experts' down_proj at 512.
+        assert_eq!(qmv_fast_k_alignment(4), 512);
+        for k in [512usize, 2048, 4096] {
+            assert_eq!(k % qmv_fast_k_alignment(4), 0, "K={k}");
+        }
     }
 }
 
@@ -354,10 +489,9 @@ fn gather_qmv(
     let bk = 32;
     let b = rhs_indices.numel();
     let fast = n % bn == 0 && k % qmv_fast_k_alignment(qw.bits) == 0;
-    let name = format!(
-        "affine_{}_{}",
+    let name = qw.kernel(
         if fast { "gather_qmv_fast" } else { "gather_qmv" },
-        qw.suffix(x.type_string())
+        x.type_string(),
     );
 
     // x is [R, 1, K] as far as the kernel is concerned: batch dims [R], then
@@ -367,17 +501,14 @@ fn gather_qmv(
     let x_strides = [k as i64, k as i64, 1];
     let w_shape = [qw.num_experts() as i32];
     let w_strides = [(qw.w.shape[1] * qw.w.shape[2]) as i64];
-    let s_strides = [(qw.scales.shape[1] * qw.scales.shape[2]) as i64];
-    let b_strides = [(qw.biases.shape[1] * qw.biases.shape[2]) as i64];
+    let (s_strides, b_strides) = qw.group_strides();
     // Both index arrays are materialised contiguous, so their strides are
     // trivially row-major and no `collapse_contiguous_dims` is needed.
     let idx_shape = [b as i32];
     let idx_strides = [1i64];
 
-    ctx.kernel(&name)
-        .arr(&qw.w)
-        .arr(&qw.scales)
-        .arr(&qw.biases)
+    let d = qw
+        .bind_wsb(ctx.kernel(&name))
         .arr(x)
         .arr(lhs_indices)
         .arr(rhs_indices)
@@ -390,9 +521,14 @@ fn gather_qmv(
         .bytes(&1i32) // w_batch_ndims
         .bytes_slice(&w_shape)
         .bytes_slice(&w_strides)
-        .bytes_slice(&s_strides)
-        .bytes_slice(&b_strides)
-        .bytes(&1i32) // index ndims
+        .bytes_slice(&s_strides);
+    // `add_strides_and_shapes` appends the zero point's strides only when
+    // there is a zero point, so for nvfp4 the index arrays follow the scales.
+    let d = match &b_strides {
+        Some(bs) => d.bytes_slice(bs),
+        None => d,
+    };
+    d.bytes(&1i32) // index ndims
         .bytes_slice(&idx_shape)
         .bytes_slice(&idx_strides)
         .bytes_slice(&idx_strides)
@@ -416,20 +552,21 @@ fn gather_qmm_rhs(
     let (bm, bn, bk) = (16usize, 32usize, 32usize);
     let (wm, wn) = (1usize, 2usize);
     let name = format!(
-        "affine_gather_qmm_rhs_nt_{}_bm_{bm}_bn_{bn}_bk_{bk}_wm_{wm}_wn_{wn}",
-        qw.suffix(x.type_string())
+        "{}_bm_{bm}_bn_{bn}_bk_{bk}_wm_{wm}_wn_{wn}",
+        qw.kernel("gather_qmm_rhs_nt", x.type_string())
     );
     let consts = [
         (200usize, m % bm == 0),
         (201, n % bn == 0),
         (202, k % bk == 0),
     ];
-    ctx.kernel_with(&name, &consts)
-        .arr(x)
-        .arr(&qw.w)
-        .arr(&qw.scales)
-        .arr(&qw.biases)
-        .arr(rhs_indices)
+    // Here `x` comes first and the optional slot is 3, after the scales.
+    let d = ctx.kernel_with(&name, &consts).arr(x).arr(&qw.w).arr(&qw.scales);
+    let d = match &qw.biases {
+        Some(b) => d.arr(b),
+        None => d.skip(),
+    };
+    d.arr(rhs_indices)
         .out(out)
         .bytes(&(m as i32))
         .bytes(&(n as i32))

@@ -38,7 +38,7 @@ fn matches_mlx_bit_for_bit() {
             // The reference took expert 0 out of the [256, ...] switch weight.
             qw.w = slice_expert0(&qw.w);
             qw.scales = slice_expert0(&qw.scales);
-            qw.biases = slice_expert0(&qw.biases);
+            qw.biases = qw.biases.as_ref().map(slice_expert0);
         }
 
         for m in ROWS {

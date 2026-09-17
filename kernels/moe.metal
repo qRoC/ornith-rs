@@ -166,3 +166,6 @@ template <typename T>
 instantiate_kernel("gather_rows_by_id_uint32", gather_rows_by_id, uint32_t)
 instantiate_kernel("gather_rows_by_id_bfloat16", gather_rows_by_id, bfloat16_t)
 instantiate_kernel("gather_rows_by_id_float32", gather_rows_by_id, float)
+// nvfp4 stores its scales as uint8 E4M3 rather than in the activation dtype,
+// so pruning `lm_head` for FR-Spec gathers a byte row rather than a bf16 one.
+instantiate_kernel("gather_rows_by_id_uint8", gather_rows_by_id, uint8_t)

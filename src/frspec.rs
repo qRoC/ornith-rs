@@ -85,7 +85,14 @@ impl FrSpec {
         let head = QuantMatrix {
             w: gather_rows(ctx, &lm_head.w, &ids, lm_head.w.shape[1]),
             scales: gather_rows(ctx, &lm_head.scales, &ids, lm_head.scales.shape[1]),
-            biases: gather_rows(ctx, &lm_head.biases, &ids, lm_head.biases.shape[1]),
+            // nvfp4 has no zero point, so there is a third row gather in
+            // affine mode and not in nvfp4 -- the pruning is per row and
+            // indifferent to what a row holds.
+            biases: lm_head
+                .biases
+                .as_ref()
+                .map(|b| gather_rows(ctx, b, &ids, b.shape[1])),
+            mode: lm_head.mode,
             group_size: lm_head.group_size,
             bits: lm_head.bits,
         };

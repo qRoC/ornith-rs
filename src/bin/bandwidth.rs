@@ -60,11 +60,12 @@ fn stream(ctx: &Context, bytes: usize) -> f64 {
 }
 
 /// Bytes a `quantized_matmul` has to read: the packed weights plus the scales
-/// and the biases, which live in their own arrays.
+/// and, in affine mode, the biases, which live in their own arrays. nvfp4 has
+/// no zero point, which is half of where its half-bit a weight comes from.
 fn matrix_bytes(qw: &QuantMatrix) -> usize {
     qw.w.numel() * qw.w.dtype.size()
         + qw.scales.numel() * qw.scales.dtype.size()
-        + qw.biases.numel() * qw.biases.dtype.size()
+        + qw.biases.as_ref().map_or(0, |b| b.numel() * b.dtype.size())
 }
 
 /// What the CPU can pull from the same memory, one pass over `bytes`.
