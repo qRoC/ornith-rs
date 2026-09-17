@@ -298,6 +298,60 @@ to the rebuild.
    baseline, continuations diverging late rather than immediately, MTP
    acceptance in the same band.
 
+## Why any of this -- the arithmetic the whole rebuild rests on
+
+A decode step reads **2.83 GB of weights** and nothing else is close. Over the
+session that measured this port, every other lever was tried and priced:
+
+| lever | verdict |
+|---|---|
+| barriers, epochs, encode order | ~7% total, half of it taken (MoE interleave), the rest needs a deferred op layer |
+| pipelining the host round trip | measured *worse*; the 128-dispatch commit threshold already does what `async_eval` does |
+| a better small-M matmul (`qmm_mma4`) | not applicable -- this port's kernels already amortize where it would pay |
+| handing the CPU a share of the rows | physics favourable (516-543 GB/s together vs 417-425 GPU alone), bit-exactness achievable, **shut by plumbing**: a split costs a command-buffer boundary at ~60 us and only `lm_head` is big enough to pay for one |
+| speculative decoding | done, and FR-Spec took 14% of the GPU work -- but it will not convert to wall clock until the stall is understood |
+
+**Bytes are what is left.** And the split of those 2.83 GB, read off the
+per-kernel table in `HANDOFF.md` (the big kernels take time in proportion to
+the bytes they read):
+
+| | share of traffic |
+|---|---|
+| modules at 8-bit g64 -- 260 of them | **~73%** |
+| modules at 4-bit g32 | ~27% |
+
+`linear_attn.in_proj` alone is 1.07 GB of the 2.83 and `lm_head` another 0.54,
+both 8-bit. So the prize is not the 4-bit body; it is the 8-bit 73%.
+
+Per-weight costs, from mlx's own formats:
+
+| format | bits/weight |
+|---|---|
+| affine int4 g32 (the body today) | 5.00 |
+| **mxfp4** | **4.25** |
+| nvfp4 g16 | 4.50 |
+| affine int8 g64 (the 260 today) | 8.50 |
+| mxfp8 | 8.25 |
+
+Which prices the two questions:
+
+- Re-cutting only the 4-bit body to mxfp4 moves 27% of traffic by 15% --
+  **~4%**. Barely worth the kernels on its own.
+- Re-cutting the 260 8-bit modules to a 4-bit format halves 73% of the traffic
+  -- **~36% fewer bytes a token**. That is the experiment.
+
+**How much of 36% becomes speed is not 36%.** `HANDOFF.md` is explicit that
+bytes convert to time only for reads already at the bandwidth roof: `lm_head`
+sustains 83% of peak and would convert nearly fully, while `in_proj_qkv` sits
+at 24% and is limited by its own ramp, so halving it buys much less than half
+its time. The honest band is 15-36%, and the top of it would put a step at
+~6.6 ms and decode near 150 tok/s against today's 92.
+
+**Why it was not simply done before:** the 260 modules are at 8 bits because
+whoever wrote the recipe found 4-bit affine insufficient there, and the
+artifact we had was already quantized -- there were no bf16 weights to re-cut.
+That is the entire reason for this rebuild.
+
 ## Phase 4 -- the experiments, in order
 
 One variant at a time; see the disk note below. For each: build, regenerate
@@ -313,6 +367,59 @@ token.
 
 C is the one worth doing all of this for. B is the step that proves the format
 works at all before betting the 8-bit half on it.
+
+**Judge each variant on three numbers, in this order.** Perplexity against
+`baseline/`'s 6.3327 is the coarse gate. The KL against `baseline/logprobs.bin`
+on the same 8 contexts is the sensitive one -- perplexity averages over
+thousands of tokens and hides a format that is wrong in a narrow place. Only
+then bytes and GPU busy, because a variant that is fast and worse is not a
+result. `tools/dump_artifact_baseline.py` produces all of it, pointed at the
+new artifact.
+
+Expect C to be the one that fails on quality if any does -- it is the variant
+betting that mxfp4 at 4 bits beats affine int4 at 4 bits by enough to replace
+8 bits. If it fails, D (nvfp4 g16, 4.50 bits, a finer grid at 16) is the next
+rung, and a partial C -- moving some of the 260 and not others -- is the
+fallback, since the recipe's `module_overrides` are per-module by suffix.
+
+### Formats and ideas considered, and where they stand
+
+- **mxfp4 / mxfp8 / nvfp4.** In mlx, kernels in `vendor/mlx`
+  (`fp_quantized.metal`), oracle available, one word in the recipe. This is the
+  route, for that reason and not because the method is the best known.
+- **A codebook derived from the weights** -- an exponent table plus a mantissa
+  in the weight, the table small enough to live in registers. Worth knowing
+  that this *is* microscaling: mxfp4 is 4-bit elements with a shared 8-bit
+  exponent per block of 32, which is the same idea with the table removed. The
+  richer version, a non-uniform grid fitted to the weights (NF4, SqueezeLLM),
+  buys quality per bit rather than bytes -- a global table could drop the
+  per-group scale, 5.00 -> 4.00 bits, but per-channel variation is what the
+  group scale exists for. **Note the trap in the framing**: the lookup argument
+  optimises arithmetic, and dequantization arithmetic here is already free --
+  it hides under the weight read, which is why the interleaved-layout idea was
+  killed earlier. Only bytes move the number.
+- **HIGGS** (Hadamard incoherence, MSE-optimal grids, data-free). One of its
+  three blockers is now gone -- the parent gives bf16 weights to quantize. The
+  rest stand: the runtime is CUDA (FLUTE), the format is not affine and rotates
+  the activations too, so it changes the op rather than the weight layout, and
+  MLX has no HIGGS, so there is no oracle and `max_abs == 0.0` has nothing to
+  compare against. Its own benchmark table is also a caution: 4-bit HIGGS is
+  *slower* than bf16 without `torch.compile` and only wins with it, which says
+  the speed comes from fusion rather than from the bytes.
+- **TurboQuant** (KV cache). Implemented for MLX on Metal already, in
+  `vendor/mlx-vlm/mlx_vlm/turboquant.py`, so the runtime exists. Wrong profile
+  for this model: 30 of 40 layers are gated-delta and have no KV cache at all,
+  so the cache is 20 KB a token of context -- 1.9% of a step's traffic at 2600
+  tokens, 24% at 32k. A long-context lever, and this port's bottleneck is
+  weights at short context. If it ever matters, port mlx-lm's own quantized KV
+  first, because that one has an oracle.
+- **The framing behind all of these** -- fusing the model and the algorithm,
+  specialising to weights a generic runtime cannot assume -- is already in this
+  port and already paid: FR-Spec is exactly that, a ranked sub-vocabulary baked
+  in, and it took 14% of the GPU work. The same framing covers a permanent
+  `lm_head` prune and reordering experts by usage. What it costs is the oracle,
+  which is why a bespoke format is the last resort and mlx's own formats are
+  the first.
 
 **The port needs `fp_quantized` kernels for B onwards** -- it carries only the
 `affine_*` family today. mlx has `fp_quantized.metal` and `fp_quantized.h` in
