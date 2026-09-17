@@ -1357,17 +1357,41 @@ Two things stand between the measurement and a win, and they are not small.
   core, 12 cores -- lands near 60 GB/s of weight consumption, against the
   GPU's 250. So the honest expectation is something like +25%, not +30% of
   542.
-- **The verification.** `max_abs == 0.0` against MLX is the rule that has not
-  moved, and a CPU row accumulates in a different order than the Metal
-  kernel's simdgroup reduction. Splitting by output rows at least keeps each
-  row's reduction self-contained, so reproducing the kernel's exact order on
-  the CPU is *possible* rather than obviously impossible -- but it is a
-  research question, not a port. mlx-dspark hit the same wall from the prefill
-  side and took the other branch: its CPU co-prefill is explicitly not
-  bit-identical, and it is off in their library API for that reason.
+- **The verification**, which was the gate, and which has now been measured
+  rather than argued. See below.
+
+#### The verification gate, measured
+
+`--bin cpu_row` transcribes `qmv_fast`'s order for 8-bit / group 64 straight
+out of `quantized.h` -- 32 lanes, 8 consecutive values each per 256-wide block,
+float accumulation, one `simd_sum`, a round to bfloat16 -- and computes real
+rows of `in_proj_qkv` on the CPU against what the GPU produced for the same
+activation. Two things in that kernel are written down nowhere: whether the
+Metal compiler contracts `accum += x[i] * w[i]` and `scale * accum + sum *
+bias` into fused multiply-adds, and what order `simd_sum` folds 32 lanes in.
+So the probe tries both contractions against three plausible trees --
+butterfly, halving, lane order -- six combinations in all.
+
+**All six reproduce the GPU on all 8192 rows, bit for bit.** Neither unknown
+has to be pinned, because the output is bfloat16 and its rounding absorbs the
+~1e-6 the orderings differ by. The probe also validates the layout reading as
+a side effect: a wrong transcription of the affine indexing would be wildly
+off, not exact.
+
+The margin is real but not generous. The worst row's spread between orderings
+is 2.0x the distance to a rounding tie, and 3 rows of 8192 -- 0.04% -- sit
+close enough that a different activation could land them on the other side.
+None did here. So this is not a proof, it is a strong measurement, and the
+thing that would catch a regression is the one already in place:
+`tests/quantized.rs` compares against MLX on real weights at `max_abs == 0.0`,
+and a CPU-split path would live or die by it.
+
+The probe's activation is synthetic, so the honest next check before any
+kernel is a real hidden state out of a decode step.
 
 So: the physics is measured and favourable, the arithmetic is plausible, and
-the verification is the thing to decide about before writing a line of it.
+**the verification gate is open** -- what is left is the NEON kernel and the
+row split, which are engineering rather than research.
 
 ---
 
