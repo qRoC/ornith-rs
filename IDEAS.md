@@ -125,7 +125,7 @@ It can be pruned **exactly**, not approximately:
 
 | | MB a token | |
 |---|---|---|
-| `lm_head` today, 8-bit g64 | 540.3 | 19.1% of a step |
+| `lm_head` when this was written, 8-bit g64 | 540.3 | 19.1% of a step |
 | 2-bit first pass | 143.0 | |
 | + refining 1024 candidates at 8 bits | 145.5 | **saves 14.0% of a step** |
 | + refining 4096 candidates | 152.2 | saves 13.7% |
@@ -134,9 +134,43 @@ The candidate count barely matters, which is what makes it robust: even a
 pathological 50000 survivors would land near 253 MB, still half of today. It
 degrades gracefully rather than failing.
 
-**Unmeasured:** how many candidates actually survive, which depends on the gap
-between the top logits and `2 d ||h||`. Measurable in one forward pass once the
-artifact exists, and the table says the answer barely changes the verdict.
+*That last sentence is the one the measurement below refutes: the survivor
+count is 248320, and `lm_head` is 4-bit and 318 MB now, not 540.*
+
+**MEASURED, and it does not work.** The survivor count was the one unknown
+and it is not "barely changes the verdict" -- it is everything. On 27 real
+hidden states from `refs/model`, a 2-bit first pass leaves **all 248320 rows
+alive**, every time. So the step reads the 2-bit copy *and* the full head:
+strictly worse than reading the head.
+
+| first stage | bits/w | bound `d||h||` | actual `|y-y'|` | loose by | survivors |
+|---|---:|---:|---:|---:|---:|
+| affine 2-bit | 2.50 | 32.60 | 0.476 | 68x | 248320 |
+| affine 3-bit | 3.50 | 14.03 | 0.207 | 68x | 248320 |
+| affine 4-bit | 4.50 | 6.73 | 0.103 | 66x | 3530 |
+| affine 6-bit | 6.50 | 2.15 | 0.044 | 49x | 4 |
+
+(One decode token; `||h|| = 97.5`, top logit 15.11, second 13.10.)
+
+**Why, and why it cannot be fixed while staying exact.** The bound is
+Cauchy-Schwarz: `|(w_v - w'_v).h| <= d_v ||h||`, which is tight only when the
+error vector points along `h`. Quantization error is isotropic in 2048
+dimensions and `h` is one direction, so the typical inner product is
+**sqrt(2048) ~ 45x** smaller than the bound -- measured 49-68x. Exactness is
+exactly what costs that factor: a probabilistic bound would prune hard, and
+would not be exact.
+
+**And the arithmetic never closes.** The precision that makes the bound bite
+costs more than the read it replaces. Against today's 4-bit g32 head (318 MB):
+a 4-bit first stage is 286 MB plus 4.5 MB of refinement -- 27 MB saved, 1.3%
+of a step -- and a 6-bit first stage is 414 MB, worse than not doing it.
+
+**The honest epitaph: this idea was competing with plain quantization for the
+same bytes, and plain quantization won first.** The table above was written
+when `lm_head` was 8-bit g64 and 540 MB, where a 4-bit first stage plus
+refinement (291 MB) really would have saved 46% of it. Phase 4 then moved
+`lm_head` to 4 bits by changing one line of a recipe, took that prize, and
+left this mechanism nothing to collect.
 
 Caveats worth stating: the argument is exact for **greedy**, where
 `argmax(log_softmax(x)) = argmax(x)` and no normalisation is needed. Sampled
