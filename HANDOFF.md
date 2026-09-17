@@ -916,6 +916,39 @@ requests in flight to saturate the memory system, pays its ramp, and stops. A
 decode step is a few hundred small reads and one big one, which is exactly why
 it averages ~250 GB/s.
 
+**And the same fact says a verify window is nearly free.** The matmuls again,
+across the M a speculative window of `depth + 1` tokens produces, as a multiple
+of what one row costs:
+
+| | M=1 | M=2 | M=3 | M=4 | M=5 | M=6 | M=7 | M=8 |
+|---|---|---|---|---|---|---|---|---|
+| `lm_head` 8-bit g64, 540 MB | 1.00 | 1.02 | 1.09 | 1.34 | 1.43 | 1.87 | 2.04 | 1.84 |
+| `in_proj_qkv` 8-bit g64, 17.8 MB | 1.00 | 1.05 | 0.80 | 1.10 | 1.12 | 1.15 | 1.18 | 1.21 |
+| `gate_up` 4-bit g32 | 1.00 | 0.95 | 1.18 | 0.97 | 0.94 | 1.22 | 1.31 | 1.26 |
+
+The small matrices are flat: eight rows for 21-26% more than one. That is the
+short-read story from the other side -- starved at M = 1, they have bus left
+over, and the extra rows ride on it. Only `lm_head` climbs, because it is the
+one already at the roof at M = 1 with nothing spare to ride on, and even it is
+2.0x at M = 7 rather than 7x.
+
+**Which rules out a kernel before porting it.** mlx-dspark's `small_m_qmm.py`
+carries `qmm_mma4`, an 8x8 `simdgroup_matrix` tile that reads each weight group
+once and reuses it across rows, against the claim that `quantized_matmul`
+"grows ~linearly in M for M in 2..8". That is not what this port does on these
+shapes -- the amortization the kernel exists to provide is already happening
+wherever it would pay. Its own table agrees from the other end: 0.85x at M = 4,
+1.05x at M = 5, so it only wins from M >= 6, and a window of `depth + 1` at
+the depths that are worth running never gets there.
+
+**It also confirms where a window's cost really is.** If the dense projections
+are flat in M, the growth in MTP's GPU busy with depth -- 9.6, 10.9, 12.1 ms a
+token at depths 1, 2, 3 -- is not the matmul shape. It is the draft steps
+themselves, and the expert gather, where four tokens pick ~30.5 distinct
+experts instead of one token's 8. That is the one part of a window that really
+does scale with its width, and it is already written down under "It does not
+pay off here".
+
 **That resets where the prize is.** If every read behaved like `lm_head`'s, the
 step would be 2.74 GB / 465 GB/s = **5.9 ms, about 170 tok/s** against today's
 88. The barrier-free bound measured earlier says the same thing from the other

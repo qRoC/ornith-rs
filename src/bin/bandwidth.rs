@@ -6,7 +6,13 @@
 //!
 //!   1. a kernel that only reads, at several sizes: the practical ceiling;
 //!   2. the real `quantized_matmul` on real weights at M = 1: what the kernel
-//!      that spends 38% of a decode step actually achieves.
+//!      that spends 38% of a decode step actually achieves;
+//!   3. the same matmul across M = 1..8, which is what a speculative verify
+//!      window costs. mlx-dspark's `small_m_qmm.py` says `quantized_matmul`
+//!      grows ~linearly in M there -- the weight read re-paid per row until
+//!      the GEMM tiling takes over around M >= 13 -- and a window of
+//!      `depth + 1` tokens lives exactly in that range. This measures whether
+//!      that holds here, because it prices every speculative depth.
 //!
 //! The gap between the two is ours to close. The gap between the first and
 //! 546 belongs to the machine.
@@ -105,5 +111,44 @@ fn main() {
             bytes as f64 / 1e6,
             100.0 * gbs / PEAK
         );
+    }
+
+    // The verify window's price. `x1` is what one row costs; a kernel that
+    // amortized the weight read across the window would hold that, and one
+    // that re-pays it per row would climb with M.
+    const MS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    println!("\nthe same matmuls across the verify window's M, as a multiple of M = 1:");
+    print!("  {:>28}", "matrix");
+    for m in MS {
+        print!("  {:>6}", format!("M={m}"));
+    }
+    println!("  {:>9}", "us at M=1");
+    for (name, path) in [
+        ("lm_head 8-bit g64", "language_model.lm_head"),
+        (
+            "in_proj_qkv 8-bit g64",
+            "language_model.model.layers.0.linear_attn.in_proj_qkv",
+        ),
+        (
+            "gate_up 4-bit g32 (shared)",
+            "language_model.model.layers.0.mlp.shared_expert.gate_proj",
+        ),
+    ] {
+        let qw = ws.quant_matrix(&ctx, path);
+        print!("  {name:>28}");
+        let mut base = 0.0;
+        for m in MS {
+            let x = Array::empty(&ctx, &[m, qw.in_dims()], Dtype::BF16);
+            zero(&ctx, &x);
+            ctx.sync();
+            let secs = best_of(&ctx, 20, || {
+                let _ = quantized_matmul(&ctx, &x, &qw);
+            });
+            if m == 1 {
+                base = secs;
+            }
+            print!("  {:>6.2}", secs / base);
+        }
+        println!("  {:>9.0}", base * 1e6);
     }
 }
