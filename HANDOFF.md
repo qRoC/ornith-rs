@@ -1560,6 +1560,26 @@ reads much more invitingly than it should.
 - `tools/gen_unicode.py` regenerates `src/tokenizer/tables.rs`. It is checked
   in; only re-run it when the Python that produced it moves to a new Unicode
   version, and re-run `tests/tokenizer.rs` afterwards.
+- **Price the options before choosing between them, not after.** The first
+  version of `REBUILD.md`'s Phase 4 moved all 260 eight-bit modules at once and
+  put mxfp4 first. Both were wrong, and both were computable from files already
+  in the repository: `baseline/config.json` plus the architecture says four
+  families carry 57% of a step's traffic while the 80 gate modules carry 0.8%,
+  and comparing mxfp4's power-of-two scale with no zero-point against affine
+  int4's bf16 scale *with* one says it is the weaker format for weights -- so
+  it was the wrong thing to ask to succeed where affine int4 had already
+  failed. Neither needed a measurement, only arithmetic that was skipped
+  because a plausible mechanism felt like a conclusion.
+
+  The same shape recurred all session: CPU co-execution estimated at +25% and
+  priced at 2.4% once the command-buffer boundary was counted; "the original
+  weights are gone" asserted without opening the artifact's own
+  `conversion_receipt.json`; scheduling called closed qualitatively before it
+  was priced at 12% and then measured at 3.3%. Every time, the data was
+  already on disk. **When about to recommend one option over another, first
+  compute how the quantity being optimized is distributed across them** -- in
+  this project that is usually `config.json`, the per-kernel table, or
+  `--bin bandwidth`.
 - When a composed test fails and its parts pass, suspect the plumbing between
   them — and write a narrower dump rather than reasoning about it. Both the
   buffer-pool race and the dispatch-grid overrun were found that way.
