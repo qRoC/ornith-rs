@@ -6,12 +6,23 @@
 //! carries a JIT compiler, residency sets, fences and multiple streams, none of
 //! which a single-stream inference loop needs.
 //!
-//! Ordering model (same guarantee mlx relies on): every dispatch goes through
-//! one queue, into one compute encoder at a time, and Metal's default
-//! `MTLDispatchTypeSerial` inserts a barrier between consecutive dispatches in
-//! an encoder. So writes from dispatch N are visible to dispatch N+1 with no
-//! explicit synchronisation, and a recycled buffer can never be written by a
-//! later dispatch while an earlier one still reads it.
+//! Ordering model, in two parts.
+//!
+//! *Inside* an encoder, Metal's default `MTLDispatchTypeSerial` inserts a
+//! barrier between consecutive dispatches, so writes from dispatch N are
+//! visible to dispatch N+1 with no explicit synchronisation, and a recycled
+//! buffer can never be written by a later dispatch while an earlier one still
+//! reads it.
+//!
+//! *Across* encoders the queue is what orders the work, and mlx relies on
+//! exactly that -- its `commit()` starts the next command buffer with no
+//! synchronisation of its own. What mlx does add is a fence per encoder
+//! (`CommandEncoder::end_encoding`), waited on by whichever later encoder
+//! reads that encoder's outputs; it needs them because its encoders are
+//! concurrent. This port signals one fence at the end of every encoder and
+//! waits on it in the next, which is the coarse version of the same thing. It
+//! costs nothing measurable and it makes the boundary explicit rather than
+//! inherited from the queue.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -24,8 +35,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice,
-    MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice, MTLDispatchType,
+    MTLFence, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::safetensors::Mapping;
@@ -40,6 +51,7 @@ type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 type ComputeEncoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 type MTLBuf = Retained<ProtocolObject<dyn MTLBuffer>>;
+type Fence = Retained<ProtocolObject<dyn MTLFence>>;
 
 /// A Metal function constant value.
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +141,37 @@ fn bucket(len: usize) -> usize {
     len.div_ceil(step) * step
 }
 
+// --- profiling ---------------------------------------------------------------
+
+/// Per-run counters, off unless `ORNITH_PROF` is set.
+///
+/// The question they answer is where a decode step's wall time goes: if the
+/// summed GPU busy time is well under it, the step is bound by encoding or by
+/// the round trip to the host, not by the kernels.
+#[derive(Default)]
+pub struct Prof {
+    pub on: bool,
+    pub commits: usize,
+    pub dispatches: usize,
+    /// Summed `GPUEndTime - GPUStartTime` over committed command buffers.
+    pub gpu_s: f64,
+    /// Time blocked in `waitUntilCompleted`.
+    pub wait_s: f64,
+    pub by_kernel: HashMap<String, usize>,
+    /// GPU seconds per kernel. Only filled when a command buffer holds a
+    /// single dispatch (`ORNITH_COMMIT_EVERY=1`), since a buffer's timestamps
+    /// cover everything in it.
+    pub gpu_by_kernel: HashMap<String, f64>,
+    /// GPU seconds in buffers that held more than one dispatch.
+    pub gpu_mixed: f64,
+    /// Kernel names dispatched into the buffer now being built.
+    cb_names: Vec<String>,
+    /// Committed but not yet harvested; their timestamps are only readable
+    /// once the GPU is done with them. Carries the one kernel name when the
+    /// buffer holds exactly one dispatch.
+    pending: Vec<(CommandBuffer, Option<String>)>,
+}
+
 // --- context ----------------------------------------------------------------
 
 pub struct Context {
@@ -146,9 +189,25 @@ pub struct Context {
     /// Buffers kept alive until the current command buffer completes.
     retained: RefCell<Vec<Rc<Buffer>>>,
     dispatches: RefCell<usize>,
-    /// Commit after this many dispatches so the GPU is never idle waiting for
-    /// the CPU to finish encoding a whole forward pass.
+    /// Signalled at the end of each encoder and waited on by the next, so a
+    /// command-buffer boundary carries the dependencies across it. Rotated so
+    /// a fence is never re-signalled while an earlier wait on it is still
+    /// outstanding; mlx gives every encoder its own for the same reason.
+    fences: Vec<Fence>,
+    next_fence: RefCell<usize>,
+    /// The fence the previous encoder signalled, if there was one.
+    last_fence: RefCell<Option<Fence>>,
+    /// The most recently committed command buffer, kept so [`Context::sync`]
+    /// has something to wait on when `flush` already submitted everything.
+    last_committed: RefCell<Option<CommandBuffer>>,
+    /// Commit after this many dispatches, trading two costs against each
+    /// other: a command buffer costs ~60 us of GPU time, and a large one
+    /// leaves the GPU idle while the CPU fills it. Measured on this machine at
+    /// 256 greedy tokens -- 32: 68 tok/s, 128: 82, 512: 79, where 512 is the
+    /// end where the GPU starts waiting. `ORNITH_COMMIT_EVERY` overrides it.
     pub max_dispatches_per_commit: usize,
+    prof: RefCell<Prof>,
+    no_barrier: bool,
 }
 
 impl Context {
@@ -170,6 +229,8 @@ impl Context {
         } else {
             0
         };
+        let fences: Vec<Fence> =
+            (0..8).map(|_| device.newFence().expect("newFence failed")).collect();
         Ok(Context {
             device,
             queue,
@@ -182,7 +243,19 @@ impl Context {
             enc: RefCell::new(None),
             retained: RefCell::new(Vec::new()),
             dispatches: RefCell::new(0),
-            max_dispatches_per_commit: 128,
+            fences,
+            next_fence: RefCell::new(0),
+            last_fence: RefCell::new(None),
+            last_committed: RefCell::new(None),
+            max_dispatches_per_commit: std::env::var("ORNITH_COMMIT_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(128),
+            prof: RefCell::new(Prof {
+                on: std::env::var_os("ORNITH_PROF").is_some(),
+                ..Prof::default()
+            }),
+            no_barrier: std::env::var_os("ORNITH_NO_BARRIER").is_some(),
         })
     }
 
@@ -327,10 +400,34 @@ impl Context {
             return e.clone();
         }
         let cb = self.queue.commandBuffer().expect("commandBuffer failed");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder failed");
+        // `ORNITH_NO_BARRIER=1` is a measurement mode, not an option: a
+        // concurrent encoder with no barriers at all lets every dispatch in a
+        // buffer overlap, which is wrong but puts a ceiling on what removing
+        // the serial encoder's per-dispatch barrier could ever buy.
+        let enc = if self.no_barrier {
+            cb.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+                .expect("computeCommandEncoder failed")
+        } else {
+            cb.computeCommandEncoder().expect("computeCommandEncoder failed")
+        };
+        if let Some(f) = self.last_fence.borrow().as_ref() {
+            enc.waitForFence(f);
+        }
         *self.cb.borrow_mut() = Some(cb);
         *self.enc.borrow_mut() = Some(enc.clone());
         enc
+    }
+
+    /// Signal this encoder's fence and end it. Everything the next encoder
+    /// does waits on that fence, so the boundary is ordered.
+    fn end_encoder(&self, enc: &ComputeEncoder) {
+        let mut idx = self.next_fence.borrow_mut();
+        let fence = self.fences[*idx % self.fences.len()].clone();
+        *idx += 1;
+        drop(idx);
+        enc.updateFence(&fence);
+        enc.endEncoding();
+        *self.last_fence.borrow_mut() = Some(fence);
     }
 
     /// Start a dispatch of `kernel`.
@@ -342,6 +439,7 @@ impl Context {
         let pipe = self.pipeline_with(name, consts);
         let enc = self.ensure_encoder();
         enc.setComputePipelineState(&pipe);
+        self.prof_name(name);
         return Dispatch { ctx: self, enc, pipe, slot: 0 };
     }
 
@@ -349,38 +447,60 @@ impl Context {
         let pipe = self.pipeline_typed(name, consts);
         let enc = self.ensure_encoder();
         enc.setComputePipelineState(&pipe);
+        self.prof_name(name);
         Dispatch { ctx: self, enc, pipe, slot: 0 }
     }
 
     /// End the current encoder and submit. Does not wait.
     pub fn flush(&self) {
         if let Some(enc) = self.enc.borrow_mut().take() {
-            enc.endEncoding();
+            self.end_encoder(&enc);
         }
         if let Some(cb) = self.cb.borrow_mut().take() {
             cb.commit();
+            self.prof_commit(&cb);
             *self.dispatches.borrow_mut() = 0;
             // The command buffer retains its resources until completion, so
             // dropping our own references here is safe.
             self.retained.borrow_mut().clear();
+            *self.last_committed.borrow_mut() = Some(cb);
         }
     }
 
     /// Submit and wait for the GPU. Required before reading any buffer.
+    ///
+    /// "Nothing open" is not the same as "nothing running": a dispatch that
+    /// lands exactly on a commit boundary leaves the encoder and the command
+    /// buffer empty while the GPU is still working. Waiting has to fall back
+    /// to the last buffer `flush` committed, or the host reads a buffer whose
+    /// kernel has not run -- which reads as zeros, and is the whole forward
+    /// pass when the dispatch that lands there is the embedding gather.
     pub fn sync(&self) {
-        if self.enc.borrow().is_none() && self.cb.borrow().is_none() {
-            return;
-        }
         if let Some(enc) = self.enc.borrow_mut().take() {
-            enc.endEncoding();
+            self.end_encoder(&enc);
         }
-        let cb = self.cb.borrow_mut().take();
-        if let Some(cb) = cb {
-            cb.commit();
+        let open = self.cb.borrow_mut().take();
+        let waiting_on = match open {
+            Some(cb) => {
+                cb.commit();
+                self.prof_commit(&cb);
+                *self.dispatches.borrow_mut() = 0;
+                self.retained.borrow_mut().clear();
+                *self.last_committed.borrow_mut() = None;
+                Some(cb)
+            }
+            None => self.last_committed.borrow_mut().take(),
+        };
+        if let Some(cb) = waiting_on {
+            let t0 = self.prof.borrow().on.then(std::time::Instant::now);
             cb.waitUntilCompleted();
-            *self.dispatches.borrow_mut() = 0;
-            self.retained.borrow_mut().clear();
+            if let Some(t0) = t0 {
+                self.prof.borrow_mut().wait_s += t0.elapsed().as_secs_f64();
+            }
         }
+        // The queue is serial, so everything committed before that buffer has
+        // completed too and the timestamps are readable now.
+        self.prof_harvest();
     }
 
     /// Keep a buffer alive until the current batch completes.
@@ -388,7 +508,100 @@ impl Context {
         self.retained.borrow_mut().push(b);
     }
 
+    // --- profiling ----------------------------------------------------------
+
+    fn prof_name(&self, name: &str) {
+        let mut p = self.prof.borrow_mut();
+        if !p.on {
+            return;
+        }
+        *p.by_kernel.entry(name.to_string()).or_default() += 1;
+        p.cb_names.push(name.to_string());
+    }
+
+    fn prof_commit(&self, cb: &CommandBuffer) {
+        let mut p = self.prof.borrow_mut();
+        if !p.on {
+            return;
+        }
+        p.commits += 1;
+        let names = std::mem::take(&mut p.cb_names);
+        let one = (names.len() == 1).then(|| names[0].clone());
+        p.pending.push((cb.clone(), one));
+    }
+
+    /// Sum the GPU busy time of every command buffer that has completed.
+    fn prof_harvest(&self) {
+        let mut p = self.prof.borrow_mut();
+        if !p.on {
+            return;
+        }
+        for (cb, name) in std::mem::take(&mut p.pending) {
+            let dt = cb.GPUEndTime() - cb.GPUStartTime();
+            p.gpu_s += dt;
+            match name {
+                Some(n) => *p.gpu_by_kernel.entry(n).or_default() += dt,
+                None => p.gpu_mixed += dt,
+            }
+        }
+    }
+
+    /// `(commits, dispatches, gpu_s, wait_s)` since the last reset.
+    pub fn prof_totals(&self) -> (usize, usize, f64, f64) {
+        let p = self.prof.borrow();
+        (p.commits, p.dispatches, p.gpu_s, p.wait_s)
+    }
+
+    pub fn prof_on(&self) -> bool {
+        self.prof.borrow().on
+    }
+
+    /// `(kernel, dispatches, gpu_s)`, most GPU time first. The GPU column is
+    /// only meaningful under `ORNITH_COMMIT_EVERY=1`; otherwise the time
+    /// lands in `gpu_mixed` and comes back zero here.
+    pub fn prof_kernel_times(&self) -> (Vec<(String, usize, f64)>, f64) {
+        let p = self.prof.borrow();
+        let mut v: Vec<(String, usize, f64)> = p
+            .by_kernel
+            .iter()
+            .map(|(k, n)| (k.clone(), *n, p.gpu_by_kernel.get(k).copied().unwrap_or(0.0)))
+            .collect();
+        v.sort_by(|a, b| b.2.total_cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+        (v, p.gpu_mixed)
+    }
+
+    /// Dispatch counts by kernel, most dispatched first.
+    pub fn prof_by_kernel(&self) -> Vec<(String, usize)> {
+        let p = self.prof.borrow();
+        let mut v: Vec<(String, usize)> =
+            p.by_kernel.iter().map(|(k, n)| (k.clone(), *n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Zero the counters, keeping them on. Called once the prompt is in, so
+    /// the numbers describe decode steps only.
+    pub fn prof_reset(&self) {
+        let mut p = self.prof.borrow_mut();
+        if !p.on {
+            return;
+        }
+        p.commits = 0;
+        p.dispatches = 0;
+        p.gpu_s = 0.0;
+        p.wait_s = 0.0;
+        p.by_kernel.clear();
+        p.gpu_by_kernel.clear();
+        p.gpu_mixed = 0.0;
+    }
+
     fn count_dispatch(&self) {
+        {
+            let mut p = self.prof.borrow_mut();
+            if p.on {
+                p.dispatches += 1;
+            }
+        }
         let mut n = self.dispatches.borrow_mut();
         *n += 1;
         let over = *n >= self.max_dispatches_per_commit;

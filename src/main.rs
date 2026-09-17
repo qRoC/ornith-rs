@@ -194,6 +194,58 @@ fn parse_args() -> Args {
     a
 }
 
+/// `ORNITH_PROF=1`: where a decode step's wall time goes.
+///
+/// `gpu` is summed `GPUEndTime - GPUStartTime` over the step's command
+/// buffers, so `wall - gpu` is what the GPU spent idle -- waiting on the CPU
+/// to encode, or on the round trip that hands the sampled token back.
+fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
+    if steps == 0 {
+        return;
+    }
+    let (commits, dispatches, gpu_s, wait_s) = ctx.prof_totals();
+    let n = steps as f64;
+    let ms = |s: f64| s * 1e3 / n;
+    eprintln!(
+        "[prof: {:.2} ms/token wall, {:.2} gpu ({:.0}%), {:.2} blocked in wait; \
+         {:.0} dispatches, {:.1} commits per token]",
+        ms(gen_time),
+        ms(gpu_s),
+        100.0 * gpu_s / gen_time.max(1e-9),
+        ms(wait_s),
+        dispatches as f64 / n,
+        commits as f64 / n,
+    );
+    let (by, mixed) = ctx.prof_kernel_times();
+    if mixed > 0.0 {
+        // Every command buffer held a whole batch of dispatches, so its
+        // timestamps cannot be split between them.
+        let shown: Vec<String> = by
+            .iter()
+            .take(12)
+            .map(|(k, c, _)| format!("{} {:.0}", k, *c as f64 / n))
+            .collect();
+        eprintln!(
+            "[prof: {} kernels, most dispatched per token: {}]",
+            by.len(),
+            shown.join(", ")
+        );
+        eprintln!("[prof: re-run with ORNITH_COMMIT_EVERY=1 to attribute GPU time per kernel]");
+        return;
+    }
+    eprintln!("[prof: GPU time per kernel, per token]");
+    let total: f64 = by.iter().map(|(_, _, g)| *g).sum();
+    for (k, c, g) in by.iter().take(16) {
+        eprintln!(
+            "  {:>7.3} ms  {:>5.1}%  x{:<5.0}  {}",
+            g * 1e3 / n,
+            100.0 * g / total.max(1e-12),
+            *c as f64 / n,
+            k
+        );
+    }
+}
+
 /// A user error -- an unreadable image, or one the processor would have to
 /// resample -- reported as a message rather than a panic with a backtrace.
 fn die(message: &str) -> ! {
@@ -380,10 +432,14 @@ impl Session<'_> {
 
         let mut fed: Vec<u32> = Vec::new();
         let mut stats: Option<MtpStats> = None;
+        let ctx = self.ctx;
         {
             let progress = |done: usize, total: usize| {
                 if done == total {
                     prompt_time = t0.elapsed().as_secs_f64();
+                    // Prefill has its own shapes and dispatch counts; the
+                    // decode steps are what the counters are meant to describe.
+                    ctx.prof_reset();
                 } else if total > DEFAULT_PREFILL_STEP_SIZE {
                     eprint!("\rprompt {done}/{total}");
                 }
@@ -466,6 +522,9 @@ impl Session<'_> {
             n_generated,
             n_generated as f64 / gen_time.max(1e-9),
         );
+        if ctx.prof_on() {
+            report_prof(ctx, n_generated, gen_time);
+        }
         detok.text.clone()
     }
 }
