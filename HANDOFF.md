@@ -198,6 +198,10 @@ tools/weight_error.py      what a variant's format actually cost, against the
                            bf16 parent, one module at a time
 tools/step_bytes.py        bytes one decode step reads, from the safetensors
                            headers rather than by hand
+tools/aq.py                mlx's affine_quantize in numpy, bit-exact, with the
+                           (scale, bias) encoding swappable
+tools/forge_fp8scale_twin.py  a 4.50-bit format's stand-in, written in the
+                           5.00-bit layout so it needs no kernel to measure
 tools/gen_unicode.py       the Unicode tables the tokenizer needs
 refs/<case>/               the references themselves (not in git)
 tests/                     one test file per reference case
@@ -1343,27 +1347,65 @@ In order:
      kernel in the step, and taking it means reordering across block and layer
      boundaries, which needs a deferred op layer rather than another dozen
      lines. Worth doing only if something else wants that layer anyway.
-   - **Then bytes, which is the only lever left at batch 1 -- and mlx's own
-     formats are now spent.** `REBUILD.md` Phase 4 is done: four artifacts
-     built from the verified parent, judged on perplexity, KL, bytes and GPU
-     busy, and the answer is `int4-head-linattn` -- 24.2% of a step's traffic
-     and 11.8% of its GPU busy for 0.048 nats. Both ways past it have been
-     tried and both fail on the same knee: more modules
-     (`int4-except-gates`, 0.0344 nats a point) and a cheaper format
-     (`nvfp4-head-linattn`, 0.0693 a point, and strictly dominated by the
-     first). mlx has exactly four modes and mxfp4 and mxfp8 were priced out
-     without building. So the next byte is not a mode string any more.
+   - **Then bytes -- and the byte lever is now spent, in both senses.**
+     `REBUILD.md` Phase 4 is done. Five artifacts built from the verified
+     parent and judged on perplexity, KL, bytes and GPU busy; the answer is
+     `int4-head-linattn`, 24.2% of a step's traffic and 11.8% of its GPU busy
+     for 0.048 nats. **Three ways past it were tried and all three failed.**
 
-     What is left is `IDEAS.md`, with the caveat now written at the top of
-     it: the grid has about one bit a weight in it and vector quantization
-     does not collect it; the cheap win looked like the group metadata; and
-     the one structural idea is a two-stage `lm_head` worth 14% of a step and
-     exact for greedy decoding. **The two metadata ideas are the ones nvfp4
-     just failed at** -- spending a coarser shared scale to pay for a smaller
-     group -- and they were ranked on the same synthetic study that
-     mispriced it, so settle them with `tools/weight_error.py` on real
-     weights before building. The `lm_head` idea does not share that risk:
-     it is exact, not approximate.
+     | | GB/token | max KL | |
+     |---|---:|---:|---|
+     | `int4-head-linattn` | 2.076 | **0.048** | the answer |
+     | `nvfp4-head-linattn` | 1.925 | 0.429 | mlx's 4.50-bit mode |
+     | fp8-scale twin | 1.925 | 0.443 | the best non-mlx 4.50-bit format |
+     | `int4-except-gates` | 1.858 | 0.323 | more modules, not a cheaper format |
+
+     mlx has exactly four modes: affine is the answer, nvfp4 was built and
+     lost, mxfp4 and mxfp8 were priced out without building. The best format
+     outside mlx at the same 4.50 bits was built as a stand-in (no kernel
+     needed -- see `tools/forge_fp8scale_twin.py`) and lost by the same
+     margin. The 4.50-bit space is closed.
+
+   - **Two findings from that which outlast the formats, and both change how
+     the next thing should be judged.**
+
+     **Weight error does not predict the distribution.** The fp8-scale twin
+     is +3% relative weight error from `int4-head-linattn` and pays 9.2x the
+     KL; nvfp4 is +34% and pays 8.9x. `tools/quant_error.py` and
+     `tools/weight_error.py` explain a result -- the second correctly
+     diagnosed nvfp4's subnormal group scales -- and neither can rank a
+     format. **`IDEAS.md` is entirely denominated in that currency**, and
+     carries the warning; its two headline ideas were both built today and
+     both are dead (the two-stage exact `lm_head` prunes nothing: a 2-bit
+     first pass leaves all 248320 rows alive, because Cauchy-Schwarz over
+     2048 dimensions runs 49-68x loose and that looseness *is* the
+     exactness).
+
+     **Every Phase 4 verdict rests on one context of eight.** `Дважды два
+     равно`, the only Russian prompt, separates the variants by a factor of
+     ten; on the other seven all four sit within 0.1 nats of the control and
+     of each other, two of them within 0.001. By *median*
+     `int4-except-gates` ties `int4-head-linattn`. It is not noise -- the
+     same context discriminates across four independently built artifacts in
+     the same order -- it is the only probe in the set with any power. The
+     conclusion stands; the confidence in it does not.
+
+   - **So the next thing is the probe set, before any more formats or
+     ideas.** Whatever is tried will be judged on those eight contexts and
+     6620 tokens of perplexity, and that instrument currently has about one
+     bit of discriminating power -- the corpus put the twin two parts in ten
+     thousand from a variant it is nine times worse than. It wants contexts
+     hard in the way context 6 is hard (other scripts, rare tokens,
+     long-range dependencies) and enough of them that a maximum is not a
+     single sample. Cheap: the list is a constant in
+     `tools/dump_artifact_baseline.py`, and re-running it over the four
+     artifacts on disk re-judges everything Phase 4 decided.
+
+     After that, the one idea not denominated in weight error is
+     **activation-aware scaling** (`IDEAS.md`): it produces an ordinary
+     affine artifact, so `max_abs == 0.0` against MLX survives untouched, and
+     it attacks *output* error, which is the axis none of this touched.
+
 3. **Rebuild the artifact from its parent -- DONE**, Phases 0 through 4, and
    it is what unblocked the byte lever above. `REBUILD.md` is the record. The
    parent is `ornith-ai/Ornith-1.5-35B-A3B@10fbf86f`, it is kept on disk
