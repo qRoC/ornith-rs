@@ -744,11 +744,26 @@ then bytes and GPU busy, because a variant that is fast and worse is not a
 result. `tools/dump_artifact_baseline.py` produces all of it, pointed at the
 new artifact.
 
-Expect C to be the one that fails on quality if any does -- it is the variant
-betting that mxfp4 at 4 bits beats affine int4 at 4 bits by enough to replace
-8 bits. If it fails, D (nvfp4 g16, 4.50 bits, a finer grid at 16) is the next
-rung, and a partial C -- moving some of the 260 and not others -- is the
-fallback, since the recipe's `module_overrides` are per-module by suffix.
+**B is also the only variant that can fail on quality.** C does not re-ask
+B's question: nvfp4 g16 measures 9.51 / 9.28 / 9.18% against affine int4
+g32's 7.82 / 9.18 / 9.37%, which is the same error to within the noise of the
+measurement, half a bit cheaper. So C cannot rescue a failed B and cannot
+spoil a successful one; it is a bytes-only follow-up, judged on bytes. D is
+not a rung below C either -- it is the same 4-bit question asked of two more
+families.
+
+If B fails, the fallback is a **partial B**: move some of the four families
+and not others, which `module_overrides` supports directly, being per-module
+by suffix. `lm_head` and `linear_attn.in_proj_qkv` are 38% of decode traffic
+between them, so even half of B is most of the prize.
+
+**mxfp4 is not a fallback and not a rung.** `tools/quant_error.py` puts it at
+20.32 / 21.19 / 22.00% -- two and a half times affine int4's error to save
+0.75 bits. Measured against the best any code can do at its own rate it is
+worse still: the gaussian floor is 5.26% at 4.25 bits and 3.12% at 5.00, so
+affine int4 lands 2.5x above its floor and mxfp4 nearly 4x above its own.
+That is the power-of-two scale and the missing zero-point, not the bit rate,
+and no ordering of the experiments makes it the right thing to try.
 
 ### Formats and ideas considered, and where they stand
 
