@@ -57,6 +57,18 @@ What it restores, and why each one is not cosmetic:
   config.json: mlx_lm_extra_tensors.mtp_tensor_count, vision_config.dtype
       Recorded by 2.9.1, dropped by 2.11.3. Documentation only.
 
+  the vision tower's patch_embed.proj.weight
+      The only difference here that is a *weight layout*. mlx's Conv3d wants
+      `(out, kD, kH, kW, in)`; a torch checkpoint stores
+      `(out, in, kD, kH, kW)`. 2.9.1 transposed it when it grafted the tower
+      in, so the published artifact held `[1152, 2, 16, 16, 3]`; 2.11.3's
+      `graft_vision_tower` copies the parent's `[1152, 3, 2, 16, 16]`
+      verbatim. MTPLX itself does not care -- `_conv_weight_in_mlx_layout`
+      transposes at load -- but this port reads the tensor as it lies and
+      `VisionTower::load` asserts on the shape, so it fails closed rather than
+      quietly convolving the wrong axes. `tools/dump_vision_ops.py`, which
+      reads the raw tensor too, is where it surfaced.
+
 **The MTP sidecar's seven RMSNorm gains are deliberately left alone**, and
 this is worth writing down because it looks wrong and is not. Forge adds 1.0
 to all seven on the way out (`shift_delta_mtp_norms`), which reads as a double
@@ -124,6 +136,54 @@ def published_sums():
     return sums
 
 
+def fix_vision_conv_layout(art, cfg):
+    """Transpose patch_embed.proj.weight into mlx's Conv3d layout.
+
+    The same test MTPLX applies at load time (`_conv_weight_in_mlx_layout`):
+    a 5-D weight whose last axis is the channel count is already mlx's.
+    """
+    import mlx.core as mx
+
+    vision = None
+    index = art / "model.safetensors.index.json"
+    if index.exists():
+        wm = json.loads(index.read_text())["weight_map"]
+        for k, f in wm.items():
+            if k.endswith("patch_embed.proj.weight"):
+                vision, key = art / f, k
+                break
+    if vision is None or not vision.exists():
+        print("  [skip] vision tower -- no patch_embed.proj.weight in the index")
+        return 0
+
+    weights = dict(mx.load(str(vision)))
+    w = weights[key]
+    in_channels = int((cfg.get("vision_config") or {}).get("in_channels", 3))
+    if w.ndim != 5:
+        print(f"  [skip] {vision.name} -- {key} is {w.ndim}-D, not a Conv3d weight")
+        return 0
+    if w.shape[-1] == in_channels:
+        print(f"  [ok  ] {vision.name} -- patch_embed is already {list(w.shape)}")
+        return 0
+    if w.shape[1] != in_channels:
+        raise SystemExit(f"{key} is {list(w.shape)}, neither mlx nor torch layout")
+
+    weights[key] = w.transpose(0, 2, 3, 4, 1)
+    # `mx.load` is lazy and the arrays stay bound to the file, so saving over
+    # that same path truncates it out from under the reads still to come --
+    # which empties the sidecar. Materialise first, then write beside it and
+    # rename.
+    mx.eval(*weights.values())
+    # The name has to keep the .safetensors extension: mx.save_safetensors
+    # appends one when it is missing, and the rename would then find nothing.
+    tmp = vision.with_name(vision.stem + ".new.safetensors")
+    mx.save_safetensors(str(tmp), weights, metadata={"format": "mlx"})
+    tmp.replace(vision)
+    print(f"  [edit] {vision.name} -- patch_embed {list(w.shape)} -> "
+          f"{list(weights[key].shape)}, mlx Conv3d layout")
+    return 1
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -178,6 +238,8 @@ def main():
               "eos_token_id, mtp_tensor_count, vision dtype")
     else:
         print("  [ok  ] config.json -- already aligned")
+
+    changed += fix_vision_conv_layout(art, cfg)
 
     print(f"\n{changed} file(s) changed. Re-run tools/check_rebuild.py next.")
     return 0

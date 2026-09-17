@@ -206,6 +206,21 @@ def main():
               "" if not unshifted else
               f"{len(unshifted)} of 7 still equal the parent's delta encoding")
 
+    # The vision patch embedding must be in mlx's Conv3d layout,
+    # (out, kD, kH, kW, in). 2.9.1 transposed it when it grafted the tower in;
+    # 2.11.3 copies the parent's torch layout verbatim. MTPLX transposes at
+    # load either way, but this port reads the tensor as it lies --
+    # `VisionTower::load` asserts, so it fails closed rather than convolving
+    # the wrong axes. `tools/align_rebuild.py` restores it.
+    conv = next((k for k in wm if k.endswith("patch_embed.proj.weight")), None)
+    if conv is None:
+        info("vision patch embed", "no patch_embed.proj.weight in the index")
+    else:
+        vshape = safetensors_header(art / wm[conv])[conv]["shape"]
+        want = int((cfg.get("vision_config") or {}).get("in_channels", 3))
+        check("INVARIANT", "patch_embed is in mlx Conv3d layout",
+              len(vshape) == 5 and vshape[-1] == want, f"{vshape}")
+
     tc = cfg.get("text_config", cfg)
     rope = (tc.get("rope_parameters") or {}).get("type")
     check("INVARIANT", "rope_parameters.type is default (blind)",

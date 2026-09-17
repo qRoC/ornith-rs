@@ -507,35 +507,83 @@ wall clock is, which is why the counts are what this table records.
   the parent's nor correct; catching that needs the acceptance profile, which
   is the argument for keeping one per variant.
 
-## Phase 3 -- re-anchoring the port
+## Phase 3 -- re-anchoring the port -- **DONE**
 
-1. **Regenerate every golden reference.** They are tied to the artifact's exact
-   weights. All the writers are in `tools/` and `HANDOFF.md`'s working notes
-   list the commands; `refs/` is ~510 MB.
-2. **Run the whole suite**, including the `--ignored` model, generate, mtp and
-   vision cases. The contract does not move: `max_abs == 0.0`.
-3. **Check the artifact properties this port depends on**, which no test
-   covers because they are true of the artifact rather than of the code.
-   `tools/check_rebuild.py` now does all of them and marks them (blind); it
-   passes on the Phase 2 rebuild. They are worth knowing by name:
-   - `conv1d.weight` must be `[D, K, 1]` -- already sanitized, so mlx-lm's
-     `TextModel.sanitize` does **not** add 1.0 to the norm weights. If a
-     rebuild produces `[D, 1, K]` or similar, the port takes the "double
-     shift" `qwen3_5_mtp_patch.py` warns about, and *the golden tests will not
-     catch it*, because MLX would shift the same way.
-   - `rope_parameters.type` must still be `"default"`, or the text path stops
-     being plain rotary.
-   - The MTP sidecar's seven RMSNorm gains must **not** be the parent's: the
-     parent stores them delta-encoded and the conversion is what adds the 1.0.
-     Left unshifted the head drafts nothing, measured at 0 of 95, with every
-     test green.
-   - `tokenizer.json` must still carry the artifact's own Split pattern, with
-     `\p{M}` in both classes, `trim_offsets` false and string-valued merges.
-4. **Re-run the Phase 0 anchors** and compare -- **done in Phase 2**.
-   Perplexity, `logprobs.bin` and all four continuations are bit-identical;
-   the MTP acceptance profile was re-captured at depth 1 and depth 3 and is
-   the rebuild's own control for Phase 4, because the Phase 0 one measures a
-   head this toolchain will not reproduce. Nothing is outstanding here.
+Every reference regenerated, every test green, and one more difference between
+the two toolchains found -- the first one that is a weight layout.
+
+    fast suite       72 passed, 0 failed
+    --ignored         8 passed, 0 failed
+      model           full_forward_matches_mlx
+      generate        greedy and sampled, token for token against mlx_lm
+      mtp             capture, head_matches_mtplx, speculative, window vs steps
+      vision_generate vision_greedy_matches_mtplx
+
+1. **Every golden reference regenerated**, 18 writers, all of them clean. The
+   stale 518 MB was moved out of `refs/` first rather than overwritten in
+   place: a writer that fails silently leaves a gap that way, instead of a
+   test comparing the new artifact against the deleted one's tensors and
+   passing. Only `refs/artifact/` was kept -- it holds the rebuild's own
+   baseline capture, which is current.
+2. **The whole suite runs.** `cargo test --release -- --ignored
+   --nocapture --test-threads=1` covers all eight model-loading cases in one
+   pass; cargo runs the test binaries sequentially, so the "only one model
+   fits" rule holds without arranging it by hand.
+3. **The artifact properties are checked by `tools/check_rebuild.py`**, which
+   passes -- see Phase 2 for what each one is and why the golden tests cannot
+   see it.
+4. **The Phase 0 anchors were re-run in Phase 2** and are exact.
+
+### The vision tower's patch embedding, and why the port caught it
+
+`tools/dump_vision_ops.py` failed where nothing else did:
+
+    ValueError: [conv] Expect the input channels in the input and weight
+    array to match -- input: (256,2,16,16,3) weight: (1152,3,2,16,16)
+
+mlx's `Conv3d` wants `(out, kD, kH, kW, in)`; a torch checkpoint stores
+`(out, in, kD, kH, kW)`. **2.9.1 transposed the patch embedding when it
+grafted the tower in, and 2.11.3 copies the parent's layout verbatim.** Both
+the writer and `src/vision/tower.rs` were written against the published
+artifact and say so in their comments -- "already `[O, kD, kH, kW, C]` in this
+checkpoint".
+
+MTPLX itself never notices: `_conv_weight_in_mlx_layout` transposes at load,
+so `dump_vision.py` and `dump_vision_generate.py` both succeeded. This port
+reads the tensor as it lies, and `VisionTower::load` asserts on the shape --
+so it **fails closed**, which is the one thing that keeps this off the blind
+list. A silent version of this bug would have convolved the wrong axes.
+
+`tools/align_rebuild.py` applies the transpose, and the result is
+**byte-identical to the published tower**: 893179493 bytes, sha256
+`ce387e11510de90772c482840c6d2bb8df1fe0f2d280b02cfea8484d04007f6b`. That is
+the first of the twenty large files to match exactly, and it settles that the
+transpose is precisely what 2.9.1 did rather than a plausible substitute.
+
+Two ways to get this wrong, both of which I did before getting it right:
+
+- `mx.load` is **lazy** and its arrays stay bound to the file. Writing
+  `mx.save_safetensors` back to that same path truncates it before the reads
+  happen, and the sidecar ends up empty. Materialise with `mx.eval` first,
+  write beside it, then rename.
+- `mx.save_safetensors` **appends `.safetensors`** when the name lacks it, so
+  a temp file called `...safetensors.new` is written as
+  `...safetensors.new.safetensors` and the rename finds nothing.
+
+Recovery, if it happens again: the tower is 333 tensors grafted verbatim from
+the parent, so `mtplx.vision_graft.graft_vision_tower(parent, artifact)`
+rebuilds it exactly. It is idempotent on an index that still resolves a vision
+prefix, so strip those 333 keys from `model.safetensors.index.json` first --
+and put `metadata.total_parameters` back afterwards, because the graft adds
+the vision parameters to whatever it finds.
+
+### One test asserted a file layout
+
+`safetensors::tests::reads_the_index_and_headers` required exactly 18 shards,
+17 body plus vision. That is `mlx_lm`'s `MAX_FILE_SIZE_GB` packing tensors
+greedily, not a property of the model, and it moved to 6. The test now asks
+what the index actually owes: that it resolves every shard it names, that the
+vision tower is among them, and that the set carries all 1970 tensors.
 
 ## Why any of this -- the arithmetic the whole rebuild rests on
 

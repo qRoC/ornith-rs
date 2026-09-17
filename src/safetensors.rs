@@ -324,8 +324,18 @@ mod tests {
             eprintln!("model not present, skipping");
             return;
         }
+        // How many body shards there are is not a property of the model: it
+        // is `mlx_lm`'s `MAX_FILE_SIZE_GB` greedily packing the tensors, and
+        // it moved from 17 to 5 when the artifact was rebuilt on a newer
+        // toolchain. What the index owes us is that it resolves every shard
+        // it names, that the vision tower is one of them, and that the whole
+        // set carries the 1970 tensors the artifact is made of.
         let shards = shards_from_index(&dir).unwrap();
-        assert_eq!(shards.len(), 18, "17 body shards + the vision shard");
+        assert!(shards.len() >= 2, "at least one body shard and the vision one");
+        assert!(
+            shards.iter().any(|p| p.file_name().unwrap().to_str().unwrap().contains("vision")),
+            "the vision shard is in the index"
+        );
         let st = SafeTensors::open_many(&shards).unwrap();
         assert_eq!(st.tensors.len(), 1970);
 

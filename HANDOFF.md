@@ -1589,6 +1589,13 @@ reads much more invitingly than it should.
   (`mtplx/data/qwen38_code_ranked_64k.npy`, same tokenizer, 65536 ids) and is
   not copied into this repository for the same reason `refs/` is not.
   `ORNITH_FRSPEC=<path>` overrides where it is read from.
+- The vision tower's `patch_embed.proj.weight` must be in mlx's Conv3d order,
+  `(out, kD, kH, kW, in)`. A forge build on 2.11.3 leaves it in the parent's
+  torch order and `VisionTower::load` asserts; `tools/align_rebuild.py`
+  transposes it, which reproduces the published tower byte for byte. MTPLX
+  transposes at load and never notices, so its own dumps succeed either way --
+  the failure surfaces in `dump_vision_ops.py` and in the port, both of which
+  read the raw tensor.
 - After a `mtplx forge build`, run **`tools/align_rebuild.py <artifact>`**
   before anything else: MTPLX 2.11.3 does not write the artifact the way 2.9.1
   did, and two of the differences (the re-serialised tokenizer, a missing
