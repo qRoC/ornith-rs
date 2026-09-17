@@ -1087,6 +1087,42 @@ block boundaries, which the eager op layer cannot express; it needs something
 to defer with, which is mlx's lazy graph. That is a different size of change
 from the twelve lines this section is about.
 
+### Pipelining the decode loop against the host read, and why it is not here
+
+Tried and reverted, like the fusion below, and for a better reason than it
+looked like it would have.
+
+mlx-lm's `generate_step` encodes step `n + 1` *before* the host reads step
+`n`: `_step(y)` is called with `y` still an unevaluated array, `mx.async_eval`
+submits it, and only then does `y.item()` go to the host. The round trip is
+paid while the GPU already has the next step. This port is eager, so `step`
+ended at a host value and the loop was strictly serial -- which looked like a
+real 1:1 divergence, and the gap profiler had just priced it exactly: 0.43-0.50
+ms a token, one gap, always before the embedding gather that starts the next
+forward.
+
+It was built. `Sampler` grew a `sample_device` returning the token as an array,
+the loop fed that array straight into the next step, and the Metal layer grew
+`Context::mark` / `wait` -- the piece `async_eval` really needs, since `sync`
+waits for the whole queue and would have waited for the step being hidden. The
+queue is serial, so a command buffer's completion means everything before it
+and nothing about what came after, which is exactly the primitive.
+
+It measured **worse**. Best of five runs each, idle a token: 0.47 ms serial
+against 0.82 pipelined, with 90.6 tok/s against 85.8, and two of the five
+pipelined runs collapsed to 41 and 55 tok/s where no serial run did.
+
+The reason is in the number it was aiming at. `max_dispatches_per_commit` is
+128, so the GPU starts as soon as the first 128 dispatches of the next step
+are encoded -- about 0.3 ms in -- and that already hides almost all of the
+round trip. What is left is 0.47 ms, of which 88 us is the wake from the GPU,
+and pipelining spends more than that: two steps' intermediates are live at
+once instead of one, which is also what the collapsed runs look like.
+
+**So the port already has what `async_eval` buys, by a different route**, and
+the eager encoder plus a commit threshold is that route. Worth knowing before
+anyone reads mlx-lm's loop and sees a divergence, which is what it looks like.
+
 ### Fusing the router's tail, and why it is not here
 
 Tried and reverted, so that it is not tried again for the same reasons.
