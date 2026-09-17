@@ -46,15 +46,26 @@ fn head_matches_mtplx() {
 
     // The contract the reference ran under has to be the one this port
     // implements, or everything below is comparing different models.
+    //
+    // `mtp_position_mode` takes two spellings. The published artifact's
+    // contract said "cache"; MTPLX 2.11.3's calibrator writes "local" for the
+    // rebuild, and `_resolve_runtime_mtp_position_mode` maps both to the same
+    // thing -- the KV cache owns the offset and no explicit draft-side RoPE
+    // offset is applied, which is what this port does. Only "absolute",
+    // "capped" and "wrapped" would be a different model.
     let meta = case.meta().unwrap();
     for (k, want) in [
         ("base_hidden_variant", "post_norm"),
         ("hidden_variant", "post_norm"),
         ("concat_order", "embedding_hidden"),
-        ("mtp_position_mode", "cache"),
     ] {
         assert_eq!(meta.get(k).and_then(|v| v.as_str()), Some(want), "contract.{k}");
     }
+    let position = meta.get("mtp_position_mode").and_then(|v| v.as_str());
+    assert!(
+        matches!(position, Some("cache") | Some("local")),
+        "contract.mtp_position_mode: {position:?} is an explicit-offset mode"
+    );
 
     // --- the unquantized MoE block on its own
     for t in [1usize, 4] {
