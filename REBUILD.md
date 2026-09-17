@@ -387,6 +387,15 @@ fallback, since the recipe's `module_overrides` are per-module by suffix.
 - **mxfp4 / mxfp8 / nvfp4.** In mlx, kernels in `vendor/mlx`
   (`fp_quantized.metal`), oracle available, one word in the recipe. This is the
   route, for that reason and not because the method is the best known.
+
+  Two things Rigel (arXiv 2606.12765) settles about it on this chip. The fp4
+  (E2M1) representable set **matches the OCP specification exactly**, across
+  all 256 bit patterns, so the element format holds no surprises and a numpy
+  reference would agree with the hardware. And block-scaled MXFP4 in the
+  *tensor* path is **absent** on M4 despite the Metal 4.1 feature table
+  claiming it -- which does not touch this route, since `fp_quantized.metal`
+  is a software path, but does mean the faster `fp_quantized_nax.metal`
+  variant is not an alternative here. See `M5.md`.
 - **A codebook derived from the weights** -- an exponent table plus a mantissa
   in the weight, the table small enough to live in registers. Worth knowing
   that this *is* microscaling: mxfp4 is 4-bit elements with a shared 8-bit
