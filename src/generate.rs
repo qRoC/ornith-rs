@@ -28,6 +28,19 @@ pub const DEFAULT_PREFILL_STEP_SIZE: usize = 2048;
 /// Picks the next token id from the logits of the last position.
 pub trait Sampler {
     fn sample(&mut self, ctx: &Context, logits: &Array) -> u32;
+
+    /// Whether a row's token depends on nothing but that row.
+    ///
+    /// A stochastic sampler draws from a stream, so how many rows it is asked
+    /// for -- and in what order -- decides what it returns. The speculative
+    /// loop therefore has to ask row by row and stop at the first mismatch,
+    /// which costs a round trip to the host per row for one argmax's worth of
+    /// work. `Greedy` has no stream, so the loop can take every row in one
+    /// pass and one round trip. Conservative by default: a sampler that does
+    /// not say otherwise is treated as having a stream.
+    fn rows_are_independent(&self) -> bool {
+        false
+    }
 }
 
 /// `greedy_sampler`: `mx.argmax(logprobs, axis=-1)`.
@@ -36,6 +49,10 @@ pub struct Greedy;
 impl Sampler for Greedy {
     fn sample(&mut self, ctx: &Context, logits: &Array) -> u32 {
         crate::ops::sample::greedy_token(ctx, logits)
+    }
+
+    fn rows_are_independent(&self) -> bool {
+        true
     }
 }
 

@@ -64,6 +64,18 @@ pub fn logsumexp_last_axis(ctx: &Context, x: &Array) -> Array {
 /// `mx.argmax(x, axis=-1)`, dropping the reduced axis.
 pub fn argmax_last_axis(ctx: &Context, x: &Array) -> Array {
     let axis = x.ndim() - 1;
+    let out_shape: Vec<usize> =
+        if axis == 0 { vec![1] } else { x.shape[..axis].to_vec() };
+    let out = Array::empty(ctx, &out_shape, Dtype::U32);
+    argmax_last_axis_into(ctx, x, &out);
+    out
+}
+
+/// [`argmax_last_axis`] writing into an array the caller owns, so a chain that
+/// only ever feeds the result back to the GPU never has to bring it to the
+/// host. `out` may be a view -- one slot of a window buffer, say.
+pub fn argmax_last_axis_into(ctx: &Context, x: &Array, out: &Array) {
+    let axis = x.ndim() - 1;
     let axis_size = x.shape[axis];
     let axis_stride = x.strides()[axis];
     // `ArgReduce::eval_gpu` erases the reduced axis from the shape and the
@@ -71,9 +83,6 @@ pub fn argmax_last_axis(ctx: &Context, x: &Array) -> Array {
     // left alone.
     let shape: Vec<i32> = x.shape[..axis].iter().map(|&v| v as i32).collect();
     let in_strides: Vec<i64> = x.strides()[..axis].to_vec();
-    let out_shape: Vec<usize> =
-        if shape.is_empty() { vec![1] } else { x.shape[..axis].to_vec() };
-    let out = Array::empty(ctx, &out_shape, Dtype::U32);
     let out_strides: Vec<i64> = out.strides();
     let ndim = shape.len();
 
@@ -87,7 +96,7 @@ pub fn argmax_last_axis(ctx: &Context, x: &Array) -> Array {
     // `get_2d_grid_dims(out.shape(), out.strides())`, which for the contiguous
     // outputs here is just the element count laid out along x.
     let rows: usize = out.numel();
-    let d = d.arr(x).out(&out);
+    let d = d.arr(x).out(out);
     let d = if ndim == 0 {
         d.bytes(&0i32).bytes(&0i64).bytes(&0i64)
     } else {
@@ -97,7 +106,6 @@ pub fn argmax_last_axis(ctx: &Context, x: &Array) -> Array {
         .bytes(&axis_stride)
         .bytes(&(axis_size as u64))
         .threads((tg, rows, 1), (tg, 1, 1));
-    out
 }
 
 /// `a - b` where `b` holds a single element: mlx's `VectorScalar` binary.
@@ -166,8 +174,18 @@ pub fn negate_for_test(ctx: &Context, x: &Array) -> Array {
 /// `mx.argmax(logits[:, -1, :], axis=-1)` without the logsumexp -- the draft
 /// chain's `next_tok = mx.argmax(row, axis=-1)`, which reads the raw logits.
 pub fn greedy_argmax(ctx: &Context, logits: &Array) -> u32 {
+    let out = Array::empty(ctx, &[1], Dtype::U32);
+    greedy_argmax_into(ctx, logits, &out);
+    out.to_vec_u32(ctx)[0]
+}
+
+/// [`greedy_argmax`] that leaves the token where the GPU can read it. The MTP
+/// draft chain feeds each token straight back into the next head forward, so
+/// bringing it to the host only to send it back is a round trip that buys
+/// nothing -- and a round trip drains the queue.
+pub fn greedy_argmax_into(ctx: &Context, logits: &Array, out: &Array) {
     let v = logits.dim(-1);
     let rows = logits.numel() / v;
     let last = logits.reshape(&[rows, v]).slice_leading(rows - 1, 1);
-    argmax_last_axis(ctx, &last).to_vec_u32(ctx)[0]
+    argmax_last_axis_into(ctx, &last, out);
 }

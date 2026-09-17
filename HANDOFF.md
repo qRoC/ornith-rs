@@ -388,16 +388,42 @@ work per generated token than autoregression** -- 1466 dispatches against
 1669, 863 barriers against 1064 -- while being no faster on the wall, because
 it leaves the GPU idle 2.58 ms a token where autoregression leaves it 0.50.
 
-**It stalls, it does not compute too much.** The counter that says so is host
-round trips: 1.66 a token against autoregression's 1.00, which over 1.53
-tokens a cycle is ~2.5 -- one to read the drafted ids, one to read the
-verified ones. Each drains the queue and leaves the GPU with nothing behind
-it. The speculative win exists at depth 1 and is spent on the way to the host.
+**It stalls, it does not compute too much.** Where the stall is, though, is
+not settled -- and the obvious answer turned out to be wrong, which is worth
+recording so it is not tried a third time.
 
-So the first thing to do with this path is not to draft more cheaply but to
-stop draining between the phases. Only then is it worth making the draft
-cheaper, and there the number is: a draft step is ~2.4 ms of GPU, about half
-of which is the `lm_head` below.
+The obvious answer was host round trips, of which there were 1.66 a token
+against autoregression's 1.00. Two were removed:
+
+- **The draft chain stayed on the host.** Each step ran `greedy_argmax`, which
+  reads the token back, and then `Array::from_slice` sent it straight to the
+  device again for the next step -- a round trip for a value only the GPU ever
+  wanted. `draft` now builds the verify window `[primary, d_0, ...]` in place
+  on the device, step `i` reading slot `i` as a view while its argmax writes
+  slot `i + 1`, and nothing comes back until the cycle needs it.
+- **The accept loop asked one row at a time.** It wants row 0, then row 1 only
+  if row 0 agreed, and each of those was a round trip for one argmax over the
+  vocabulary -- all latency, no work. When `Sampler::rows_are_independent`
+  (`Greedy` does; a stochastic sampler does not, because how many rows it is
+  asked for decides its draws) every row is now taken in one pass into one
+  buffer and read back once.
+
+Round trips a token fell from 1.66 / 2.20 / 2.69 to 1.31 / 1.21 / 1.14 at
+depths 1 / 2 / 3, all of it bit-exact -- `tests/mtp` reproduces the baseline's
+acceptance and divergence numbers exactly. **And the idle barely moved.**
+Depth 2 gained ~5% of wall, depths 1 and 3 nothing, and the GPU busy share is
+still ~80% against autoregression's 96%.
+
+So the stall is real, it is worth ~9% at depth 1, and it is *not* the number
+of round trips. What is left to explain is the gap between command buffers,
+which the profiler cannot see: it sums `GPUEndTime - GPUStartTime` and so
+measures only where the GPU works, never where it waits. Measuring the gaps --
+`GPUStartTime` of each buffer against `GPUEndTime` of the one before, charged
+to whatever was encoded into it -- is the instrument this needs, and it does
+not exist yet.
+
+Only after that is it worth making the draft cheaper, and there the number is:
+a draft step is ~2.4 ms of GPU, about half of which is the `lm_head` below.
 
 The two structural costs, which are why deeper is worse:
 
