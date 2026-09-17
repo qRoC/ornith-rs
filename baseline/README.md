@@ -48,3 +48,12 @@ whole suite green. These are the measurements that would notice.
 - **MTP acceptance** shifts with requantization because draft and target move
   together. Without a before, a format regression is indistinguishable from
   noise.
+
+  **This one is retired.** The Phase 2 rebuild's MTP head is not the head this
+  profile measured -- forge's norm-gain handling changed between the MTPLX
+  that built the published artifact (2.9.1, per its own `config.json`) and the
+  one on this machine, and the rebuilt head drafts measurably and
+  deterministically better. The trunk is bit-identical, so perplexity, the
+  logprobs and the anchors above are all still valid; this table is not, and
+  a profile taken from the rebuild replaces it as Phase 4's control.
+  `REBUILD.md` Phase 2, "The MTP sidecar", has the evidence.

@@ -1,7 +1,7 @@
 # ornith-rs — state of the port
 
 A from-scratch Rust + Metal port of the MLX inference path for
-`~/.mtplx/models/Shiftedx--ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx`.
+`~/.mtplx/models/ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx`.
 
 The point of the exercise is to **understand how the model works**, so the port
 stays 1:1 with the sources in `../vendor/` (mlx, mlx-lm, MTPLX), keeps every
@@ -324,6 +324,21 @@ assumed, because `tokenizers` runs the pattern through oniguruma:
 pre-tokenizer, one probe per codepoint, and `tests/tokenizer.rs` compares them
 against `src/tokenizer/tables.rs`.
 
+**A rebuild will quietly take the artifact's own pattern away.** `mlx_lm`'s
+`save()` ends in `tokenizer.save_pretrained`, so a forged artifact gets its
+tokenizer written back out by whatever `transformers` is installed instead of
+carrying the parent's files through. transformers 5.14.1 writes the *older*
+pattern -- no `\p{M}` in either class -- into `tokenizer.json`, flips
+ByteLevel's `trim_offsets` and the decoder's `add_prefix_space` and
+`use_regex` from false to true, rewrites `merges` from `"a b"` to
+`["a", "b"]`, folds the config's 7 extra added tokens into the file's 26, and
+writes no `vocab.json` or `merges.txt` at all -- which is what
+`Qwen2Tokenizer` rebuilds itself from, so the default dialect loses its
+source too. The published artifact carried the parent's four files byte for
+byte; `tools/align_rebuild.py` puts them back, and `tools/check_rebuild.py`
+has three invariants that notice if it was not run. No golden test can see
+this, because `dump_tokenizer.py` reads the same file the port does.
+
 ---
 
 ## MTP speculative decoding
@@ -358,7 +373,15 @@ Three things about the wiring are not what the file names suggest:
   | `committed` + prompt seeding | 0.54 - 0.79 | 0.31 - 0.55 | 0.00 - 0.25 |
 
   against the 0.78 / 0.35 / 0.13 the artifact records. `committed` is the
-  default here. Seeding the head's cache over the prompt -- what
+  default here.
+
+  **Those numbers are the deleted artifact's head, and the rebuild's head is
+  not the same head.** The trunk is bit-identical -- `baseline/logprobs.bin`
+  reproduces to the last bit -- but the rebuilt MTP sidecar drafts measurably
+  better, and deterministically so. `REBUILD.md` Phase 2 has the evidence and
+  what is and is not still comparable; the short version is that every
+  acceptance figure in this section was measured on the old head and will read
+  higher on the new one. Seeding the head's cache over the prompt -- what
   `_append_mtp_history(..., phase="prefill")` does -- measurably does not
   help, which is convenient: it is the only thing that would have needed
   mlx's steel *gather* gemm, since a prompt-length append crosses
@@ -1562,6 +1585,16 @@ reads much more invitingly than it should.
   (`mtplx/data/qwen38_code_ranked_64k.npy`, same tokenizer, 65536 ids) and is
   not copied into this repository for the same reason `refs/` is not.
   `ORNITH_FRSPEC=<path>` overrides where it is read from.
+- After a `mtplx forge build`, run **`tools/align_rebuild.py <artifact>`**
+  before anything else: MTPLX 2.11.3 does not write the artifact the way 2.9.1
+  did, and two of the differences (the re-serialised tokenizer, a missing
+  `num_nextn_predict_layers`) change what this port reads. Then
+  `tools/check_rebuild.py <artifact>` for the invariants, and
+  `tools/compare_baselines.py` for the one comparison that survived the old
+  artifact's deletion -- `baseline/logprobs.bin` against a fresh capture from
+  `dump_artifact_baseline.py`, where identical weights must give `max_abs ==
+  0.0` exactly as they must inside the port. `REBUILD.md` Phase 2 has the
+  whole story.
 - `tools/gen_unicode.py` regenerates `src/tokenizer/tables.rs`. It is checked
   in; only re-run it when the Python that produced it moves to a new Unicode
   version, and re-run `tests/tokenizer.rs` afterwards.

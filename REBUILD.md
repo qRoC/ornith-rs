@@ -224,14 +224,29 @@ Only then delete.
    says it should pass, so a failure here means the download is incomplete
    rather than the revision being wrong.
 
-## Phase 2 -- reproduce what we had, before changing anything
+## Phase 2 -- reproduce what we had, before changing anything -- **DONE**
 
-**Start here in a new session.** Phase 0 is captured in `baseline/`, the old
-artifact is deleted, and the parent is pulled.
+**The trunk is the same model, exactly.** Every one of the 1986560 float32
+log-probabilities in `baseline/logprobs.bin` reproduces bit for bit, mean NLL
+matches to twelve decimals, and all four greedy anchors are identical token
+for token. The mechanism is proven and every Phase 4 variant now differs only
+by what the recipe says.
 
-Build with the saved recipe **unmodified**:
+**The MTP head is not the same head**, and that is the one substantive finding
+of this phase -- see "The MTP sidecar" below. It changes nothing about Phase
+4, whose subject is the quantized body, but it does retire one of the four
+Phase 0 captures.
 
-    cd ~/Projects/ai/ornith-rs
+    perplexity    6.332690  ->  6.332690     delta 0.000e+00
+    mean NLL      1.845725035884 -> 1.845725035884
+    logprobs      max_abs 0.000000e+00, 1986560 of 1986560 identical
+    anchors       4 of 4 identical
+
+It is **not** byte-identical, and it cannot be on this toolchain. That is the
+middle outcome the plan allowed for, so here is the explanation it asked for.
+
+### What was run
+
     mtplx forge build \
       --repo ornith-ai/Ornith-1.5-35B-A3B \
       --model-root ~/.mtplx/models \
@@ -239,52 +254,228 @@ Build with the saved recipe **unmodified**:
       --recipe "$(cat baseline/BUILD_RECIPE.json)" \
       --branded-name ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx
 
-One thing to watch: `BUILD_RECIPE.json` is the artifact's *record* of its
-recipe, so it carries keys that are history rather than input --
-`artifact_name`, `source_model`, `source_revision`, `release_repo`,
-`architecture_signature`, `source_signature`. `_read_recipe` only parses JSON
-and the builder reads the keys it knows (`forge.py:1448` and around), so the
-extras should be inert; if forge objects, strip them to the ones the recipe
-actually sets: `body_bits`, `body_group_size`, `body_mode`, `body_dtype`,
-`module_overrides`, `mtp_policy`, `vision_policy`, `recipe_id`,
-`recipe_version`, `adapter_id`, and the `expected_*` counts.
+It found the pulled parent rather than downloading again ("using the copy
+already on disk"), classified it `bf16_native`, and took the mixed-precision
+lane because the recipe has `module_overrides`. The recipe's history keys
+(`artifact_name`, `source_model`, `source_revision`, `release_repo`,
+`architecture_signature`, `source_signature`) were inert as predicted -- no
+stripping was needed.
 
-Then check it:
+| stage | |
+|---|---|
+| quantize body | **38 s**, "Quantized model with 5.889 bits per weight" |
+| vision tower | 333 tensors, 893142496 bytes, restored from the parent |
+| MTP sidecar | 785 tensors, gains delta-decoded back to the +1.0 convention |
+| calibrate | 64 contract candidates, `exact_agreement` |
+| verify | AR 63.7 tok/s, depth 1 **88.3** (acceptance 0.93), depth 2 **123.5** (0.83) |
 
-    python3 tools/check_rebuild.py ~/.mtplx/models/<branded name>
+The speed gate passed comfortably, which is worth noting against
+`HANDOFF.md`'s finding that MTP does not pay off *in this port*: MTPLX's own
+runtime gets 1.4x at depth 1 on the same weights, so the gap is in the
+driving, not in the head.
 
-That script encodes every condition found while writing this plan, split into
-INVARIANT (must hold for any rebuild, including the two the golden tests are
-blind to) and RECIPE (must hold in Phase 2, expected to break in Phase 4).
-Its inventory half was verified against the parent once the pull landed: all
-six counts pass (1811 / 785 / 333 / 30 / 30 / 30), so the download is complete
-and that half of the script works. The rest has still never run against a real
-rebuilt artifact, so treat a first failure there as possibly the script's.
+### Why byte-identity is off the table
 
-Pointing it at the **parent** is a category error and it now refuses, because
-everything else fails for the right reasons and reads like a disaster: the
-parent's `conv1d.weight` is still the torch `[8192, 1, 4]` that conversion
-transposes into `[D, K, 1]`, and its config has no `rope_parameters` at all
-until mlx writes one. Both differences are conversion doing its job -- and
-they confirm from the other side that the sanitisation this port depends on
-happens during the forge, which is exactly why it has to be re-checked on the
-output.
+The published artifact records its own builder: `config.json`'s
+`mtplx_wrapper.mtplx_version` is **2.9.1**. This machine has 2.11.3, with an
+mlx-lm newer than whatever 2.9.1 pulled in. Six differences follow, none of
+them a weight -- and then a seventh that is, which has its own section below:
 
-Compare per-file sha256 against `.mtplx-source.json`.
+| | published (2.9.1) | rebuild (2.11.3) |
+|---|---|---|
+| body shards | 17, largest 1.96 GiB | **5**, `make_shards(MAX_FILE_SIZE_GB = 5)` |
+| MTP sidecar | `mtp/weights.safetensors` | `mtp.safetensors` |
+| vision file | `model-vision-00001-of-00001.safetensors` | `model-vision.safetensors` |
+| tokenizer | the parent's four files, verbatim | re-serialised by transformers 5.14.1 |
+| config extras | `mtp_num_hidden_layers`, `num_nextn_predict_layers`, `publisher`, `mtplx_wrapper` | `mtplx_mtp_contract`, `mtplx_mtp_payload_audit` |
+| MTP contract | `mtp_position_mode: "cache"` | `"local"` |
 
-- **Byte-identical:** the mechanism is proven, the parent is right, and every
-  later variant differs only by what the recipe says. This is the outcome to
-  hope for and it is worth a day to get.
-- **Not identical but structurally equal** (same tensor names, shapes, dtypes,
-  same 192/260/60 module split): usable, but the difference has to be
-  explained before going on -- an engine version, a dtype default, a scrub
-  step. `engine_version` in `.mtplx-source.json` was 2.11.2.
-- **Structurally different:** stop. Everything downstream is measuring a
-  different model.
+The two sidecar names are read out of `mlx_lm_extra_tensors.mtp_file` and the
+index, by both the port and MTPLX, so they are naming and nothing else. The
+shard count is immaterial for the same reason -- nothing reads a shard by
+name, and `model.safetensors.index.json` maps every tensor. `"local"` and
+`"cache"` are two spellings of one behaviour --
+`_resolve_runtime_mtp_position_mode` maps the first onto the second, and only
+`absolute`, `capped` and `wrapped` would be a different model. `tests/mtp.rs`
+now accepts both spellings instead of the literal `"cache"`.
 
-Then re-anchor the port against this rebuild, which is Phase 3. Do that before
-any experiment, so that a later failure is attributable to the format and not
-to the rebuild.
+The tokenizer and the missing config keys are **not** cosmetic, and they are
+what `tools/align_rebuild.py` exists for.
+
+### The tokenizer, which is the trap in this phase
+
+mlx-lm's `save()` ends with `tokenizer.save_pretrained`, so the artifact's
+tokenizer comes back out through transformers rather than being copied. The
+published artifact's four tokenizer files are the **parent's, byte for byte**
+(sha256-checked against `baseline/SHA256SUMS`); the re-serialised ones are
+not, and the round trip is lossy in five ways:
+
+- the Split pattern loses `\p{M}` from both character classes -- it is
+  literally the older transformers pattern from `HANDOFF.md`'s "two
+  behaviours" section, now written *into the artifact*, which would delete the
+  `Dialect::TokenizerJson` behaviour by leaving nothing to distinguish;
+- ByteLevel flips `trim_offsets` false -> true, and the decoder flips
+  `add_prefix_space` and `use_regex` false -> true;
+- `merges` is rewritten from `"a b"` to `["a", "b"]`;
+- `added_tokens` goes 26 -> 33, folding in the 7 that only the config carried;
+- `vocab.json` and `merges.txt` are **not written at all** -- and those two are
+  exactly what `Qwen2Tokenizer` rebuilds itself from, which is the default
+  dialect of this port and what `mlx_lm.generate` runs.
+
+`tokenizer_config.json` also shrinks 16718 -> 1161 bytes, losing
+`added_tokens_decoder`, which `src/tokenizer/mod.rs` reads.
+
+**None of this is visible to a golden test.** `dump_tokenizer.py` reads the
+same `tokenizer.json` the port does, so both would agree on the wrong pattern
+with `max_abs == 0.0` throughout. It is the same shape as the `conv1d` trap
+and it was not on the list.
+
+And `config.json` loses `num_nextn_predict_layers`, which 2.9.1 wrote and
+2.11.3 does not. `TextConfig::load` falls back to **0** for it, so the MTP
+head would be configured away; `MtpHead::load` asserts, so this one fails
+loudly rather than silently, but only if something loads the head.
+
+### So the procedure is now three steps, not two
+
+    mtplx forge build ... --branded-name <name>
+    python3 tools/align_rebuild.py ~/.mtplx/models/<name>
+    python3 tools/check_rebuild.py ~/.mtplx/models/<name>
+
+`align_rebuild.py` restores the parent's tokenizer files and the config keys
+2.11.3 drops, and is idempotent; its docstring justifies every line it
+touches. **Run it after every forge build, including each Phase 4 variant**,
+or the variants get compared to each other through different tokenizers.
+
+`check_rebuild.py` was itself wrong and has been fixed. Its inventory half had
+been verified against the *parent* and never against an artifact, and two of
+its six counts can never hold on one: an artifact's index has 1970 entries
+(1637 text + 333 vision) where the parent's has 1811, and the MTP head is a
+sidecar that the index does not list at all. The invariant that does hold is
+the **module** count -- 733, which is the parent's 693 non-MTP non-vision
+tensors plus one per layer for mlx-lm splitting the fused
+`mlp.experts.gate_up_proj` -- because a module is one tensor or three
+depending on whether the recipe quantized it, which is exactly what Phase 4
+changes. It now also checks the MTP sidecar through the config key, the three
+tokenizer properties above, `num_nextn_predict_layers`, and the sidecar's
+seven norm gains; the per-file sha256 comparison is INFO, and the ten
+published *content* files are compared by sha256 from `baseline/SHA256SUMS`
+instead. Six of its invariants are now marked (blind) where there were two.
+
+`baseline/SHA256SUMS` turns out to be the better manifest: it covers all 35
+files where `.mtplx-source.json` carries a sha256 for only the 20 LFS ones,
+and it was computed *before* publish scrubbed `config.json` and
+`conversion_receipt.json` -- so it describes the local build, which is what a
+rebuild is.
+
+### The check that survived
+
+Per-file sha256 cannot answer "are these the same numbers" once the file
+layout moves. `baseline/logprobs.bin` can, and does: 8 full next-token
+distributions, 248320 wide, float32. MLX is deterministic and file layout is
+not an input to a matmul, so identical weights give identical bits --
+`max_abs == 0.0`, the same contract the port is held to. Capture the other
+side with
+
+    cd tools && ORNITH_BASELINE_OUT=../refs/artifact/new \
+      PYTHONPATH=../../vendor/mlx-lm python3 dump_artifact_baseline.py <artifact>
+    python3 tools/compare_baselines.py
+
+In Phase 4 those three numbers stop being a check and become the measurement.
+
+### The MTP sidecar, which is a different head
+
+The trunk is bit-identical and the port's own `--mtp --greedy --raw` output is
+character-for-character the Phase 0 anchor -- so tokenizer, config, index,
+body and sidecar are all being read correctly, and speculative decoding is
+exact as it should be. What changed is only how often the draft head *guessed
+right*:
+
+| prompt, depth 1 | Phase 0 | rebuild |
+|---|---|---|
+| merges two sorted lists | 51 cycles, 45 accepted, **0.88** | 49, 47, **0.96** |
+| memory-bound vs compute-bound | 59, 36, **0.61** | 54, 41, **0.76** |
+| first eight primes | 50, 45, **0.90** | 48, 47, **0.98** |
+| what is a neutron star | 58, 38, **0.66** | 54, 42, **0.78** |
+
+Higher every time, and not noise: the same prompt re-run gives 49/47/0.96
+again, to the cycle. MTPLX's own build-time verification points the same way
+-- 0.93 at depth 1 where the old artifact's `mtplx_runtime.json` recorded 0.78
+-- though those two ran different prompt suites, so take it as corroboration
+and not as a second measurement.
+
+**What the sidecar is.** 785 tensors, of which **778 are byte-identical to the
+parent's `mtp.*`**. The seven that differ are the RMSNorm gains, each exactly
+1.0 higher: forge runs `shift_delta_mtp_norms` over the sidecar on the way
+out.
+
+**The shift is right, and proving it took a wrong turn worth recording.** The
+parent's MTP norms sit inside the distribution of the parent's *trunk* norms
+-- same means, same standard deviations -- which reads as "they are already
+absolute and forge is double-shifting them". Restoring the parent's seven
+tensors byte for byte and re-running gives a head that drafts **0 of 95**
+tokens correctly. The comparison was between two delta-encoded sets: the
+parent stores *both* the trunk's and the head's gains as deltas, and the
+trunk's get their +1.0 from `qwen3_5.TextModel.sanitize`, which does it
+whenever the checkpoint still has `mtp.*` weights or a torch-layout `conv1d`
+-- both true of the parent, neither true of an artifact. That is the same
+`should_shift_norm_weights` flag `HANDOFF.md` describes from the other
+direction. Two quantities that are both wrong by the same 1.0 agree with each
+other perfectly; the only reference that settles it is the model running.
+
+**So why is the head different?** The remaining explanation is that 2.9.1
+shifted a different set. 2.11.3's own comment beside the suffix lists reads
+like the fix for it -- "the convention is decided per sidecar from the two
+separable families and then applied to all seven norms, never per tensor, and
+never *always*" -- and a per-tensor gate with those thresholds
+(`LOW_DELTA_MEAN_MAX = 0.5`, `QK_DELTA_MEAN_MAX = 1.25`) would have skipped
+`post_attention_layernorm`, whose parent mean is 0.869. A partially shifted
+head is degraded but not dead, which is exactly what the Phase 0 numbers look
+like next to these -- and the depth table below is the strongest thing
+pointing that way, because a small weight error is precisely what compounds
+when the same layer is applied three times in a row. **2.9.1 is not on this
+machine, so this is inference, not proof** -- what is proved is that the two
+heads differ, that the difference is in the sidecar, and that the rebuild's
+drafts better.
+
+Depth 3 says it louder, and says something more:
+
+| prompt, depth 3 | Phase 0 | rebuild |
+|---|---|---|
+| merges two sorted lists | 38 cycles, 58 of 112, 0.87 / 0.53 / **0.47** | 28, 67 of 84, 0.96 / 0.85 / **0.74** |
+| memory-bound vs compute-bound | 52, 43 of 154, 0.52 / 0.48 / **0.23** | 36, 59 of 108, 0.72 / 0.73 / **0.74** |
+| first eight primes | 32, 64 of 95, 0.94 / 0.83 / **0.38** | 29, 67 of 86, 0.93 / 0.89 / **0.70** |
+| what is a neutron star | 47, 49 of 141, 0.57 / 0.52 / **0.57** | 33, 63 of 99, 0.82 / 0.81 / **0.64** |
+
+**The gap widens with depth.** At level 1 the two heads are close enough to
+argue about -- on the primes prompt the old head is even a hair ahead, 0.94 to
+0.93. By level 3 there is nothing to argue about: 0.23 becomes 0.74, 0.38
+becomes 0.70. The old head fell off a cliff as the draft chain got longer and
+the new one barely notices, which is the signature of a head whose norms are
+slightly wrong rather than one that is simply worse -- a small error
+compounding through three recursive applications of the same layer.
+
+Worth noting for its own sake: these were captured at 10 - 32 tok/s against
+the 70 tok/s the same prompts decode at depth 1, on a machine at 15 GB of
+swap. That is `HANDOFF.md`'s "MTP does not pay off here" showing up again, and
+the acceptance counts are unaffected by it -- they are deterministic. Only the
+wall clock is, which is why the counts are what this table records.
+
+**What that retires, and what it does not.**
+
+- `baseline/baseline.json`'s `mtp_profile` is **no longer a valid before**.
+  It measures a head that no rebuild on this toolchain will reproduce. The
+  replacement is captured and lives at `refs/artifact/new/mtp_profile.json`
+  -- the eight runs above, depth 1 and depth 3, in the same shape.
+- Nothing else moves. The sidecar is bf16 and no recipe variant touches it,
+  so the new profile is as stable a control as the old one was, and the
+  quality baseline that Phase 4 actually turns on -- perplexity and
+  `logprobs.bin`, both trunk-only -- is bit-identical and fully comparable.
+- `HANDOFF.md`'s acceptance tables were all measured on the old head and now
+  read low.
+- `check_rebuild.py` gained an invariant for it: the seven gains must *not*
+  equal the parent's. A sidecar left delta-encoded gives a head that drafts
+  nothing while every golden test stays green, because MLX reads the same
+  file. That is a fourth member of the blind family.
 
 ## Phase 3 -- re-anchoring the port
 
@@ -293,8 +484,10 @@ to the rebuild.
    list the commands; `refs/` is ~510 MB.
 2. **Run the whole suite**, including the `--ignored` model, generate, mtp and
    vision cases. The contract does not move: `max_abs == 0.0`.
-3. **Check the two artifact properties this port depends on**, which no test
-   covers because they were true of the artifact rather than of the code:
+3. **Check the artifact properties this port depends on**, which no test
+   covers because they are true of the artifact rather than of the code.
+   `tools/check_rebuild.py` now does all of them and marks them (blind); it
+   passes on the Phase 2 rebuild. They are worth knowing by name:
    - `conv1d.weight` must be `[D, K, 1]` -- already sanitized, so mlx-lm's
      `TextModel.sanitize` does **not** add 1.0 to the norm weights. If a
      rebuild produces `[D, 1, K]` or similar, the port takes the "double
@@ -302,9 +495,17 @@ to the rebuild.
      catch it*, because MLX would shift the same way.
    - `rope_parameters.type` must still be `"default"`, or the text path stops
      being plain rotary.
-4. **Re-run the Phase 0 anchors** and compare: perplexity within noise of the
-   baseline, continuations diverging late rather than immediately, MTP
-   acceptance in the same band.
+   - The MTP sidecar's seven RMSNorm gains must **not** be the parent's: the
+     parent stores them delta-encoded and the conversion is what adds the 1.0.
+     Left unshifted the head drafts nothing, measured at 0 of 95, with every
+     test green.
+   - `tokenizer.json` must still carry the artifact's own Split pattern, with
+     `\p{M}` in both classes, `trim_offsets` false and string-valued merges.
+4. **Re-run the Phase 0 anchors** and compare -- **done in Phase 2**.
+   Perplexity, `logprobs.bin` and all four continuations are bit-identical;
+   the MTP acceptance profile was re-captured at depth 1 and depth 3 and is
+   the rebuild's own control for Phase 4, because the Phase 0 one measures a
+   head this toolchain will not reproduce. Nothing is outstanding here.
 
 ## Why any of this -- the arithmetic the whole rebuild rests on
 
@@ -554,10 +755,20 @@ locally removes the whole constraint.
 ## How this goes wrong, and how we would notice
 
 - **Wrong parent revision.** Caught in Phase 1 by the tensor counts, and in
-  Phase 2 by the shas. Not caught later by anything.
+  Phase 2 by `logprobs.bin` -- *not* by the shas, which cannot match on this
+  toolchain at all. Not caught later by anything.
 - **A sanitization difference.** Caught only by the explicit `conv1d` shape
-  check in Phase 3; the golden tests cannot see it, because MLX reads the same
-  artifact and makes the same mistake. This is the failure mode to fear.
+  check in `check_rebuild.py`; the golden tests cannot see it, because MLX
+  reads the same artifact and makes the same mistake. This is the failure mode
+  to fear.
+- **A re-serialised tokenizer.** Found in Phase 2 and it is the same shape as
+  the one above: mlx-lm's `save()` writes the tokenizer back out through
+  transformers, which silently swaps the artifact's own Split pattern for the
+  older one without `\p{M}`, flips three ByteLevel flags, and drops
+  `vocab.json` and `merges.txt` entirely. `dump_tokenizer.py` reads the file
+  the port reads, so every tokenizer test stays green on the wrong pattern.
+  Caught by the three tokenizer invariants in `check_rebuild.py`, fixed by
+  `tools/align_rebuild.py`, and it was not on this list before.
 - **A quality regression from the format.** Caught by perplexity against the
   Phase 0 baseline -- which is why Phase 0 cannot be skipped.
 - **A port bug in the new kernels.** Caught by `max_abs == 0.0`, as usual.
