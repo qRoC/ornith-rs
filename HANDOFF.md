@@ -1405,9 +1405,48 @@ way. What would catch a regression is already in place: `tests/quantized.rs`
 compares against MLX on real weights at `max_abs == 0.0`, and a CPU-split path
 would live or die by it.
 
-So: the physics is measured and favourable, the arithmetic is plausible, and
-**the verification gate is open** -- what is left is the NEON kernel and the
-row split, which are engineering rather than research.
+#### And the gate that is shut: the CPU cannot get its input in time
+
+The verification gate is open. A different one is not, and it closes the idea
+for decode.
+
+**The CPU needs the matmul's input, and every matmul's input in a decode step
+was produced by the GPU tens of microseconds earlier.** The activation sits in
+shared memory, but a GPU write only becomes visible to the host when the
+command buffer carrying it completes -- reading earlier is not something
+Metal's memory model promises, whatever the bytes happen to say. So splitting a
+matmul costs a command-buffer boundary in front of it, and a command buffer
+costs ~60 us of GPU time (the number `max_dispatches_per_commit` is set by).
+
+That prices the split per matmul, at M = 1:
+
+| | time | boundary worth paying? |
+|---|---|---|
+| `lm_head` | 1257 us | yes -- 60 us to enable saving ~314 |
+| `in_proj_qkv` | 151 us | no |
+| `o_proj` | 122 us | no |
+| a routed expert gather, x96 | ~18 us | no |
+
+A decode step has 195 8-bit `qmv` dispatches and **exactly one of them is
+`lm_head`**. So the reachable share is that one matmul: 1257 us of a ~10500 us
+step, and a CPU taking a quarter of its rows nets ~254 us after the boundary --
+**2.4% of a step**, not the 25% the bandwidth measurement suggested.
+
+The earlier estimate was wrong because it priced the CPU against all 2.83 GB a
+step reads. The CPU can only be handed matmuls big enough to amortize a
+handoff, and there is one of those per step.
+
+**Where it does work is where mlx-dspark put it.** Prefill's matmuls are a
+chunk wide and take milliseconds each, so a boundary disappears into them --
+which is why their CPU co-prefill is a prefill feature and measures 1.41x
+there. This port's prefill does not want it either, for an unrelated reason:
+its GPU work already corresponds to ~1230 tok/s and what it loses is memory
+pressure, not arithmetic.
+
+So the honest end of this line: the physics is favourable, the verification is
+achievable, and the *plumbing* is what rules it out. Recorded here with the
+arithmetic so it is not re-derived from the bandwidth number alone, which
+reads much more invitingly than it should.
 
 ---
 
