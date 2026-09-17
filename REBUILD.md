@@ -869,6 +869,52 @@ variant's quality, not `int4-except-gates`'s. That is now the only remaining run
 `fp_quantized` port. Whether three points justifies a new kernel family is a
 separate decision from the one this phase settled.
 
+### The float pair, asked and priced
+
+"nvfp4 with nvfp8 instead of int4 with int8" is the obvious next thought and
+it is half right. **There is no nvfp8** -- mlx takes exactly four modes,
+`affine`, `mxfp4`, `nvfp4`, `mxfp8` -- so the float pair on offer is nvfp4 and
+mxfp8. `tools/quant_error.py` now measures the 8-bit side too:
+
+| format | bits/w | gaussian | laplace | student-t(4) |
+|---|---|---|---|---|
+| affine int8 g64 -- where the 169 sit | 8.50 | **0.54%** | 0.67% | 0.70% |
+| mxfp8 g32 | 8.25 | **2.94%** | 3.17% | 3.23% |
+
+Applied to `int4-head-linattn`, whose read is 2421M weights at 4 bits and
+520M at 8:
+
+| formats | GB/token | vs it | 4-bit err | 8-bit err |
+|---|---:|---:|---:|---:|
+| affine int4 g32 + affine int8 g64 | 2.066 | -- | 9.4% | 0.70% |
+| **nvfp4 g16** + affine int8 g64 | 1.915 | **-7.3%** | 9.5% | 0.70% |
+| affine int4 g32 + **mxfp8 g32** | 2.050 | -0.8% | 9.4% | **3.23%** |
+| nvfp4 g16 + mxfp8 g32 | 1.898 | -8.1% | 9.5% | 3.23% |
+
+**nvfp4 for the 4-bit side: yes**, and it is the rung already named -- 7.3%
+of bytes for 9.4% -> 9.5% error, which is nothing. It needs the
+`fp_quantized` port and nothing else.
+
+**mxfp8 for the 8-bit side: no.** It buys 0.8% of bytes for 4.6 times the
+weight error, and the reason is the one that killed mxfp4 one rung down: a
+power-of-two shared scale, no zero point, three mantissa bits. The same shape
+at 8 bits as at 4.
+
+The deeper reason there is nothing to win there: after
+`int4-head-linattn` only **17.7% of the read is still 8-bit**, so even a free
+0.25 bits is under a point. And those 169 modules are at 8 bits *because they
+need the precision* -- trading 0.70% error for 3.23% on exactly them, to save
+0.8% of bytes, is the trade backwards.
+
+*A note on measuring it.* The first mxfp8 number this tool produced was 16.1%,
+which would have made the format look catastrophic rather than merely a bad
+trade. That was the harness, not the format: the shared scale was taken as
+`floor(log2(max / 448))`, which puts every group's largest element at or past
+the clip. The OCP rule is `floor(log2(max)) - emax_elem`, with `emax_elem = 8`
+for E4M3. An independent check -- a bare E4M3 round trip with no shared scale
+at all -- lands at 2.65% against the ~3.6% three mantissa bits predict, which
+is what says the corrected path is sound.
+
 ### Formats and ideas considered, and where they stand
 
 - **mxfp4 / mxfp8 / nvfp4.** In mlx, kernels in `vendor/mlx`

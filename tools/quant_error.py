@@ -39,6 +39,35 @@ def fp8(x):
     return s * 2**e * np.round(a / 2**e * 8) / 8
 
 
+def e4m3(x):
+    """An OCP E4M3 element: 3 mantissa bits, max 448, subnormals to 2**-9.
+
+    This is what mxfp8 stores, where affine int8 stores a uniform code. The
+    difference is the whole question: E4M3 spends its bits on dynamic range a
+    group of weights does not have, and keeps only ~3.5 significant bits
+    wherever it lands.
+    """
+    a = np.abs(x)
+    e = np.clip(np.floor(np.log2(np.maximum(a, 1e-30))), -6, 8)
+    normal = np.round(a / 2.0**e * 8) / 8 * 2.0**e
+    subnormal = np.round(a / 2.0**-9) * 2.0**-9
+    return np.sign(x) * np.clip(np.where(a < 2.0**-6, subnormal, normal), 0, 448.0)
+
+
+def mxfp8(w, g):
+    """E4M3 elements under a shared E8M0 scale, by the OCP MX rule.
+
+    The shared exponent is `floor(log2(max|w|)) - emax_elem`, with
+    `emax_elem = 8` for E4M3 (448 = 1.75 * 2**8) -- not `max / 448` rounded
+    down, which would put every group's top element at or past the clip.
+    """
+    w = w.reshape(-1, g)
+    m = np.abs(w).max(1, keepdims=True)
+    m = np.where(m == 0, 1, m)
+    s = 2.0 ** (np.floor(np.log2(m)) - 8)
+    return (e4m3(w / s) * s).ravel()
+
+
 def err(q, w):
     return 100 * np.sqrt(((q - w) ** 2).mean()) / np.sqrt((w**2).mean())
 
@@ -127,6 +156,7 @@ def main():
         [
             ("affine int8 g64  -- the 260 modules today", 8.50, lambda w: affine(w, 64, 8)),
             ("affine int4 g32  -- the body today", 5.00, lambda w: affine(w, 32, 4)),
+            ("mxfp8 g32", 8.25, lambda w: mxfp8(w, 32)),
             ("nvfp4 g16", 4.50, lambda w: fp4(w, 16, False)),
             ("mxfp4 g32", 4.25, lambda w: fp4(w, 32, True)),
         ],
