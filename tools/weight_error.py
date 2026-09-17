@@ -2,6 +2,7 @@
 
     PYTHONPATH=../vendor/mlx-lm python3 tools/weight_error.py
     PYTHONPATH=../vendor/mlx-lm python3 tools/weight_error.py --decompose
+    PYTHONPATH=../vendor/mlx-lm python3 tools/weight_error.py --schemes
 
 `tools/quant_error.py` predicts a format's error by quantizing a million
 synthetic draws -- gaussian, laplace, student-t. That is how REBUILD.md Phase
@@ -162,6 +163,102 @@ def rel_rms(a, b):
     return float(mx.sqrt(mx.sum((a - b) ** 2) / mx.sum(b**2)))
 
 
+# --- --schemes: IDEAS.md's metadata table, on real weights -----------------
+
+# Whole groups of 32, evenly spaced through the tensor, so a g16 scheme and a
+# g32 scheme see exactly the same elements and the sample spans every row
+# rather than the first few thousand.
+SAMPLE_GROUPS = 1 << 16
+
+
+def sample(w, g=32):
+    w = w.ravel()
+    w = w[: (len(w) // g) * g].reshape(-1, g)
+    if len(w) > SAMPLE_GROUPS:
+        w = w[:: len(w) // SAMPLE_GROUPS][:SAMPLE_GROUPS]
+    return np.ascontiguousarray(w.ravel())
+
+
+def schemes():
+    """IDEAS.md's metadata table, on real weights, with and without a global
+    scale.
+
+    The distinction is the whole result. An 8-bit shared scale is E4M3, whose
+    smallest normal is 2**-6; this model's weights have sigma 0.015, so a
+    group's max/6 lands near 2**-7.7 and **99.6% of group scales are
+    subnormal**, on a grid of 2**-9. That is a ~20% relative scale error, not
+    the ~6% three mantissa bits suggest, and it is why nvfp4 measured 10.9%
+    where the synthetic study said 9.5%.
+
+    A single fp32 per tensor fixes it, by moving the group scales into E4M3's
+    normal range before they are encoded. nvfp4 has exactly that input and
+    calls it `global_scale`; `mlx_lm.convert` does not pass one, which is why
+    the built artifact pays the full price. Any bespoke scheme would carry the
+    same fp32, so the `+global` rows are the honest form of the ideas.
+    """
+    import quant_error as q
+
+    def enc_global(ref):
+        """An E4M3 scale encoding told the tensor's magnitude first: one fp32
+        per tensor, exactly what nvfp4's global_scale buys."""
+        gs = ref / 448.0
+        return lambda x: q.e4m3(x / gs) * gs
+
+    def affine_enc(w, g, bits, enc):
+        w = w.reshape(-1, g)
+        n = 2**bits - 1
+        lo, hi = w.min(1, keepdims=True), w.max(1, keepdims=True)
+        s, b = enc((hi - lo) / n), enc(lo)
+        s = np.where(s == 0, 1, s)
+        return (np.clip(np.round((w - b) / s), 0, n) * s + b).ravel()
+
+    def nvfp4_enc(w, g, enc):
+        w = w.reshape(-1, g)
+        a = np.abs(w).max(1, keepdims=True) / 6.0
+        a = np.where(a == 0, 1, a)
+        s = enc(a)
+        s = np.where(s == 0, 1, s)
+        i = np.abs(np.abs(w / s)[..., None] - q.E2M1).argmin(-1)
+        return (np.sign(w) * q.E2M1[i] * s).ravel()
+
+    rows = [
+        ("affine g32, bf16 scale+bias   -- the body today", 5.00,
+         lambda w: q.affine(w, 32, 4)),
+        ("nvfp4 g16                     -- as forged", 4.50,
+         lambda w: nvfp4_enc(w, 16, q.e4m3)),
+        ("nvfp4 g16, + global scale     -- as mlx allows", 4.50,
+         lambda w: nvfp4_enc(w, 16, enc_global(np.abs(w).max()))),
+        ("IDEAS #1  affine g16, fp8 scale+bias", 5.00,
+         lambda w: affine_enc(w, 16, 4, q.e4m3)),
+        ("IDEAS #1  + global scale", 5.00,
+         lambda w: affine_enc(w, 16, 4, enc_global(np.abs(w).max()))),
+        ("IDEAS #2  Lloyd-Max g16, fp8 scale, + global", 4.50,
+         lambda w: q.lloyd(w, 16, 4, enc_global(np.abs(w).max()))),
+        ("          Lloyd-Max g32, bf16 scale", 4.50,
+         lambda w: q.lloyd(w, 32, 4, q.bf16)),
+    ]
+
+    labels = [c[0] for c in CASES if c[0] != "mlp.gate (router)"]
+    cols = {}
+    for label, _m, parent_name, kind in CASES:
+        if label == "mlp.gate (router)":
+            continue
+        t = load_one(PARENT, parent_name)
+        if kind == "experts":
+            t = t[:EXPERTS, : t.shape[1] // 2, :]
+        mx.eval(t)
+        cols[label] = sample(np.array(t.astype(mx.float32)))
+        del t
+
+    print("IDEAS.md's metadata table, on the model's own weights")
+    print("(a scale is E4M3; +global is one fp32 a tensor, moving the group")
+    print(" scales out of E4M3's subnormals -- 99.6% of them land there)\n")
+    print(f"  {'scheme':<48}{'bits':>6}" + "".join(f"{l.split('[')[0][:12]:>14}" for l in labels))
+    for name, bits, f in rows:
+        cells = "".join(f"{rel_rms_np(f(cols[l]), cols[l]):>13.2f}%" for l in labels)
+        print(f"  {name:<48}{bits:>6.2f}{cells}")
+
+
 def main():
     print(f"parent: {PARENT.name}\n")
     width = max(len(n) for n, _ in VARIANTS)
@@ -191,5 +288,7 @@ def main():
 
 if "--decompose" in sys.argv:
     decompose()
+elif "--schemes" in sys.argv:
+    schemes()
 else:
     main()

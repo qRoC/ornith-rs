@@ -132,9 +132,14 @@ converting almost one for one, as a memory-bound step should. It does not
 deliver its quality: the max KL goes 0.048 -> 0.429 nats, which leaves it
 **strictly dominated by `int4-except-gates`** on bytes, GPU busy *and* KL. The
 measured reason is that nvfp4's error on this model's own weights is
-10.4-13.1%, not the 9.2-9.5% a synthetic study predicted. `REBUILD.md`,
-"nvfp4, built and measured", has the whole thing; `recipes/README.md` has the
-table.
+10.4-13.1%, not the 9.2-9.5% a synthetic study predicted -- and the root
+cause is that E4M3's smallest normal is 2**-6 where this model's group scales
+sit near 2**-7.7, so **99.6% of them are subnormal**. nvfp4's optional
+`global_scale` exists to fix precisely that and `mlx_lm.convert` never passes
+one; with it the same weights measure 9.4-9.5%. So the verdict is on the rung
+the toolchain can forge, not on the ceiling of the format. `REBUILD.md`,
+"nvfp4, built and measured", has the whole thing including what a
+global-scaled build would cost; `recipes/README.md` has the table.
 
 mxfp4 and mxfp8 are **not** ported and the instantiation file says why: mxfp4
 measures 20-22% weight error against affine int4's 8-9%, and mxfp8 buys 0.8%

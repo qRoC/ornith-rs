@@ -8,18 +8,34 @@ marked unmeasured.
 
 ## The ceiling on formats, measured
 
-> **Read the caveat before the table.** Every number below is
-> `tools/quant_error.py` on synthetic draws, and one row of it has since been
-> checked against the model's own weights and found badly optimistic: nvfp4
-> g16 is predicted at 9.18-9.51% and measures **10.4-10.9%** on the dense
-> projections and **13.1%** on the expert slabs
-> (`REBUILD.md`, "Why the prediction missed"). The affine rows transferred;
-> the one row that spends its budget on a coarser shared scale to pay for a
-> smaller group did not -- and **that is exactly what the two leading ideas
-> below do.** An fp8 scale has three mantissa bits, the same three that put
-> 4% of nvfp4's elements past its clip. Treat the ranking as a hypothesis and
-> settle it with `tools/weight_error.py` on real weights before building
-> anything on it.
+> **Read this before the table.** Every number below is
+> `tools/quant_error.py` on **unit-variance synthetic draws**, and that turned
+> out to matter more than the distribution shape the three columns vary. An
+> 8-bit shared scale is E4M3, whose smallest normal is 2**-6; this model's
+> weights have sigma 0.015, so **99.6% of its group scales are subnormal** and
+> get a 2**-9 grid instead of three mantissa bits. A unit-variance draw never
+> goes there, so the table below cannot see the regime the model lives in.
+> (`fp8()` also had a bug that omitted subnormals entirely. Fixing it changed
+> **not one digit here** -- which is the point.)
+>
+> Re-run on the model's own weights, `tools/weight_error.py --schemes`:
+>
+> | scheme | bits/w | predicted | real weights |
+> |---|---:|---:|---:|
+> | affine g32, bf16 scale+bias -- the body today | 5.00 | 7.82% | 7.8-8.3% |
+> | **g16, fp8 scale+bias, *with a per-tensor fp32*** | 5.00 | 7.02% | **7.0-7.2%** |
+> | g16, fp8 scale+bias, without one | 5.00 | -- | 11.8-18.6% |
+> | Lloyd-Max g16, fp8 scale, with one | 4.50 | 7.50% | 7.5-**18.7%** |
+> | Lloyd-Max g32, bf16 scale | 4.50 | 8.21% | 8.2-9.0% |
+> | nvfp4 g16 (built) | 4.50 | 9.51% | 10.4-13.1%, or 9.5% with one |
+>
+> **So the first idea holds and the second does not.** `g16, fp8 scale+bias`
+> is really 10% better than the body at equal bits -- but only once a single
+> fp32 a tensor moves the scales out of the subnormals, which is what nvfp4's
+> `global_scale` input is for and what nothing in the table below models. The
+> Lloyd-Max row does not reproduce at all and swings by 2.5x across tensors.
+> Treat the rest of this table the same way: a hypothesis about a format,
+> measured in a regime the model is not in.
 
 Relative RMS weight error against the rate-distortion floor for a Gaussian
 source, which is the best any code can do at that rate:
@@ -38,7 +54,7 @@ a gaussian and the ranking moves with it.
 | affine g32, fp8 scale+bias | 4.50 | 8.14% | 9.51% | 9.72% | 4.42% |
 | affine g16, fp8 scale, no zero-point | 4.50 | 8.35% | 9.97% | 10.43% | 4.42% |
 | affine g64, bf16 scale+bias | 4.50 | 8.97% | 11.13% | 11.74% | 4.42% |
-| nvfp4 g16 -- **built; real weights 10.4-13.1%** | 4.50 | 9.51% | 9.28% | 9.18% | 4.42% |
+| nvfp4 g16 -- **built; real 10.4-13.1%, 9.5% with a global scale** | 4.50 | 9.51% | 9.28% | 9.18% | 4.42% |
 | mxfp4 g32 | 4.25 | 20.32% | 21.19% | 22.00% | 5.26% |
 | VQ dim 2, 256 codes, g32 | 4.50 | 8.54% | -- | -- | 4.42% |
 | VQ dim 4, 4096 codes, g32 | 3.50 | 14.97% | -- | -- | 8.84% |
@@ -53,17 +69,27 @@ Three readings:
   lose badly at the codebook sizes that fit in a threadgroup. The gains the
   literature reports at 2-3 bits come from codebooks far larger than this, plus
   residual stages.
-- **The cheap wins are in the group metadata, not the grid**, and they are
-  bigger than they look on a gaussian. Moving from a bf16 scale+bias at g32 to
-  an **fp8 scale+bias at g16** buys 10% less error on a gaussian and **15-17%
-  on the heavy-tailed distributions real weights resemble** -- at the *same*
-  5.00 bits, because the overhead fp8 frees pays for a group half the size.
-  Same kernel shape, same 4-bit elements, same packing.
-- **And a fitted codebook at g16 beats today's scheme while spending less.**
-  Lloyd-Max at group 16 with an fp8 scale is 7.50 / 8.09 / 8.12% against
-  today's 7.82 / 9.18 / 9.37% -- better on all three distributions at **0.50
-  fewer bits a weight**. That is a 10% byte saving with a quality improvement
-  attached, for a per-tensor 16-entry table and a kernel that indexes it.
+- **The cheap wins are in the group metadata, not the grid** -- and this one
+  measured true, with a condition the synthetic table could not express.
+  Moving from a bf16 scale+bias at g32 to an **fp8 scale+bias at g16** buys
+  10% less error on a gaussian and 15-17% on the heavy-tailed columns, at the
+  *same* 5.00 bits, because the overhead fp8 frees pays for a group half the
+  size. On the model's real weights it buys **10%, uniformly** -- the
+  heavy-tail bonus does not appear -- **and only if the format also carries
+  one fp32 a tensor.** Without it the same scheme is 11.8-18.6% against the
+  body's 7.8-8.3%, because an E4M3 scale with nothing to normalise it is
+  subnormal here. Same kernel shape, same 4-bit elements, same packing, plus
+  four bytes a tensor that are not optional.
+- **And a fitted codebook at g16 looked like it beat today's scheme while
+  spending less -- but it does not reproduce.** Lloyd-Max at group 16 with an
+  fp8 scale is 7.50 / 8.09 / 8.12% on synthetic draws against today's 7.82 /
+  9.18 / 9.37%, better on all three at **0.50 fewer bits a weight**. On real
+  weights, with the per-tensor fp32 the scheme needs, it is 7.6% on `lm_head`,
+  7.5% on `in_proj_z`, 9.4% on the experts and **18.7% on `in_proj_qkv`** --
+  a 2.5x swing across tensors of the same model, where plain Lloyd-Max at g32
+  with a bf16 scale stays inside 8.2-9.0%. Something about that tensor defeats
+  a single fitted codebook and the g32/bf16 version absorbs it; until that is
+  understood this is not a plan, it is a lead.
 
 ## What voxel engines solved, and which of it transfers
 

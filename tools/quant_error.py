@@ -31,14 +31,6 @@ def bf16(x):
     return ((u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000).view(np.float32)
 
 
-def fp8(x):
-    """E4M3 magnitude, which is how nvfp4 stores a group scale."""
-    s = np.sign(x)
-    a = np.clip(np.abs(x), 2**-9, 448.0)
-    e = np.floor(np.log2(a))
-    return s * 2**e * np.round(a / 2**e * 8) / 8
-
-
 def e4m3(x):
     """An OCP E4M3 element: 3 mantissa bits, max 448, subnormals to 2**-9.
 
@@ -52,6 +44,24 @@ def e4m3(x):
     normal = np.round(a / 2.0**e * 8) / 8 * 2.0**e
     subnormal = np.round(a / 2.0**-9) * 2.0**-9
     return np.sign(x) * np.clip(np.where(a < 2.0**-6, subnormal, normal), 0, 448.0)
+
+
+def fp8(x):
+    """E4M3 magnitude, which is how nvfp4 stores a group scale.
+
+    **Subnormals are the whole story below 2**-6** and this used to omit
+    them: it took `floor(log2(a))` unclamped, so a scale of 2**-8 kept a full
+    3-bit mantissa instead of landing on E4M3's subnormal grid of 2**-9. On a
+    unit-variance draw that never shows -- a group max of ~3 gives a scale of
+    ~0.4, comfortably normal. On this model's weights it is the only thing
+    that matters: sigma is 0.015, so **99.6% of group scales are subnormal**,
+    and the omission made nvfp4 read 9.5% where mlx measures 10.9%.
+
+    `e4m3` already models this correctly for mxfp8's elements, so a scale is
+    now encoded by the same function as an element. Anything that wants the
+    old behaviour wants a *global scale* instead -- see `fp4`.
+    """
+    return e4m3(x)
 
 
 def mxfp8(w, g):
@@ -203,4 +213,8 @@ def main():
         print(f"  {r:>5} bits: {100 * 2**-r:>6.2f}%")
 
 
-main()
+# Importable: `tools/weight_error.py --schemes` reuses these definitions to
+# run the same schemes against the model's own weights, and the whole point of
+# that comparison is that both sides cut the format the same way.
+if __name__ == "__main__":
+    main()

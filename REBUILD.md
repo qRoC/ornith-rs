@@ -979,30 +979,108 @@ not a reimplementation of the format.
 | `out_proj` | 8.52% | 9.33% | 10.80% | 4.5% | 11.62% |
 | `switch_mlp.gate_proj` | 8.21% | 9.38% | **13.11%** | 4.2% | **11.29%** |
 
-- **The E2M1 grid is the bigger half everywhere except the experts.** Even
-  with a perfect scale and half the group size it is 9.3-9.4% against
-  affine's 8.1-8.5% -- 12-16% more error before the scale is quantized at
-  all. A non-uniform grid suits weights in principle; four exponent levels
-  and one mantissa bit is not enough of one, and the missing zero point costs
-  on top.
-- **The E4M3 scale is what wrecks the experts, and clipping is the
-  mechanism.** Three mantissa bits on the shared scale, rounded to nearest,
-  can round it *down*, and then the group's own maximum lands past the E2M1
-  clip at 6.0 -- a hard error, where affine's min/max scale cannot clip by
-  construction. 4.2-4.6% of elements clip, and that fraction is **the same
-  for every module**; what differs is what it costs. Rounding the scale up
-  instead removes the clipping entirely (0.0% throughout) and takes the
-  experts from 13.11% to 11.29%, while costing every other module 0.7-1.2
-  points. So the experts are not clipping more often, they are clipping
-  harder -- and the fix is a trade whose sign flips per tensor, which a
-  format with one scale rule cannot make.
+- **The E2M1 grid is the smaller half.** Even with a perfect scale and half
+  the group size it is 9.3-9.4% against affine's 8.1-8.5% -- 12-16% more
+  error before the scale is quantized at all. A non-uniform grid suits weights
+  in principle; four exponent levels and one mantissa bit is not enough of
+  one, and the missing zero point costs on top. But that is a point and a
+  half, not the gap.
+- **Everything past that is the shared scale, and the cause is not what it
+  first looked like.** The proximate mechanism is clipping -- a scale rounded
+  *down* puts the group's own maximum past the E2M1 clip at 6.0, which
+  affine's min/max scale cannot do by construction, and 4.2-4.6% of elements
+  land there. Rounding the scale up instead removes the clipping entirely and
+  takes the experts from 13.11% to 11.29% while costing every other module
+  0.7-1.2 points.
 
-**The lesson for `IDEAS.md`.** That file's format table is the same synthetic
-study, and its two leading ideas -- an fp8 scale at g16, and a Lloyd-Max
-codebook at g16 with an fp8 scale -- both spend their budget exactly where
-nvfp4 just lost it: a coarser shared scale to pay for a smaller group. The
-ranking there is now unsafe until `weight_error.py` re-runs it on real
-weights. See the note added at the top of that section.
+#### The root cause: 99.6% of these group scales are subnormal
+
+Why is a scale with three mantissa bits rounding down by enough to clip? It
+is not the mantissa. **E4M3's smallest normal is 2**-6, and this model's
+weights have sigma 0.015**, so a group's `max/6` lands around 2**-7.7 and
+99.6% of them are *subnormal* -- encoded on a fixed grid of 2**-9, with two
+or three steps to work with. That is a ~20% relative error on the scale, not
+the ~6% three mantissa bits suggest, and it multiplies the whole group.
+
+Two consequences, and the second is the useful one.
+
+**`tools/quant_error.py` had a bug that no synthetic draw could reveal.** Its
+`fp8()` took `floor(log2(a))` unclamped, so it gave every scale a full 3-bit
+mantissa and never modelled a subnormal. On a unit-variance draw that is
+correct -- a group max near 3 gives a scale near 0.4, comfortably normal -- so
+**fixing it changes not one digit of either synthetic table**, byte for byte.
+It is wrong only in the regime real weights live in, and the study never
+entered that regime because its inputs were unit-variance. A self-consistent
+study, an invisible defect, and a conclusion off by a factor of nine once it
+met the model. `fp8()` now calls `e4m3()`, which had modelled subnormals
+correctly all along for mxfp8's *elements*; the two encodings are the same
+encoding and the file had one right and one wrong.
+
+**And nvfp4 has an input for exactly this, which `mlx_lm.convert` does not
+pass.** One fp32 a tensor, `global_scale`, folded in as
+`inv_scale_enc = global_scale / (F8E4M3_MAX * F4E2M1_MAX)` -- it exists to
+move the group scales into E4M3's normal range before they are encoded. With
+it, on these same weights (`tools/weight_error.py --schemes`):
+
+| | as forged | + global scale | affine int4 g32 |
+|---|---:|---:|---:|
+| `lm_head` | 10.38% | **9.45%** | 8.03% |
+| `in_proj_qkv` | 10.86% | **9.53%** | 7.81% |
+| `in_proj_z` | 10.65% | **9.50%** | 7.90% |
+| `out_proj` | 10.79% | **9.44%** | 8.25% |
+| `switch_mlp.gate_proj` | 13.07% | **9.48%** | 7.94% |
+
+(The left column reproduces mlx's own measurements on all five to within
+0.04 points, which is what says the model is the format.)
+
+**So the built variant pays a penalty the format does not require.** The
+global scale recovers 1 to 3.6 points and flattens the expert anomaly
+completely -- the experts were never a different distribution, they were
+further into the subnormals. What is left at 9.5% against affine int4's
+7.8-8.3% is the E2M1 grid, which is the real and irreducible part.
+
+**Does that overturn the verdict? Not on the measurements in hand, and it is
+not settled either.** The rung that was built is the rung `mlx_lm.convert`
+can forge, and it lost. A global-scaled nvfp4 would sit at 9.5% rather than
+10.4-13.1%, which is most of the way back to affine int4's error at half a
+bit less -- so its KL would land somewhere well below 0.429 and above 0.048,
+and whether that beats the knee is an open question rather than a predicted
+one. This project has now mispriced that prediction twice, so it stays open
+until measured.
+
+What it would cost, honestly: a quantization pass outside `mlx_lm.convert`
+(neither it nor `nn.QuantizedLinear.from_linear` passes `global_scale`), the
+`_hgs` kernel specialisations this port deliberately did not instantiate, and
+a loader path for the third tensor -- which `WeightStore::quant_matrix`
+currently rejects by design. Perhaps half the work of the port that is
+already here, for a question worth asking only if the byte lever is still
+the one being pulled.
+
+**The lesson for `IDEAS.md`, measured rather than feared.** That file's two
+leading ideas both spend a coarser shared scale to buy a smaller group, which
+is what nvfp4 just lost on, so they were run on real weights too:
+
+| scheme | bits/w | real weights | predicted (gaussian) |
+|---|---:|---:|---:|
+| affine g32, bf16 scale+bias -- the body today | 5.00 | 7.8-8.3% | 7.82% |
+| **#1 affine g16, fp8 scale+bias, with a global scale** | 5.00 | **7.0-7.2%** | 7.02% |
+| #1 without one | 5.00 | 11.8-18.6% | -- |
+| #2 Lloyd-Max g16, fp8 scale, with a global scale | 4.50 | 7.5-18.7% | 7.50% |
+| Lloyd-Max g32, bf16 scale | 4.50 | 8.2-9.0% | 8.21% |
+
+- **#1 survives, and only with the global scale.** 7.0-7.2% against the
+  body's 7.8-8.3% at the same 5.00 bits -- the predicted 10% holds on real
+  weights, though the extra 15-17% the heavy-tailed synthetic columns
+  promised does not. Without the per-tensor fp32 the same scheme is 11.8-18.6%
+  and far worse than what it replaces. **The idea was never "fp8 scales are
+  fine", it was "fp8 scales are fine once something tells them the
+  magnitude", and the study could not see the difference.**
+- **#2 does not reproduce and is not usable as stated.** 7.5-7.7% on three
+  modules, 9.4% on the experts and **18.7% on `in_proj_qkv`** -- against a
+  predicted 7.50%. A single codebook fitted across a tensor is evidently
+  sensitive to something that tensor has and the others do not; whether that
+  is the fit or the scheme is unresolved, and it is a prerequisite rather
+  than a detail.
 
 ### The float pair, asked and priced
 

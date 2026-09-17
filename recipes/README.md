@@ -26,9 +26,22 @@ perplexity, which is the column Phase 4 established cannot rank these.
 The measured reason is in `REBUILD.md`, "Why the prediction missed": nvfp4's
 error on the model's own weights is 10.4-13.1%, not the 9.2-9.5% the
 synthetic study predicted, and `tools/weight_error.py` is the tool that says
-so. The kernels stay in the port -- they are verified, they cost nothing at
-rest, and on an M5 the `_r_2` narrow-qmv path changes the speed side of this
-trade even though it cannot change the quality side.
+so.
+
+**With one caveat that is worth more than the verdict.** The root cause is
+that E4M3's smallest normal is 2**-6 while this model's group scales sit near
+2**-7.7, so 99.6% of them are subnormal and lose most of their precision --
+and nvfp4 has an input for exactly that, `global_scale`, one fp32 a tensor,
+which `mlx_lm.convert` does not pass. With it the same weights come out at
+**9.4-9.5%** instead of 10.4-13.1%. So what was measured is the rung the
+toolchain can forge, not the ceiling of the format, and whether a
+global-scaled nvfp4 clears the knee is open. `REBUILD.md` prices what it
+would take: a quantization pass outside `mlx_lm.convert`, the `_hgs` kernels
+this port did not instantiate, and a loader path for the third tensor.
+
+The kernels stay in the port -- they are verified, they cost nothing at rest,
+and on an M5 the `_r_2` narrow-qmv path changes the speed side of this trade
+even though it cannot change the quality side.
 
 The artifacts are `~/.mtplx/models/ornith-1.5-35b-a3b-{int4-head-linattn,
 nvfp4-head-linattn, int4-except-gates}`; the control is
