@@ -581,6 +581,45 @@ plus ~5.3 ms of serialisation plus ~1.7 ms of dispatch and commit overhead.
 
 ---
 
+### Which kernels the time is in
+
+`ORNITH_PROF=1 ORNITH_COMMIT_EVERY=1` gives one dispatch per command buffer,
+so each buffer's timestamps belong to a single kernel. That inflates the total
+(14.0 ms against 10.9) and inflates small kernels most, since each pays for its
+own command buffer -- roughly 1.5 us of the cost of every line below. The
+proportions are what to read.
+
+| ms/token | share | count | kernel |
+|---|---|---|---|
+| 5.361 | 38.2% | 195 | `affine_qmv_fast` 8-bit g64 |
+| 1.768 | 12.6% | 96 | `affine_gather_qmv_fast` 4-bit g32, the routed experts |
+| 0.770 | 5.5% | 191 | `rms_norm` |
+| 0.693 | 4.9% | 96 | `affine_qmv_fast` 4-bit g32 |
+| 0.596 | 4.2% | 24 | `affine_gather_qmv_fast` 8-bit g64 |
+| 0.587 | 4.2% | 40 | `affine_qmv` 8-bit g64 |
+| 0.481 | 3.4% | 40 | `carg_block_sort`, the router's argsort |
+| 0.318 | 2.3% | 120 | `add_elem` |
+| 0.215 | 1.5% | 50 | `slice_inner` |
+| 0.189 | 1.4% | 80 | `swiglu` |
+| 0.186 | 1.3% | 40 | `col_reduce_small` |
+| 0.182 | 1.3% | 50 | `sigmoid_gate` |
+| 0.173 | 1.2% | 60 | `scalar_mul` |
+| 0.173 | 1.2% | 40 | `row_reduce_small` |
+
+**The big kernels take time in proportion to the bytes they read**, so there is
+no slow one to find. The 8-bit `qmv_fast` is 38% of the time and reads about
+38% of the traffic -- the gated-delta `in_proj` alone is 1.07 GB of the 2.83.
+A guess that the expert gather was the anomaly did not survive the measurement.
+
+**The small kernels are the anomaly, from the other side**: `rms_norm`, `add`,
+`slice`, `swiglu`, `sigmoid_gate`, `scalar_mul` and the two reductions come to
+~2.2 ms, 16% of the time, while moving ~0.2% of the bytes. Take out the
+command-buffer inflation (~1.5 us x ~500 dispatches) and it is **~1.2 ms, ~11%
+of a real step**, which is what a fusion could go after. Not the bandwidth --
+the hidden state is 2048 values, 4 KB, and all of those kernels together push
+~4 MB a token against 2.83 GB of weights. The launches.
+
+
 ## What is left
 
 In order:
@@ -590,7 +629,37 @@ In order:
    other work on it; by the end a run of one binary varied by more than the
    thing being measured, so the wall-clock figures are the shape of the
    answer, not the answer.
-2. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
+2. **Fuse the elementwise chain, in three steps.** Worth ~5-6%, the second
+   largest lever after the weight reading itself, which is not removable.
+   Ordered by size, each landing with its own golden test:
+
+   1. **The router's tail**, the biggest single piece and self-contained:
+      `softmax -> argsort -> slice_tail -> take_along -> sum -> div` over 256
+      experts, ~4 dispatches x 40 layers, and the argsort alone is 12 us to
+      sort 256 numbers, 3.4% of the step. One kernel per layer: 256 logits in,
+      8 indices and 8 normalised weights out, one threadgroup. The catch is
+      that mlx's `argpartition` is a full argsort, so the permutation is fully
+      determined and the fused kernel has to reproduce it exactly -- including
+      the tie-break.
+   2. **`add` residual + the `rms_norm` after it**, 2 per layer x 40 = 80
+      dispatches. The fused kernel writes both, since `h` is still needed as
+      the next residual.
+   3. **`rms_norm(q, no weight)` + `scalar_mul`** in the gated-delta path,
+      2 per layer x 30 = 60 dispatches.
+
+   Two things have to be said out loud about this one. It is **a deliberate
+   departure from 1:1 with mlx**: these are fusions `mx.compile` does not make,
+   so the port would be doing something its source does not. The numbers stay
+   identical, the correspondence does not. And a fused bfloat16 kernel has to
+   reproduce mlx's *chain of arrays*, not its expression -- every intermediate
+   gets its own `bfloat16_t` variable, or Metal keeps it at float precision and
+   the result drifts, which is exactly how `gelu_pytorch_tanh` disagreed on 9
+   of 65536 inputs until every step was named.
+
+   What mlx does fuse is already here, by hand, in
+   `kernels/ornith_elementwise.metal` -- `swiglu`, `precise_swiglu`,
+   `sigmoid_gate`, `silu`, `scalar_mul`. This item is only about going past it.
+3. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
    `lm_head` over a ranked sub-vocabulary, which is what removes the ~540 MB
    per draft step. The artifact ships no ranked vocabulary, so it would have
    to be derived.
@@ -631,6 +700,36 @@ taps (this `vision_config` ships none), and mlx's graph-level fusion engine
 (the fused forms it produces are written out by hand instead, in
 `kernels/ornith_elementwise.metal`, `kernels/sampler_ops.metal` and
 `kernels/vision_ops.metal`).
+
+### The Neural Engine, and why it is not a lever here
+
+Looked at and turned down, so it does not have to be looked at twice. The ANE
+is a graph-execution engine reached through private frameworks (`_ANEClient`,
+`_ANECompiler`, MIL programs, IOSurface for tensors); there is a Rust toolkit
+on the same objc2 stack as this port, `djphoenix/ane-rs`, already carrying
+Qwen3/Qwen3.5. Three things rule it out, in order of how final they are.
+
+- **It is fp16, and this trunk is quantised.** 260 tensors at 4-bit g32 and
+  8-bit g64 with group scales, and no affine quantised matmul is exposed on
+  that path. Dequantising is 70 GB of weights instead of 25.5, or 2-4x the
+  bytes per token if done on the fly -- the opposite of what a memory-bound
+  decode wants.
+- **Decode is bound by memory, not arithmetic.** 2.83 GB a token, a 5.2 ms
+  floor at this machine's 546 GB/s against an 11.3 ms step. The ANE's case is
+  TOPS, and it shares the same unified memory, so there is nothing for it to
+  win at batch 1.
+- **It would end the verification.** The published figure for that path is
+  MAE 1e-5 against fp32; the check here is `max_abs == 0.0`, and it is what
+  caught all ten bugs in the list above.
+
+The one piece that could physically run there is the **vision tower** -- its
+333 tensors are unquantised bf16, and a ViT is the ANE's home ground. It still
+is not worth it: the tower runs once per image rather than once per token, so
+it is not on the decode path at all, and moving it would trade the token-for-
+token agreement with MTPLX for fp16.
+
+AMX is out for the same reasons and one more: it is CPU-side, on the same
+memory, with no quantised matmul, and mlx does not use it on the GPU path.
 
 ---
 
