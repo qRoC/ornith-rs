@@ -12,6 +12,7 @@
 
 pub mod array;
 pub mod chat;
+pub mod frspec;
 pub mod generate;
 pub mod json;
 pub mod metal;

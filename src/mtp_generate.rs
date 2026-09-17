@@ -35,6 +35,7 @@
 //! case, so `--mtp` refuses to pair with sampling unless asked.
 
 use crate::array::{Array, Dtype};
+use crate::frspec::FrSpec;
 use crate::generate::{Sampler, model_call, prefill};
 use crate::vision::splice::VisionSplice;
 use crate::metal::Context;
@@ -100,6 +101,7 @@ fn draft(
     ctx: &Context,
     model: &TextModel,
     head: &MtpHead,
+    frspec: Option<&FrSpec>,
     mtp_cache: &mut KvCache,
     hidden_row: &Array,
     primary: u32,
@@ -108,19 +110,26 @@ fn draft(
     let mut init = vec![0u32; depth + 1];
     init[0] = primary;
     let window = Array::from_slice(ctx, &init, &[depth + 1], Dtype::U32);
+    // FR-Spec drafts through a pruned `lm_head`; the verify forward below is
+    // untouched and still reads all 248320 rows, which is what keeps the
+    // emitted tokens identical either way.
+    let lm = frspec.map(|f| &f.head).unwrap_or(&model.lm_head);
     let mut h = hidden_row.clone();
     for i in 0..depth {
         let tok = window.slice_leading(i, 1);
-        let (logits, hid) = head.forward(
-            ctx,
-            &model.cfg,
-            &model.embed_tokens,
-            &model.lm_head,
-            &h,
-            &tok,
-            mtp_cache,
-        );
-        crate::ops::sample::greedy_argmax_into(ctx, &logits, &window.slice_leading(i + 1, 1));
+        let (logits, hid) =
+            head.forward(ctx, &model.cfg, &model.embed_tokens, lm, &h, &tok, mtp_cache);
+        let slot = window.slice_leading(i + 1, 1);
+        match frspec {
+            // The argmax is over the pruned rows, so it comes back as a row
+            // index and has to be mapped to the id that row stands for.
+            Some(fr) => {
+                let local = Array::empty(ctx, &[1], Dtype::U32);
+                crate::ops::sample::greedy_argmax_into(ctx, &logits, &local);
+                fr.map_id(ctx, &local, &slot);
+            }
+            None => crate::ops::sample::greedy_argmax_into(ctx, &logits, &slot),
+        }
         h = hid;
     }
     window
@@ -143,6 +152,7 @@ pub fn generate_step_mtp(
     ctx: &Context,
     model: &TextModel,
     head: &MtpHead,
+    frspec: Option<&FrSpec>,
     caches: &mut [LayerCache],
     prompt: &[u32],
     sampler: &mut dyn Sampler,
@@ -202,7 +212,7 @@ pub fn generate_step_mtp(
         // mlx-lm caps the draft at what is still wanted:
         // `num_draft = min(max_tokens - ntoks, num_draft_tokens)`.
         let want = depth.min(max_tokens.saturating_sub(emitted + 1));
-        let window = draft(ctx, model, head, mtp_cache, &h, primary, want);
+        let window = draft(ctx, model, head, frspec, mtp_cache, &h, primary, want);
         if want > 0 {
             stats.cycles += 1;
             stats.drafted += want;

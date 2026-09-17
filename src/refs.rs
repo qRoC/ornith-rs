@@ -167,7 +167,7 @@ impl RefTensor {
     }
 }
 
-fn refs_root() -> PathBuf {
+pub fn refs_root() -> PathBuf {
     if let Ok(p) = std::env::var("ORNITH_REFS") {
         return PathBuf::from(p);
     }

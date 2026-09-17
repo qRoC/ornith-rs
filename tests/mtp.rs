@@ -283,6 +283,7 @@ fn speculative_tracks_autoregressive() {
             &ctx,
             &model,
             &head,
+            None,
             &mut caches,
             &ids,
             &mut ornith_rs::generate::Greedy,

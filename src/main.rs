@@ -134,6 +134,7 @@ struct Args {
     dialect: Dialect,
     /// `mtplx_runtime.json` recommends depth 3; 0 is plain autoregression.
     mtp_depth: usize,
+    frspec: bool,
     mtp_policy: HistoryPolicy,
     images: Vec<PathBuf>,
     /// Dimensions for a headerless raw RGB file.
@@ -150,6 +151,7 @@ fn parse_args() -> Args {
         seed: 0,
         dialect: Dialect::Transformers,
         mtp_depth: 0,
+        frspec: false,
         mtp_policy: HistoryPolicy::Committed,
         images: Vec::new(),
         image_size: None,
@@ -164,6 +166,7 @@ fn parse_args() -> Args {
             }
             "--seed" => a.seed = it.next().expect("--seed needs a value").parse().unwrap(),
             "--mtp" => a.mtp_depth = 3,
+            "--frspec" => a.frspec = true,
             "--mtp-depth" => {
                 a.mtp_depth = it.next().expect("--mtp-depth needs a value").parse().unwrap()
             }
@@ -184,7 +187,7 @@ fn parse_args() -> Args {
                     "ornith [--prompt TEXT] [--system TEXT] [--max-tokens N] [--seed N]\n\
                      \x20      [--raw] [--greedy] [--tokenizer-json]\n\
                      \x20      [--image PATH]... [--image-size WxH]\n\
-                     \x20      [--mtp] [--mtp-depth N] [--mtp-cycle]"
+                     \x20      [--mtp] [--mtp-depth N] [--mtp-cycle] [--frspec]"
                 );
                 std::process::exit(0);
             }
@@ -401,6 +404,23 @@ fn main() {
     ws.prefetch();
     let model = TextModel::load(&ctx, &mut ws, cfg.clone());
     let head = (args.mtp_depth > 0).then(|| MtpHead::load(&ctx, &mut ws, &cfg));
+    // The pruned draft head is gathered from `lm_head`, so it is built here,
+    // once, while the weights are still open.
+    let frspec = (args.frspec && args.mtp_depth > 0).then(|| {
+        match ornith_rs::frspec::FrSpec::load(&ctx, &model.lm_head, &ornith_rs::frspec::default_path()) {
+            Ok(f) => {
+                eprintln!(
+                    "frspec: drafting from {} of {} rows ({:.1}% of the head's bytes); \
+                     the verify pass still reads all of them",
+                    f.n,
+                    f.vocab,
+                    100.0 * f.ratio()
+                );
+                f
+            }
+            Err(e) => panic!("--frspec: {e}\n  run tools/dump_frspec.py to write the id list"),
+        }
+    });
     let vision = (!args.images.is_empty())
         .then(|| Vision::load(&ctx, &mut ws, &dir, &args.images, args.image_size));
     ctx.sync();
@@ -429,6 +449,7 @@ fn main() {
         ctx: &ctx,
         model: &model,
         head: head.as_ref(),
+        frspec: frspec.as_ref(),
         depth: args.mtp_depth,
         policy: args.mtp_policy,
         tokenizer: &tokenizer,
@@ -512,6 +533,7 @@ struct Session<'a> {
     ctx: &'a Context,
     model: &'a TextModel,
     head: Option<&'a MtpHead>,
+    frspec: Option<&'a ornith_rs::frspec::FrSpec>,
     depth: usize,
     policy: HistoryPolicy,
     tokenizer: &'a Tokenizer,
@@ -585,6 +607,7 @@ impl Session<'_> {
                         self.ctx,
                         self.model,
                         head,
+                        self.frspec,
                         &mut self.caches,
                         fresh,
                         sampler,

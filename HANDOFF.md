@@ -152,6 +152,7 @@ src/chat.rs                chat_template.jinja, hand-compiled
 src/sample.rs              make_sampler: top-p, top-k, categorical
 src/generate.rs            generate_step: prefill chunking and the decode loop
 src/mtp_generate.rs        the MTP draft/verify loop
+src/frspec.rs              the pruned draft head (FR-Spec)
 src/main.rs                the console chat
 src/refs.rs                golden-reference reader
 tools/dump_*.py            golden-reference writers (run against MLX)
@@ -176,6 +177,7 @@ cargo run --release -- -p "..." -m 200       # one shot
 cargo run --release -- --raw -p "..."        # no chat template
 cargo run --release -- --tokenizer-json ...  # tokenizer.json's split regex
 cargo run --release -- --mtp                 # speculative decoding, depth 3
+cargo run --release -- --mtp --mtp-depth 1 --frspec   # the fast pairing
 cargo run --release -- --mtp-depth 1         # shallower draft, see the table below
 cargo run --release -- --image p.bmp -p "..." # one image (repeat for more)
 cargo run --release -- --image p.rgb --image-size 768x448
@@ -486,9 +488,50 @@ part already fixed.
 
 So the stall is a wall-clock problem on the one machine whose wall clock
 cannot be trusted, and seven explanations have now been measured away. The way
-forward on MTP is what GPU busy *can* see: at depth 1 it is 9.6-9.8 ms a token
-against autoregression's 10.5, and FR-Spec below takes ~0.8 ms more off it.
-The stall is a separate item, for a machine that is not swapping.
+forward on MTP was what GPU busy *can* see, and that is what FR-Spec did.
+
+### FR-Spec, and speculative decoding finally paying
+
+`--frspec` drafts through a pruned `lm_head` -- 65536 of the 248320 rows,
+26.4% of its bytes -- while the verify pass keeps reading all of them. Port of
+MTPLX's `frspec_draft.py`, and `src/frspec.rs` says why the two agree.
+
+**It cannot change what the model emits**, and this is the property that makes
+it worth having. Every committed token is the verify forward's own argmax: the
+loop accepts draft `i` only where it already equals target `i` and takes
+target `k` itself otherwise, so the draft decides how many tokens a cycle
+commits and never which. Measured rather than argued -- the same prompt at
+depth 3, with and without, gives byte-identical output *and* identical
+acceptance, 53 of 199 drafts at 0.57 / 0.27 / 0.50. Over those 199 drafts the
+64K subset never once failed to hold the token the full head would have
+proposed, which is what a 0.997 coverage figure looks like from close up.
+`tests/mtp` is unchanged by it.
+
+GPU busy a token, two runs each, against the same binary with the lane off:
+
+| | off | on | |
+|---|---|---|---|
+| `--mtp-depth 1` | 9.63, 9.72 | 9.03, 9.07 | -6.5% |
+| `--mtp-depth 2` | 11.17, 11.20 | 10.36, 10.04 | -8.7% |
+| `--mtp-depth 3` | 12.54, 12.64 | 11.07, 11.35 | -11% |
+
+And against autoregression, interleaved, four runs each:
+
+| | wall tok/s | GPU busy |
+|---|---|---|
+| autoregressive | 89.5, 90.1, 91.2, 90.8 | 10.50-10.67 |
+| `--mtp-depth 1 --frspec` | 85.1, **32.0**, **38.5**, 91.1 | 9.10-9.24 |
+
+**Depth 1 with FR-Spec does 13.5% less GPU work a token than autoregression**,
+with no overlap between the two sets, and its best wall run ties. Depth 1 is
+also the best depth now: 9.0 against 10.0 and 11.1.
+
+The two collapsed runs are the swap signature from the section above -- FR-Spec
+adds 142 MB of gathered rows to a 27.2 GB working set, and the machine was
+back to 16.4 GB of a 17.4 GB swap file by then. Which is the whole state of
+this path: **the speculative win is real and measured on the metric that
+survives this machine, and the stall is what stands between it and the wall
+clock.**
 
 Only after that is it worth making the draft cheaper, and there the number is:
 a draft step is ~2.4 ms of GPU, about half of which is the `lm_head` below.
@@ -514,8 +557,7 @@ The two structural costs, which are why deeper is worse:
    available.
 
 A dense model would win here; a 3B-active MoE with an unpruned draft head does
-not, past depth 1. FR-Spec is the one fix that is real, and it needs a ranked
-vocabulary the artifact does not ship.
+not. FR-Spec is the fix for the first of those, and it is in -- see below.
 
 ### How exact it is
 
@@ -1100,10 +1142,14 @@ In order:
    - **Then bytes, which is the only lever left at batch 1.** That is the
      `fp_quantized` family in "Metal 4.1, fp8/fp4" above, and it is worth it
      only if MXFP4 holds quality where affine int4 did not.
-3. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
-   `lm_head` over a ranked sub-vocabulary, which is what removes the ~540 MB
-   per draft step. The artifact ships no ranked vocabulary, so it would have
-   to be derived.
+3. **The MTP stall**, which is now the only thing between speculative
+   decoding and a wall-clock win. FR-Spec is done and `--mtp-depth 1
+   --frspec` does 13.5% less GPU work a token than autoregression; what it
+   does not do is convert that into tok/s, because the loop leaves the GPU
+   idle ~2.5 ms a token against autoregression's 0.5. Seven explanations are
+   measured away in "It does not pay off here"; the eighth needs a machine
+   that is not swapping, since this is a wall-clock question and this
+   machine's wall clock is the one number that cannot be trusted.
 
 Smaller gaps, each with an assert or a comment where it bites:
 
@@ -1225,6 +1271,11 @@ memory, with no quantised matmul, and mlx does not use it on the GPU path.
   `ORNITH_NO_BARRIER=1` drops every barrier, which is wrong but bounds what
   they cost. `cargo run --release --bin dispatch_cost` times an empty
   dispatch.
+- `tools/dump_frspec.py` writes `refs/frspec/ids_64k.bin`, the ranked
+  sub-vocabulary `--frspec` drafts from. It is MTPLX's artifact
+  (`mtplx/data/qwen38_code_ranked_64k.npy`, same tokenizer, 65536 ids) and is
+  not copied into this repository for the same reason `refs/` is not.
+  `ORNITH_FRSPEC=<path>` overrides where it is read from.
 - `tools/gen_unicode.py` regenerates `src/tokenizer/tables.rs`. It is checked
   in; only re-run it when the Python that produced it moves to a new Unicode
   version, and re-run `tests/tokenizer.rs` afterwards.
