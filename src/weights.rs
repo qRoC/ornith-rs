@@ -241,6 +241,14 @@ mod tests {
         }))
     }
 
+    /// The loaded tensors agree with what `config.json` says about them.
+    ///
+    /// Deliberately derived rather than hardcoded: the three Phase 4 variants
+    /// disagree about which modules are 4-bit and the nvfp4 one disagrees
+    /// about the format, so an assertion of the control's own numbers here
+    /// fails on a correct artifact -- which is exactly the shape of mistake
+    /// `check_rebuild.py` was rewritten to avoid. What is invariant is the
+    /// relation between the config and the shapes.
     #[test]
     fn loads_a_quantized_matrix_with_the_right_config() {
         let dir = model_dir();
@@ -250,17 +258,40 @@ mod tests {
         let ctx = Context::new().unwrap();
         let mut ws = WeightStore::open(&dir, &[]).unwrap();
 
-        // 8-bit / group 64, per the per-module override in config.json.
-        let qkv = ws.quant_matrix(&ctx, "language_model.model.layers.0.linear_attn.in_proj_qkv");
-        assert_eq!((qkv.group_size, qkv.bits), (64, 8));
-        assert_eq!(qkv.out_dims(), 8192);
-        assert_eq!(qkv.in_dims(), 2048);
-        assert_eq!(qkv.w.shape, vec![8192, 512]); // 2048 * 8 / 32 = 512 words
+        // A 2-D linear and a 3-D stacked expert weight, which between them
+        // cover both the per-module override and the top-level default.
+        for (path, experts) in [
+            ("language_model.model.layers.0.linear_attn.in_proj_qkv", 1),
+            ("language_model.model.layers.0.mlp.switch_mlp.gate_proj", 256),
+        ] {
+            let spec = ws.quant_config(path);
+            let q = ws.quant_matrix(&ctx, path);
+            assert_eq!((q.group_size, q.bits, q.mode), (spec.group_size, spec.bits, spec.mode));
+            assert_eq!(q.num_experts(), experts, "{path}");
+            assert_eq!(q.in_dims(), 2048, "{path}");
 
-        // 4-bit / group 32 comes from the top-level default.
-        let e = ws.quant_matrix(&ctx, "language_model.model.layers.0.mlp.switch_mlp.gate_proj");
-        assert_eq!((e.group_size, e.bits), (32, 4));
-        assert_eq!(e.num_experts(), 256);
-        assert_eq!(e.w.shape, vec![256, 512, 256]); // 2048 * 4 / 32 = 256 words
+            // `32 / bits` codes per uint32 word, in both modes: nvfp4 packs 8
+            // E2M1 nibbles where affine int4 packs 8 codes.
+            let words = q.in_dims() * q.bits / 32;
+            assert_eq!(*q.w.shape.last().unwrap(), words, "{path} packed width");
+            assert_eq!(
+                *q.scales.shape.last().unwrap(),
+                q.in_dims() / q.group_size,
+                "{path} scale groups"
+            );
+            // Two tensors or three, decided by the mode and nothing else.
+            match q.mode {
+                QuantMode::Affine => {
+                    let b = q.biases.as_ref().expect("affine carries a zero point");
+                    assert_eq!(b.shape, q.scales.shape, "{path}");
+                    assert_eq!(q.scales.dtype, b.dtype, "{path}");
+                }
+                QuantMode::Nvfp4 => {
+                    assert!(q.biases.is_none(), "{path} is nvfp4 and must be two tensors");
+                    assert_eq!(q.scales.dtype, Dtype::U8, "{path} nvfp4 scales are E4M3 bytes");
+                    assert_eq!((q.group_size, q.bits), (16, 4), "{path}");
+                }
+            }
+        }
     }
 }

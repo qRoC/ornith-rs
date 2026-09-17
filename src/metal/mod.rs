@@ -1415,11 +1415,18 @@ mod tests {
         assert!(!ctx.device_name().is_empty());
         assert!(ctx.arch.starts_with("applegpu_"), "arch: {}", ctx.arch);
         assert!(ctx.arch_gen >= 13, "arch_gen: {}", ctx.arch_gen);
-        // One instantiation from each family we compiled.
+        // One instantiation from each family we compiled, in both
+        // quantization modes -- the fp half is a separate .metal file and a
+        // separate set of template parameters, so it can go missing on its
+        // own.
         for k in [
             "affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0",
             "affine_gather_qmv_fast_bfloat16_t_gs_32_b_4",
             "affine_dequantize_bfloat16_t_gs_64_b_8",
+            "nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_batch_0",
+            "nvfp4_qmv_wide_bfloat16_t_gs_16_b_4_nv_4_kl_16_batch_0",
+            "nvfp4_gather_qmv_fast_bfloat16_t_gs_16_b_4",
+            "nvfp4_dequantize_bfloat16_t_gs_16_b_4_hgs_false",
         ] {
             ctx.pipeline(k);
         }
@@ -1428,6 +1435,10 @@ mod tests {
         ctx.pipeline_with("rope_bfloat16", &[(1, true), (2, false), (3, false)]);
         ctx.pipeline_with(
             "affine_qmm_t_bfloat16_t_gs_32_b_4_alN_true_batch_0",
+            &[(200, true), (201, true), (202, true)],
+        );
+        ctx.pipeline_with(
+            "nvfp4_gather_qmm_rhs_nt_bfloat16_t_gs_16_b_4_bm_16_bn_32_bk_32_wm_1_wn_2",
             &[(200, true), (201, true), (202, true)],
         );
     }
