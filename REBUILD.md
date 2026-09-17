@@ -765,6 +765,77 @@ affine int4 lands 2.5x above its floor and mxfp4 nearly 4x above its own.
 That is the power-of-two scale and the missing zero-point, not the bit rate,
 and no ordering of the experiments makes it the right thing to try.
 
+### What the experiments measured -- **DONE**
+
+Three artifacts, built from the same verified parent by the same toolchain,
+measured against `baseline/` on the same corpus and the same eight contexts.
+
+| | 8-bit | ppl | vs A | max KL | GB/token | AR tok/s | D1 tok/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **A** Flagship, the control | 260 | 6.3327 | -- | 0 | 2.737 | 63.7 | 88.3 |
+| **B** four byte-heavy families | 169 | 6.5022 | +2.7% | **0.048** | 2.074 (-24.2%) | 75.1 (+17.9%) | 112.6 |
+| **R** Balanced, the publisher's | 80 | 6.6422 | +4.9% | **0.323** | 1.855 (-32.2%) | 79.4 (+24.6%) | 117.6 |
+
+**The answer to Phase 4's question is yes, and B is where to stop.** These
+modules do tolerate 4 bits: B costs 2.7% of perplexity and 0.048 nats of KL
+for a quarter of the bytes and 18% of the decode rate. Going further does not
+scale:
+
+    A -> B    24.2 points of traffic for 0.048 nats   0.0020 nats per point
+    B -> R     8.0 points of traffic for 0.275 nats   0.0344 nats per point
+
+**Seventeen times the distribution cost per point of traffic past B.** The
+last eight points are paid for at a rate the first twenty-four were not, and
+they buy 4.3% of decode. B is the knee.
+
+**Perplexity would have hidden this, exactly as the plan warned.** It moves
++2.7% -> +4.9%, a factor of 1.8, while the KL moves 0.048 -> 0.323, a factor
+of 6.7. Averaging 6620 tokens flattens a distribution that has moved much
+further in places; the eight full 248320-wide distributions do not. Judging
+these two variants on perplexity alone would have made R look like a
+reasonable next step. It is not.
+
+### The publisher shipped this experiment already, and it sharpens the result
+
+The artifact this port runs on is one of a matrix -- the sibling recipes carry
+`adapter_id: qwen35-moe-ornith15-quant-matrix-v1` and
+`profile: control-candidate`:
+
+| repo suffix | label | 8-bit | bf16 |
+|---|---|---:|---:|
+| `attention8-bf16recurrence-vision` | "Flagship / Highest Quality" | 260 | 60 |
+| `affine4-router8-bf16recurrence-vision` | "Balanced" | 80 | 60 |
+| `affine4-router8-vision` | "Most Compact" | 80 | 0 |
+
+So variant R above *is* their Balanced, rebuilt here from their own recipe,
+and they independently landed on the plan's rule that the router gates never
+move. Two things their cards do not give, and this measurement does.
+
+**Their benchmark cannot rank the variants.** Balanced and Compact both carry
+a Shiftedx Bench table; the Flagship carries none, so the tier this port
+actually runs on has no row to compare against. And the two tables disagree in
+the wrong direction: Compact, the *more* quantized one, scores 7/10 on Quality
+against Balanced's 6/10, while losing Long context 9/15 to 11/15 and Vision
+1/4 to 2/4. At ten pass/fail items around p = 0.65 one standard deviation is
+about 1.5 items, so a 60-vs-70 gap is one item and well inside noise. The two
+runs are not even comparable -- Balanced's effective tested context is 131072
+and Compact's is 4096. The card says as much itself: "the benchmark does not
+produce a composite intelligence score".
+
+**Most Compact was never built here, and the arithmetic is why.** It buys
+0.2 percentage points of traffic over Balanced -- 1.850 against 1.855 GB a
+token -- by quantizing the recurrence inputs the other two recipes keep in
+bf16 deliberately. Near-zero prize against real risk, the same shape as the
+argument for leaving the 80 gates alone. Seconds of arithmetic, one build and
+one qualification run saved.
+
+**What this leaves for C.** nvfp4 g16 measures the same weight error as affine
+int4 g32 at half a bit less, so applied to B's four families it is a
+bytes-only follow-up: roughly three more points of traffic at B's quality, not
+R's. That is now the only remaining rung worth building, and it needs the
+`fp_quantized` port. Whether three points justifies a new kernel family is a
+separate decision from the one this phase settled.
+
 ### Formats and ideas considered, and where they stand
 
 - **mxfp4 / mxfp8 / nvfp4.** In mlx, kernels in `vendor/mlx`
