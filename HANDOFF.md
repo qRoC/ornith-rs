@@ -446,12 +446,49 @@ have been tried and measured away:
   `head.hidden` and 15 us emitting. Everything else is blocking on the GPU.
   There is no 2 ms of host work to find.
 
-So what is left is the shape of the restart itself: after a full drain, MTP
-takes 2 ms to get the GPU going again where autoregression takes 0.43, and
-none of the obvious differences account for it. The next tool is not another
-counter on this side -- it is a Metal system trace, which can see submission
-and scheduling latency that `GPUStartTime` already includes by the time we
-read it.
+- **Waiting for a core.** `ORNITH_PROF` reports the time between the GPU
+  finishing the buffer that was waited on and `waitUntilCompleted` returning,
+  by comparing `GPUEndTime` with `mach_absolute_time` on the same clock --
+  neither side's own timer can see that stretch, since the wait timer starts
+  before the GPU finishes and the GPU timer stops when it does. It is 88 us a
+  round trip on the autoregressive path and 74 on the MTP one: a tenth of the
+  gap, and the smaller of the two belongs to the slower path.
+- **Memory pressure.** This one was real, and it explained the *variance*
+  rather than the gap. See below.
+
+**The four-fold swing was memory pressure, and intervention settled it.** The
+machine was 21 GB into a 21.5 GB swap file while MTP's working set is 27.2 GB
+against the trunk's 25.5 -- the extra being the bf16 head, touched once a
+cycle while the trunk sweeps 2.83 GB past it every token, which is exactly the
+profile of a page that gets evicted and faulted back. Memory was handed back
+to the host, swap fell to 10.7 GB of 12.3, and the same interleaved series was
+run again:
+
+| | wall tok/s | GPU busy | idle |
+|---|---|---|---|
+| autoregressive, before | 90.4, 92.4, 89.4, 89.1 | 10.4-10.7 | 0.45-0.50 ms |
+| `--mtp-depth 1`, before | 78.8, **20.9**, **44.3**, 74.6 | 9.75-9.98 | 2.68-35.54 ms |
+| autoregressive, after | 90.4, 90.6, 90.8, 90.1 | 10.50-10.52 | 0.51-0.58 ms |
+| `--mtp-depth 1`, after | 75.0, 79.5, 77.6, 87.0 | 9.59-9.76 | 1.78-3.03 ms |
+
+The swing is gone and the 20 tok/s runs do not come back. Autoregression never
+showed it at all, because 25.5 GB fits where 27.2 does not. **So no MTP
+wall-clock number taken while this machine is swapping means anything** -- and
+that, not the load average, is what invalidated the original "slower at every
+depth" table.
+
+**What it did not explain is the gap**: still ~2.5 ms a token against
+autoregression's 0.5, still on the same `gather_rows_by_id`. Which also argues
+against mlx's residency sets, the lead this looked like -- the note at the top
+of `src/metal/mod.rs` calls them something a single-stream loop does not need,
+and they would have helped most exactly where the swap was worst, which is the
+part already fixed.
+
+So the stall is a wall-clock problem on the one machine whose wall clock
+cannot be trusted, and seven explanations have now been measured away. The way
+forward on MTP is what GPU busy *can* see: at depth 1 it is 9.6-9.8 ms a token
+against autoregression's 10.5, and FR-Spec below takes ~0.8 ms more off it.
+The stall is a separate item, for a machine that is not swapping.
 
 Only after that is it worth making the draft cheaper, and there the number is:
 a draft step is ~2.4 ms of GPU, about half of which is the `lm_head` below.
