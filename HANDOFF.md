@@ -369,20 +369,37 @@ keeps every intermediate `(conv window, recurrent state)` at no numerical cost
 and almost no bandwidth cost -- each step already allocates its own outputs, so
 a snapshot is a reference rather than a copy.
 
-### It does not pay off here
+### It does not pay off here, and the reason is not the one it looks like
 
-Interleaved runs, same prompt, 200 tokens, greedy:
+Same prompt, 200 tokens, greedy. The wall column was how this was first read;
+the GPU column is what it should have been read by, for the reason in "Where a
+decode step goes":
 
-| | tok/s | acceptance by depth |
-|---|---|---|
-| autoregressive | 83.8, 83.2 | -- |
-| `--mtp-depth 1` | 74.0, 76.1 | ~0.58 |
-| `--mtp-depth 2` | 69.4, 68.0 | ~0.53 / 0.36 |
-| `--mtp-depth 3` | 62.8, 55.5 | ~0.52 / 0.40 / 0.30 |
+| | wall tok/s | GPU busy ms/token | GPU busy share | acceptance by depth |
+|---|---|---|---|---|
+| autoregressive | 84.5 | 10.35 | 95% | -- |
+| `--mtp-depth 1` | 83.7 | **9.56** | 80% | ~0.53 |
+| `--mtp-depth 2` | 72.3 | 10.88 | -- | ~0.53 / 0.34 |
+| `--mtp-depth 3` | 64.8 | 12.10 | -- | ~0.53 / 0.34 / 0.35 |
 
 Acceptance is in the band the artifact records (0.78 / 0.35 / 0.13), so the
-head and the loop are doing their job -- but every depth is *slower* than
-plain autoregression. Two structural reasons:
+head and the loop are doing their job. And **depth 1 is already 8% less GPU
+work per generated token than autoregression** -- 1466 dispatches against
+1669, 863 barriers against 1064 -- while being no faster on the wall, because
+it leaves the GPU idle 2.58 ms a token where autoregression leaves it 0.50.
+
+**It stalls, it does not compute too much.** The counter that says so is host
+round trips: 1.66 a token against autoregression's 1.00, which over 1.53
+tokens a cycle is ~2.5 -- one to read the drafted ids, one to read the
+verified ones. Each drains the queue and leaves the GPU with nothing behind
+it. The speculative win exists at depth 1 and is spent on the way to the host.
+
+So the first thing to do with this path is not to draft more cheaply but to
+stop draining between the phases. Only then is it worth making the draft
+cheaper, and there the number is: a draft step is ~2.4 ms of GPU, about half
+of which is the `lm_head` below.
+
+The two structural costs, which are why deeper is worse:
 
 1. **Every draft step runs the full `lm_head`.** It is 8-bit over a 248320
    vocabulary, so ~540 MB read per draft -- ~1.6 GB for a depth-3 chain,
@@ -390,16 +407,21 @@ plain autoregression. Two structural reasons:
    rejected. This is exactly what MTPLX's FR-Spec (`frspec_ids`, a pruned
    draft head over a ranked sub-vocabulary) exists to avoid, and it is not
    ported.
-2. **The verify forward multiplies MoE traffic.** Its `depth + 1` tokens each
-   pick their own top-8 of 256 experts, so a 4-token window can read up to
-   four times the expert weights a single token would. `SwitchGLU` keeps
-   32 (token, expert) pairs on the *unsorted* gather path too, because mlx-lm
-   sorts only at `indices.size >= 64`, so nothing amortises the reads.
+2. **The verify forward multiplies MoE traffic**, and nothing can amortise it.
+   Its `depth + 1` tokens each pick their own top-8 of 256 experts, so a
+   4-token window reads ~30.5 distinct experts for its 32 (token, expert)
+   pairs -- 1.05 rows per expert, which is nothing to group. Sorting is the
+   mechanism that would group them and it does not apply: `GatherQMM` takes
+   the batched rhs-sorted path only at `rows / experts >= 4`, which at 256
+   experts means 1024 rows, i.e. 128 tokens. `switch_glu_sorted` has a
+   `force_sort` hook and using it here would buy a counting sort and two
+   gathers and still land in `gather_qmv`. This was once written down as
+   "forbidden because it would stop matching mlx-lm"; it is simply not
+   available.
 
 A dense model would win here; a 3B-active MoE with an unpruned draft head does
-not. Both fixes are real optimizations rather than porting work, which is why
-neither is in: FR-Spec needs a ranked vocabulary the artifact does not ship,
-and forcing the sorted gather at 32 rows would stop matching mlx-lm.
+not, past depth 1. FR-Spec is the one fix that is real, and it needs a ranked
+vocabulary the artifact does not ship.
 
 ### How exact it is
 
@@ -796,12 +818,16 @@ cause behind it was real.
 
 So the suspicion was right in kind and small in size. These counts do not
 depend on what else the machine is doing, and they reproduced exactly across
-runs. `ORNITH_NO_RECYCLE=1` makes the pool decline to hand back a buffer the
-current epoch has touched; it removes exactly those 30 and nothing else
-(1216 -> 1186, spurious -> 0), and `tests/model` passes bit-exact under it. It
-is worth under a percent of wall, which on a machine at load 13 is not
-distinguishable from noise. Not on by default: it is a deviation from mlx, and
-30 barriers do not pay for one.
+runs.
+
+**The pool now declines to hand back a buffer the current epoch has touched**,
+which removes exactly those 30 and nothing else. Measured by GPU busy against
+its own control, four runs each: 10.43 -> 10.35 ms a token, **-0.8%**, which
+is what the calibrated model predicted to the second decimal (-1.9% priced,
+divided by 2.4). It costs no memory at all -- the buffer is reused in the next
+epoch instead, and the pool's peak is 76.8 MB either way -- and `tests/model`
+is bit-exact under it. `ORNITH_RECYCLE=1` puts mlx's behaviour back as the
+control.
 
 **The number that matters is not the barrier but the epoch.** A Metal barrier
 is encoder-wide -- it orders everything before it against everything after --
@@ -1090,9 +1116,10 @@ memory, with no quantised matmul, and mlx does not use it on the GPU path.
   a read-only kernel at several sizes, then `quantized_matmul` at M = 1 on real
   weights. Run it before believing any "% of peak" claim.
 - `ORNITH_PROF=1` also attributes each barrier to the pair of dispatches that
-  forced it and prints the epoch histogram; `ORNITH_NO_RECYCLE=1` stops the
-  pool handing back a buffer the current barrier epoch has touched, which is
-  the 30 invented barriers a token; `ORNITH_TRACE=<path>` writes one step's
+  forced it, counts host round trips, and prints the epoch histogram and the
+  pool's peak; `ORNITH_RECYCLE=1` lets the pool hand back a buffer the current
+  barrier epoch has touched, as mlx does, which is worth 30 invented barriers
+  a token and 0.8% of GPU busy; `ORNITH_TRACE=<path>` writes one step's
   dispatches with every binding, which `tools/epoch_schedule.py <path>`
   levelises into the fewest epochs the dependencies permit. The barrier and
   epoch counts do not care what else the machine is running -- they are the

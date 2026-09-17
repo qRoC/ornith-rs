@@ -138,8 +138,8 @@ impl Pool {
     /// `take`, but skipping any buffer the current barrier epoch has already
     /// touched. Handing one of those out puts an unrelated array on an address
     /// a live dispatch is using, which the tracking can only read as a
-    /// dependency. Only used under `ORNITH_NO_RECYCLE=1`, which is the
-    /// experiment that says how many barriers that costs.
+    /// dependency. This is the default; `ORNITH_RECYCLE=1` takes the other
+    /// branch, which is what mlx does.
     fn take_untouched(&mut self, len: usize, touched: &dyn Fn(BufId) -> bool) -> Option<MTLBuf> {
         let v = self.free.get_mut(&len)?;
         let i = v.iter().rposition(|b| !touched(buf_id(b)))?;
@@ -205,6 +205,9 @@ pub struct Prof {
     trace: Option<Vec<String>>,
     pub commits: usize,
     pub dispatches: usize,
+    /// Round trips to the host: every one drains the queue and leaves the GPU
+    /// with nothing to do until the CPU queues the next thing.
+    pub syncs: usize,
     /// Summed `GPUEndTime - GPUStartTime` over committed command buffers.
     pub gpu_s: f64,
     /// Time blocked in `waitUntilCompleted`.
@@ -414,10 +417,13 @@ pub struct Context {
     /// Hands out [`Buffer::serial`].
     next_serial: Cell<u64>,
     /// Whether the pool may hand back a buffer this barrier epoch has already
-    /// touched. True in the port as it stands, which is what mlx does;
-    /// `ORNITH_NO_RECYCLE=1` turns it off to measure what the recycling costs
-    /// in barriers. Memory is not short here -- 27 GB of artifact in 64 -- so
-    /// declining is cheap.
+    /// touched. mlx allows it; this port does not, because handing one out
+    /// puts an unrelated array on an address a live dispatch is using and the
+    /// tracking can only read that as a dependency -- 30 barriers a token
+    /// that no data needs. Declining costs nothing: the buffer is reused in
+    /// the next epoch instead, so the pool's peak is the same 76.8 MB either
+    /// way, and it measured -0.8% of GPU busy. `ORNITH_RECYCLE=1` puts mlx's
+    /// behaviour back as the control.
     recycle_in_epoch: bool,
     /// Buffers some dispatch has written, or the host filled at allocation.
     ///
@@ -487,7 +493,7 @@ impl Context {
             last_kernel: RefCell::new(String::new()),
             cur_kernel: RefCell::new(Rc::from("")),
             next_serial: Cell::new(1),
-            recycle_in_epoch: std::env::var_os("ORNITH_NO_RECYCLE").is_none(),
+            recycle_in_epoch: std::env::var_os("ORNITH_RECYCLE").is_some(),
         })
     }
 
@@ -754,6 +760,12 @@ impl Context {
             }
             None => self.last_committed.borrow_mut().take(),
         };
+        {
+            let mut p = self.prof.borrow_mut();
+            if p.on {
+                p.syncs += 1;
+            }
+        }
         if let Some(cb) = waiting_on {
             let t0 = self.prof.borrow().on.then(std::time::Instant::now);
             cb.waitUntilCompleted();
@@ -940,6 +952,11 @@ impl Context {
         (p.commits, p.dispatches, p.gpu_s, p.wait_s)
     }
 
+    /// Host round trips since the last reset.
+    pub fn prof_syncs(&self) -> usize {
+        self.prof.borrow().syncs
+    }
+
     /// Barriers inserted since the last reset.
     pub fn prof_barriers(&self) -> usize {
         self.prof.borrow().barriers
@@ -1037,6 +1054,7 @@ impl Context {
             return;
         }
         p.commits = 0;
+        p.syncs = 0;
         p.barriers = 0;
         p.barriers_spurious = 0;
         p.barrier_causes.clear();

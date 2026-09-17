@@ -208,7 +208,7 @@ fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
     let ms = |s: f64| s * 1e3 / n;
     eprintln!(
         "[prof: {:.2} ms/token wall, {:.2} gpu ({:.0}%), {:.2} blocked in wait; \
-         {:.0} dispatches, {:.0} barriers, {:.1} commits per token]",
+         {:.0} dispatches, {:.0} barriers, {:.1} commits, {:.2} syncs per token]",
         ms(gen_time),
         ms(gpu_s),
         100.0 * gpu_s / gen_time.max(1e-9),
@@ -216,6 +216,13 @@ fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
         dispatches as f64 / n,
         ctx.prof_barriers() as f64 / n,
         commits as f64 / n,
+        ctx.prof_syncs() as f64 / n,
+    );
+    let (live, peak) = ctx.pool_stats();
+    eprintln!(
+        "[prof: pooled intermediates {:.1} MB live, {:.1} MB peak]",
+        live as f64 / 1e6,
+        peak as f64 / 1e6,
     );
     report_barriers(ctx, n);
     let (by, mixed) = ctx.prof_kernel_times();
@@ -256,8 +263,8 @@ fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
 /// address because the pool handed the freed one straight back out. Neither of
 /// the last two moves any data, and both cost a barrier all the same, because
 /// the tracking keys on the buffer -- which is what mlx does too.
-/// `ORNITH_NO_RECYCLE=1` stops the pool recycling inside an epoch, which is
-/// what the `recycled` line costs to remove.
+/// The pool does not recycle inside an epoch, so `recycled` should be zero;
+/// `ORNITH_RECYCLE=1` puts mlx's behaviour back and it becomes 30 a token.
 fn report_barriers(ctx: &Context, n: f64) {
     let causes = ctx.prof_barrier_causes();
     if causes.is_empty() {
