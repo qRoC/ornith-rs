@@ -1082,6 +1082,104 @@ is what nvfp4 just lost on, so they were run on real weights too:
   is the fit or the scheme is unresolved, and it is a prerequisite rather
   than a detail.
 
+### The other 4.50-bit format, and what it exposed about the measurement
+
+`weight_error.py --schemes` said the best thing left at 4.50 bits was not an
+mlx mode at all: **affine int4 g32 with the scale and bias stored as E4M3**
+measures 8.3-9.0% weight error on real weights against nvfp4's 9.4-9.5% at
+the same rate, and the body's 7.8-8.3% at 5.00 bits. It needs no new grid and
+no new packing -- only a different encoding of the two numbers a group
+carries.
+
+It was measured without writing a kernel. An E4M3 value times a power of two
+keeps four significant bits and bfloat16 holds eight, so a scale and bias cut
+to the candidate format **can be written out in the ordinary affine layout
+with no loss at all**. `tools/forge_fp8scale_twin.py` builds that stand-in
+from the bf16 parent: a plain `affine int4 g32` artifact that reconstructs,
+bit for bit, what the 4.50-bit format would, and that unmodified mlx-lm and
+the unmodified port both run. `tools/aq.py` is mlx's `affine_quantize` in
+numpy and reproduces `mx.quantize` bit for bit with the encoding left alone,
+which is what says the substitution is the only thing being measured.
+
+| against `int4-head-linattn` | |
+|---|---|
+| bytes a decode step | 2.076 -> 1.925 GB, -7.3% (arithmetic; the twin is 5.00 bits on disk) |
+| weight error | 8.11-8.71% -> 8.34-8.96%, **+3% relative** |
+| perplexity | 6.5022 -> **6.5035**, +0.02% |
+| max KL against the control | 0.048 -> **0.443 nats**, a factor of **9.2** |
+
+**It fails, and it fails exactly as hard as nvfp4** -- 0.443 against 0.429 --
+while sitting four percentage points closer to `int4-head-linattn` in weight
+error. Both 4.50-bit routes are also dominated by `int4-except-gates`, which
+reads fewer bytes (1.858 GB) at a lower KL (0.323).
+
+**So weight error does not predict the thing that decides.** This is worth
+stating flatly, because `tools/weight_error.py` was built earlier the same
+day and this format was chosen over nvfp4 *on its numbers*:
+
+| | weight error vs `int4-head-linattn` | max KL |
+|---|---:|---:|
+| `int4-head-linattn` | -- | 0.048 |
+| the fp8-scale twin | +3% relative | 0.443 |
+| `nvfp4-head-linattn` | +34% relative | 0.429 |
+
+A tenfold difference in how far the weights moved, no difference in where the
+distribution ended up. `weight_error.py` remains good at *explaining* a
+result -- it found nvfp4's subnormal group scales, and that diagnosis held --
+and it is not a selection criterion. Nothing cheap has yet been found that
+is.
+
+#### Seven of the eight contexts cannot tell these variants apart
+
+The headline is a **max** over eight contexts, and unpacking it changes what
+the number is:
+
+| context | `int4-head-linattn` | `int4-except-gates` | fp8-scale twin | `nvfp4` |
+|---|---:|---:|---:|---:|
+| 0 `The capital of France is` | 0.0145 | 0.0116 | 0.0226 | 0.1156 |
+| 1 `def quicksort(arr):` ... | 0.0002 | 0.0007 | 0.0011 | 0.0023 |
+| 2 `In a memory-bound decode step` ... | 0.0291 | 0.0481 | 0.0522 | 0.0878 |
+| 3 `1, 1, 2, 3, 5, 8, 13,` | 0.0076 | 0.0040 | 0.0384 | 0.0437 |
+| 4 `The Rust borrow checker prevents` | 0.0481 | 0.0909 | 0.1052 | 0.1154 |
+| 5 `SELECT name FROM users WHERE` | 0.0277 | 0.0278 | 0.0286 | 0.0632 |
+| **6 `Дважды два равно`** | **0.0472** | **0.3232** | **0.4433** | **0.4294** |
+| 7 `def fib(n):` ... | 0.0001 | 0.0001 | 0.0003 | 0.0002 |
+| **max** | 0.0481 | 0.3232 | 0.4433 | 0.4294 |
+| mean | 0.0218 | 0.0633 | 0.0865 | 0.1072 |
+| median | 0.0211 | 0.0197 | 0.0335 | 0.0755 |
+
+**Every verdict this phase has reached rests on context 6, the one Russian
+prompt.** On the other seven the four variants are within 0.1 nats of each
+other and of the control, and on two of them within 0.001. Change the
+statistic and the ranking changes with it: by median, `int4-except-gates`
+*ties* `int4-head-linattn`.
+
+Two readings, and the second is the right one.
+
+- It could be that a max over eight samples is a noisy statistic and the
+  phase has been reading noise. That is the worry, and it deserves the
+  weight.
+- But the same context separates the variants in **four independently built
+  artifacts**, by a factor of ten, in the same order every time -- and the
+  one variant that holds on it is the one every other measure also prefers.
+  That is not noise; it is the only probe in the set with any discriminating
+  power, and the other seven are too easy to be doing anything.
+
+So the conclusion survives -- `int4-head-linattn` is where to stop, and it is
+the only variant that holds where it is hard -- while the confidence in it
+does not. **Four format experiments have now been decided by one four-word
+Russian prompt**, which is a thin foundation whichever way the answer comes
+out. The corpus behind the perplexity is 6620 tokens and cannot see any of
+this at all: it puts the twin at 6.5035 against 6.5022, a difference of two
+parts in ten thousand, for a variant that moved a distribution nine times
+further.
+
+**That is the next thing to fix, and it comes before the next format.**
+Whatever is tried next will be judged on this set, and right now the set has
+about one bit of discriminating power. It wants more contexts that are hard
+in the way context 6 is hard -- other scripts, rare tokens, long-range
+dependencies -- and enough of them that a maximum is not a single sample.
+
 ### The float pair, asked and priced
 
 "nvfp4 with nvfp8 instead of int4 with int8" is the obvious next thought and

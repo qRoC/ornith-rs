@@ -10,12 +10,35 @@ Phase 4 has the arithmetic and the measured results.
 | **`int4-head-linattn.json`** | `lm_head`, `linear_attn.in_proj_qkv`, `.in_proj_z`, `.out_proj`, at affine g32 | 169 | 60 | 2.076 (-24.2%) | 9.17 ms | 6.5022 | **0.048** |
 | `nvfp4-head-linattn.json` | the same four families, at **nvfp4 g16** | 169 | 60 | 1.925 (-29.7%) | 8.55 ms | 6.6010 | **0.429** |
 | `int4-except-gates.json` | everything but the 80 router and shared-expert gates | 80 | 60 | 1.858 (-32.2%) | 8.29 ms | 6.6422 | **0.323** |
+| *(no recipe)* `fp8scale-twin` | the four families at **affine int4 g32 with E4M3 scale+bias** | 169 | 60 | 1.925 (-29.7%) | -- | 6.5035 | **0.443** |
+
+The last row has no recipe because it is not an mlx mode and `mtplx forge`
+cannot build it. `tools/forge_fp8scale_twin.py` builds a stand-in instead --
+an E4M3 value times a power of two is exactly representable in bfloat16, so
+the candidate format can be written out in the ordinary affine layout and
+run unmodified. Its GB/token is the arithmetic of the format it stands for
+(4.50 bits), not of the file on disk (5.00).
 
 **`int4-head-linattn` is still the one to keep.** Past it the distribution
 cost per point of traffic is seventeen times higher -- 0.0020 nats a point up
 to it, 0.0344 a point beyond -- for 4.3% more decode.
 
-**And `nvfp4-head-linattn` is the one not to keep**, which is the new result.
+**Both 4.50-bit routes lose, and lose the same way.** `nvfp4-head-linattn`
+and the fp8-scale twin land at 0.429 and 0.443 nats -- nine times
+`int4-head-linattn` -- and both are dominated by `int4-except-gates`, which
+reads fewer bytes at a lower KL. They get there from very different weight
+errors (+34% and +3% relative), which is the other result: **how far the
+weights moved does not predict where the distribution ended up**, so
+`tools/weight_error.py` explains a format and cannot rank one.
+
+**And the whole ranking rests on one context of eight** -- `Дважды два
+равно`, the only Russian prompt. On the other seven all four variants sit
+within 0.1 nats of the control. `REBUILD.md`, "Seven of the eight contexts
+cannot tell these variants apart", has the table; the short version is that
+the verdict holds and the confidence in it does not, and a wider probe set
+comes before the next format.
+
+**`nvfp4-head-linattn` is the one not to keep**, which was the first result.
 It delivered its bytes exactly as predicted (-7.3% against
 `int4-head-linattn`, -6.7% of GPU busy) and its quality did not: 0.048 ->
 0.429 nats, a factor of 8.9. That leaves it **strictly dominated by

@@ -29,13 +29,22 @@ marked unmeasured.
 > | Lloyd-Max g32, bf16 scale | 4.50 | 8.21% | 8.2-9.0% |
 > | nvfp4 g16 (built) | 4.50 | 9.51% | 10.4-13.1%, or 9.5% with one |
 >
-> **So the first idea holds and the second does not.** `g16, fp8 scale+bias`
-> is really 10% better than the body at equal bits -- but only once a single
-> fp32 a tensor moves the scales out of the subnormals, which is what nvfp4's
-> `global_scale` input is for and what nothing in the table below models. The
-> Lloyd-Max row does not reproduce at all and swings by 2.5x across tensors.
-> Treat the rest of this table the same way: a hypothesis about a format,
-> measured in a regime the model is not in.
+> **So the first idea holds on weight error and the second does not.**
+> `g16, fp8 scale+bias` is really 10% better than the body at equal bits --
+> but only once a single fp32 a tensor moves the scales out of the
+> subnormals, which is what nvfp4's `global_scale` input is for and what
+> nothing in the table below models. The Lloyd-Max row does not reproduce at
+> all and swings by 2.5x across tensors.
+>
+> **And then weight error turned out not to be the thing that decides.** The
+> fp8-scale family was built and run end to end (`REBUILD.md`, "The other
+> 4.50-bit format"): at 4.50 bits it is +3% weight error against the body and
+> **nine times the KL**, which is the same damage nvfp4 does at +34%. Two
+> formats four percentage points apart on this table, indistinguishable where
+> it counts. So the whole table -- this one and the real-weights one above --
+> ranks formats by a quantity that has no demonstrated relationship to the
+> distribution the model ends up with. It explains a result once you have
+> one. It does not choose.
 
 Relative RMS weight error against the rate-distortion floor for a Gaussian
 source, which is the best any code can do at that rate:
@@ -69,8 +78,11 @@ Three readings:
   lose badly at the codebook sizes that fit in a threadgroup. The gains the
   literature reports at 2-3 bits come from codebooks far larger than this, plus
   residual stages.
-- **The cheap wins are in the group metadata, not the grid** -- and this one
-  measured true, with a condition the synthetic table could not express.
+- **The cheap wins looked like the group metadata, not the grid** -- and on
+  weight error this measured true, with a condition the synthetic table could
+  not express. On the distribution it did not: built and run, the 4.50-bit
+  form of this idea costs nine times the KL for its half bit. See the caveat
+  above and `REBUILD.md`.
   Moving from a bf16 scale+bias at g32 to an **fp8 scale+bias at g16** buys
   10% less error on a gaussian and 15-17% on the heavy-tailed columns, at the
   *same* 5.00 bits, because the overhead fp8 frees pays for a group half the
