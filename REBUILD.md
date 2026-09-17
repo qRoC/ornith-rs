@@ -178,7 +178,32 @@ Only then delete.
 
 1. Resolve the revision question above. `huggingface-cli` or the HF API on
    both shas; if only one exists, that settles it.
-2. Pull `ornith-ai/Ornith-1.5-35B-A3B` at the resolved revision. ~70 GB.
+2. Pull it with **MTPLX's own pull, not `huggingface-cli`**:
+
+       mtplx pull ornith-ai/Ornith-1.5-35B-A3B \
+         --revision 10fbf86fed7ecee4a061f8b499a618f46001cac1 \
+         --download-backend auto
+
+   ~70 GB. Three reasons it has to be this and not the HF CLI:
+
+   - **Destination.** `pull_model` writes to
+     `<model root>/ornith-ai--Ornith-1.5-35B-A3B` (`hf_loader.py:1617`,
+     `safe_model_name` turning `/` into `--`, the same shape as the artifact
+     directory we have). `huggingface-cli download` without `--local-dir` goes
+     to `~/.cache/huggingface/hub`, where forge will not find it and will pull
+     its own copy -- 140 GB against 84 free.
+   - **The provenance marker.** Every successful pull writes
+     `.mtplx-source.json` with a per-file sha256. That marker is what makes
+     Phase 2's byte-identical check possible at all, and forge uses it
+     (`_source_marker_matches`) to recognise an already-downloaded source
+     instead of re-fetching. The HF CLI leaves none.
+   - **The revision.** `main` is `10fbf86f` today; pinning costs nothing and
+     protects against the repo moving mid-run.
+
+   No `--include`: everything but two PNG assets is needed, the 70 GB is the
+   weights themselves, and a filter that misses a config fails late.
+   `--download-backend auto` picks up `aria2c` when it is installed, which is
+   worth having at this size; the default is the built-in Python downloader.
 3. Re-run the inventory check locally after the pull -- the remote one above
    says it should pass, so a failure here means the download is incomplete
    rather than the revision being wrong.
@@ -255,6 +280,11 @@ steps.
 | delete the current artifact (27 GB) | 111 GB |
 | pull the parent (~70 GB) | ~41 GB |
 | build one artifact (~27 GB) | ~14 GB |
+
+The order is forced by that table: Phase 0's captures, then the delete, then
+the pull. Pulling first leaves 14 GB and no room for forge's output, and
+deleting before Phase 0 throws away the only baseline the experiment can be
+judged against.
 
 That leaves room for the parent plus **one** artifact at a time, and forge
 needs scratch on top. So variants cannot be compared side by side on this
