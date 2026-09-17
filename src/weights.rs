@@ -177,7 +177,7 @@ mod tests {
 
     fn model_dir() -> PathBuf {
         PathBuf::from(std::env::var("ORNITH_MODEL").unwrap_or_else(|_| {
-            "/Users/qroc/.mtplx/models/Shiftedx--ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx".into()
+            "/Users/qroc/.mtplx/models/ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx".into()
         }))
     }
 

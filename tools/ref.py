@@ -26,7 +26,7 @@ import mlx.core as mx
 MODEL = os.environ.get(
     "ORNITH_MODEL",
     "/Users/qroc/.mtplx/models/"
-    "Shiftedx--ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx",
+    "ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx",
 )
 REFS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "refs")
 
