@@ -57,6 +57,75 @@ different Mac fails loudly instead of silently diverging:
 - `GEMM_TPARAM_MACRO` classes this as a "medium device", so the steel gemm tile
   is always 64x64x16 / wm=wn=2. Only that tile is instantiated.
 
+### Metal 4.1, fp8/fp4, and what changes on an M5
+
+Metal 4.1 does expose fp8 (E4M3), fp4 and block-scaled MXFP4 -- in the tensor
+path, the MPP `matmul2d` operation over `cooperative_tensor` fragments. Two
+gates keep it off this machine, and both are worth knowing before the move:
+
+- **The toolchain.** `xcrun metal -std=metal4.1` answers `invalid value
+  'metal4.1'` under the Xcode 26.5 SDK; `build.rs` compiles at
+  `-std=metal4.0`, and the 4.1 low-precision formats are absent under the 4.0
+  toolchain.
+- **The OS.** Metal 4.1 needs Xcode 27 *and* macOS 27.0, not the "Xcode 26.1+"
+  the specification claims, and a 4.1 binary refuses to load below that. This
+  machine runs macOS 26.6.2.
+
+And on an M4 the formats are **emulated rather than accelerated**: fp8
+`matmul2d` sustains 0.94x the throughput of fp16 while reading half the
+operand bytes, `matmul2d` executes on the GPU shader cores through the legacy
+`simdgroup_matrix` path with no dedicated matrix datapath and no sign of ANE
+routing, and it accumulates in at least fp32. Those are measurements on this
+exact part -- M4 Max, 40 GPU cores, 64 GB -- from *Rigel: Reverse-Engineering
+the Metal 4.1 Tensor Compute Path on the Apple M4 Max GPU* (arXiv 2606.12765),
+run on macOS 27.0.
+
+**The inversion to remember.** "A memory-footprint feature, not a performance
+feature" is a verdict from compute-bound GEMM. A decode step here is the
+opposite: 96% GPU busy, waiting on 2.83 GB of weight reads at ~250 GB/s of a
+possible 546. Halving operand bytes for 6% of the arithmetic is, at batch 1,
+close to a win proportional to the bytes saved. Footprint *is* performance
+here, which is exactly why the paper's dismissal does not transfer.
+
+The same paper's optimization study is the other way round and confirms
+something this port measured independently: a hand-fused GEMM+bias+GELU beats
+the decomposed path by 6.5-12.9% in the cache-resident regime, the win decays
+as the O(n^3) compute dominates, and it "does not extend to operations that
+forgo the matrix units". Decode forgoes them entirely -- see the reverted
+router fusion below, which bought half a percent.
+
+**None of that is needed for the byte win, though.** mlx already carries
+`fp_quantized.metal` for `Mxfp4` / `Mxfp8` / `Nvfp4` (uint8 E8M0 scales, no
+biases, group size fixed at 32, or 16 for nvfp4) as a software path whose own
+source note reads "fp benefits on every gen"; `fp_quantized_nax.metal` is the
+Metal 4 tensor variant. Per weight: affine int4 g32 costs 5.00 bits, MXFP4
+4.25, nvfp4 g16 4.50, affine int8 g64 8.50, MXFP8 8.25. Against this model's
+mix that is ~5% fewer bytes a token -- worth little on its own, and worth a
+lot only if MXFP4 holds quality at 4 bits where affine int4 did not, since
+that is what would let the 8-bit half of the artifact drop to 4 and take ~35%
+of the traffic with it. This port carries only the `affine_*` family, so going
+there means porting `fp_*` whole.
+
+**The checklist for the M5, in order.**
+
+1. `nax_available()` flips true (gen >= 17, or >= 18 on a 'p' part) and three
+   asserts fire first, by design: the gemm and the gather gemm in
+   `src/ops/quantized.rs`, and `dispatch_choices_for_this_model`. That is the
+   signal that mlx would now pick kernels this port does not carry -- porting
+   the `*_nax` family becomes a decision rather than an accident.
+2. The steel gemm tile. `GEMM_TPARAM_MACRO` keys off the last letter of the
+   architecture name; if an M5 classes differently from "medium", a new tile
+   has to be instantiated in `kernels/steel_gemm_inst.metal`.
+3. `qmv_batch_limit` already carries the gen-17 branch (33/25/13 where gen 16
+   gives 13/15/13). `tests/quantized.rs::dispatch_choices_for_this_model`
+   skips itself off gen 16 and says so -- re-pin those numbers there.
+4. The two-pass SDPA routing and `sdpa_blocks` both key off the architecture's
+   last letter, so a different device class changes when attention splits.
+5. Re-measure everything in "Where a decode step goes". The Rigel numbers are
+   M4 numbers; the M4 predates the Neural Accelerators that arrived with the
+   A19 and M5, so the emulation verdict in particular has to be re-measured on
+   the new part rather than carried over.
+
 ---
 
 ## Layout
