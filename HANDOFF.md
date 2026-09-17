@@ -165,6 +165,8 @@ tools/dump_*.py            golden-reference writers (run against MLX)
 tools/epoch_schedule.py    how few barrier epochs a step's dependencies allow
 M5.md                      what changes on a GPU where nax_available() is true
 REBUILD.md                 rebuilding the artifact from its bf16 parent
+IDEAS.md                   what designing the artifact buys, with the arithmetic
+tools/quant_error.py       every quantization number in those two, reproducible
 tools/gen_unicode.py       the Unicode tables the tokenizer needs
 refs/<case>/               the references themselves (not in git)
 tests/                     one test file per reference case
@@ -1282,9 +1284,12 @@ In order:
      kernel in the step, and taking it means reordering across block and layer
      boundaries, which needs a deferred op layer rather than another dozen
      lines. Worth doing only if something else wants that layer anyway.
-   - **Then bytes, which is the only lever left at batch 1.** That is the
-     `fp_quantized` family in "Metal 4.1, fp8/fp4" above, and it is worth it
-     only if MXFP4 holds quality where affine int4 did not.
+   - **Then bytes, which is the only lever left at batch 1.** `REBUILD.md`
+     is the plan and `IDEAS.md` is what the freedom to design the artifact
+     buys -- measured, not asserted: the grid has about one bit a weight left
+     in it and vector quantization does not collect it, the cheap win is in
+     the group metadata, and the one structural idea is a two-stage `lm_head`
+     worth 14% of a step and exact for greedy decoding.
 3. **Rebuild the artifact from its parent**, which is what unblocks the byte
    lever above. `REBUILD.md` is the plan: the artifact records the recipe that
    forged it, the parent is `ornith-ai/Ornith-1.5-35B-A3B@10fbf86f` and its

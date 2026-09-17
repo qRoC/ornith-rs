@@ -11,16 +11,24 @@ marked unmeasured.
 Relative RMS weight error against the rate-distortion floor for a Gaussian
 source, which is the best any code can do at that rate:
 
-| scheme | bits/w | error | floor at that rate |
-|---|---|---|---|
-| affine int4 g32, bf16 scale+bias (today) | 5.00 | 7.82% | 3.12% |
-| affine int4 g16, fp8 scale+bias | 5.00 | **7.02%** | 3.12% |
-| affine int4 g32, fp8 scale+bias | 4.50 | 8.14% | 4.42% |
-| Lloyd-Max codebook g16, fp8 scale | 4.50 | 7.50% | 4.42% |
-| VQ dim 2, 256 codes, g32 | 4.50 | 8.54% | 4.42% |
-| VQ dim 4, 4096 codes, g32 | 3.50 | 14.97% | 8.84% |
-| nvfp4 g16 | 4.50 | 9.28% | 4.42% |
-| mxfp4 g32 | 4.25 | 20.32% | 5.26% |
+All from `tools/quant_error.py`; 4-bit elements throughout except the first
+row. Three weight distributions, because real weights are heavier-tailed than
+a gaussian and the ranking moves with it.
+
+| scheme | bits/w | gaussian | laplace | t(4) | floor |
+|---|---|---|---|---|---|
+| affine int8 g64 -- the 260 today | 8.50 | 0.54% | 0.67% | 0.70% | 0.28% |
+| affine g32, bf16 scale+bias -- **the body today** | 5.00 | 7.82% | 9.18% | 9.37% | 3.12% |
+| **affine g16, fp8 scale+bias** | **5.00** | **7.02%** | **7.77%** | **7.78%** | 3.12% |
+| **Lloyd-Max codebook g16, fp8 scale** | **4.50** | **7.50%** | **8.09%** | **8.12%** | 4.42% |
+| Lloyd-Max codebook g32, bf16 scale | 4.50 | 8.21% | 9.22% | 9.27% | 4.42% |
+| affine g32, fp8 scale+bias | 4.50 | 8.14% | 9.51% | 9.72% | 4.42% |
+| affine g16, fp8 scale, no zero-point | 4.50 | 8.35% | 9.97% | 10.43% | 4.42% |
+| affine g64, bf16 scale+bias | 4.50 | 8.97% | 11.13% | 11.74% | 4.42% |
+| nvfp4 g16 | 4.50 | 9.51% | 9.28% | 9.18% | 4.42% |
+| mxfp4 g32 | 4.25 | 20.32% | 21.19% | 22.00% | 5.26% |
+| VQ dim 2, 256 codes, g32 | 4.50 | 8.54% | -- | -- | 4.42% |
+| VQ dim 4, 4096 codes, g32 | 3.50 | 14.97% | -- | -- | 8.84% |
 
 Three readings:
 
@@ -32,10 +40,17 @@ Three readings:
   lose badly at the codebook sizes that fit in a threadgroup. The gains the
   literature reports at 2-3 bits come from codebooks far larger than this, plus
   residual stages.
-- **The cheap wins are in the group metadata, not the grid.** Going from a
-  bf16 scale+bias at g32 to an fp8 scale+bias at g16 buys 10% less error *at
-  the same 5.00 bits*, because the overhead freed by fp8 pays for a finer
-  group. That is free: same kernel shape, same 4-bit elements.
+- **The cheap wins are in the group metadata, not the grid**, and they are
+  bigger than they look on a gaussian. Moving from a bf16 scale+bias at g32 to
+  an **fp8 scale+bias at g16** buys 10% less error on a gaussian and **15-17%
+  on the heavy-tailed distributions real weights resemble** -- at the *same*
+  5.00 bits, because the overhead fp8 frees pays for a group half the size.
+  Same kernel shape, same 4-bit elements, same packing.
+- **And a fitted codebook at g16 beats today's scheme while spending less.**
+  Lloyd-Max at group 16 with an fp8 scale is 7.50 / 8.09 / 8.12% against
+  today's 7.82 / 9.18 / 9.37% -- better on all three distributions at **0.50
+  fewer bits a weight**. That is a 10% byte saving with a quality improvement
+  attached, for a per-tensor 16-entry table and a kernel that indexes it.
 
 ## What voxel engines solved, and which of it transfers
 
@@ -130,12 +145,16 @@ Why it suits this project better than anything else here:
 ## If it were ranked
 
 1. **Activation-aware scaling** -- no kernels, keeps the oracle, attacks the
-   binding question.
-2. **fp8 scale at group 16** instead of bf16 at 32 -- 10% less error at
-   identical bits, same kernel shape.
+   binding question from the only side with room left.
+2. **fp8 scale at group 16** instead of bf16 at 32 -- 10-17% less error at
+   identical bits and an unchanged kernel shape. The closest thing here to
+   free, and it needs mlx to accept an fp8 group scale in `affine` mode, which
+   is the one thing to check before counting on it.
 3. **Two-stage `lm_head`** -- 14% of a step, exact for greedy, independent of
-   everything else.
-4. Lloyd-Max codebook -- a further ~7% less error at 4.50 bits, needs a
-   per-tensor table and a new kernel.
+   every other item on this list.
+4. **Lloyd-Max codebook at g16** -- better than today on all three
+   distributions at 0.50 fewer bits, so ~10% of bytes with quality attached.
+   Costs a per-tensor table, a new kernel, and the oracle unless mlx grows the
+   same format.
 5. Vector quantization -- 6% at equal rate for a new kernel and a new format.
-   Not worth it at these codebook sizes.
+   Not worth it at codebook sizes that fit in a threadgroup.
