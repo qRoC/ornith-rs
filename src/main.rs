@@ -30,7 +30,7 @@ use std::path::PathBuf;
 
 use ornith_rs::chat::{Content, Message, Part, Role, apply_chat_template};
 use ornith_rs::generate::{DEFAULT_PREFILL_STEP_SIZE, Greedy, Sampler, generate_step};
-use ornith_rs::metal::Context;
+use ornith_rs::metal::{Context, Kind, Why};
 use ornith_rs::model::cache::LayerCache;
 use ornith_rs::model::config::TextConfig;
 use ornith_rs::model::mtp::{MtpHead, sidecar_path};
@@ -217,6 +217,7 @@ fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
         ctx.prof_barriers() as f64 / n,
         commits as f64 / n,
     );
+    report_barriers(ctx, n);
     let (by, mixed) = ctx.prof_kernel_times();
     if mixed > 0.0 {
         // Every command buffer held a whole batch of dispatches, so its
@@ -236,7 +237,7 @@ fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
     }
     eprintln!("[prof: GPU time per kernel, per token]");
     let total: f64 = by.iter().map(|(_, _, g)| *g).sum();
-    for (k, c, g) in by.iter().take(16) {
+    for (k, c, g) in by.iter().take(64) {
         eprintln!(
             "  {:>7.3} ms  {:>5.1}%  x{:<5.0}  {}",
             g * 1e3 / n,
@@ -245,6 +246,76 @@ fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
             k
         );
     }
+}
+
+/// Which pairs of dispatches the barriers are between, and how many of them
+/// are there because two dispatches share bytes rather than merely an address.
+///
+/// `real` is a dependency the data has. `disjoint` is one allocation bound at
+/// two ranges that do not overlap; `recycled` is two allocations that share an
+/// address because the pool handed the freed one straight back out. Neither of
+/// the last two moves any data, and both cost a barrier all the same, because
+/// the tracking keys on the buffer -- which is what mlx does too.
+/// `ORNITH_NO_RECYCLE=1` stops the pool recycling inside an epoch, which is
+/// what the `recycled` line costs to remove.
+fn report_barriers(ctx: &Context, n: f64) {
+    let causes = ctx.prof_barrier_causes();
+    if causes.is_empty() {
+        return;
+    }
+    let total = ctx.prof_barriers();
+    let spurious = ctx.prof_barriers_spurious();
+    eprintln!(
+        "[prof: {:.0} barriers per token, {:.0} of them ({:.0}%) with no data \
+         behind them]",
+        total as f64 / n,
+        spurious as f64 / n,
+        100.0 * spurious as f64 / (total as f64).max(1.0),
+    );
+    let line = |(kernel, culprit, kind, why, _sp, count): &(String, String, Kind, Why, bool, usize)| {
+        eprintln!(
+            "  x{:<6.1} {:<4} {:<8} {} after {}",
+            *count as f64 / n,
+            kind.as_str(),
+            why.as_str(),
+            kernel,
+            culprit,
+        );
+    };
+    eprintln!("[prof: the pairs that barrier most]");
+    for c in causes.iter().take(15) {
+        line(c);
+    }
+    let idle: Vec<_> = causes.iter().filter(|c| c.4).collect();
+    if !idle.is_empty() {
+        eprintln!("[prof: and the ones with nothing flowing through them]");
+        for c in &idle {
+            line(c);
+        }
+    }
+    if let Ok(path) = std::env::var("ORNITH_TRACE") {
+        let trace = ctx.prof_trace();
+        if !trace.is_empty() && std::fs::write(&path, trace.join("\n") + "\n").is_ok() {
+            eprintln!("[prof: {} lines of one step's dispatches in {path}]", trace.len());
+        }
+    }
+    let sizes = ctx.prof_epoch_sizes();
+    let epochs: usize = sizes.iter().map(|(_, c)| *c).sum();
+    let disp: usize = sizes.iter().map(|(k, c)| k * c).sum();
+    let alone: usize = sizes.iter().filter(|(k, _)| *k <= 1).map(|(_, c)| *c).sum();
+    eprintln!(
+        "[prof: {:.0} epochs per token, {:.2} dispatches each, {:.0}% of them \
+         holding one dispatch or none -- an epoch is what can overlap]",
+        epochs as f64 / n,
+        disp as f64 / (epochs as f64).max(1.0),
+        100.0 * alone as f64 / (epochs as f64).max(1.0),
+    );
+    let hist: Vec<String> = sizes
+        .iter()
+        .take(10)
+        .map(|(k, c)| format!("{k}: {:.0}", *c as f64 / n))
+        .collect();
+    eprintln!("  dispatches per epoch, epochs per token -- {}", hist.join(", "));
 }
 
 /// A user error -- an unreadable image, or one the processor would have to

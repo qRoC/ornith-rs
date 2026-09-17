@@ -301,23 +301,30 @@ pub fn sparse_moe_block(
     let tokens = x.numel() / dim;
     let x2 = x.reshape(&[tokens, dim]);
 
+    // Issued interleaved, not in the order the Python reads. The shared expert
+    // runs on every token and depends on `x2` alone, so nothing in it waits on
+    // the router; the router's tail, meanwhile, is a chain of small dispatches
+    // that each hold a barrier epoch on their own. Issuing the two together
+    // puts the shared expert's reads into those epochs instead of giving them
+    // five more. Every kernel still sees the same inputs and writes the same
+    // bytes, so the result is bit-exact -- only the issue order moves. See
+    // HANDOFF, "Where the 1216 barriers come from".
     let gates = quantized_matmul(ctx, &x2, gate);
-    let gates = super::softmax::softmax(ctx, &gates, true);
-
-    let (inds, scores) = top_k(ctx, &gates, top_k_n);
-    let scores = if norm_topk_prob { normalize_scores(ctx, &scores) } else { scores };
-
-    let y = switch_glu(ctx, &x2, &inds, switch_gate, switch_up, switch_down);
-
-    let mixed = mix_experts(ctx, &y, &scores);
-
-    // The shared expert runs on every token, gated by a scalar per token.
     let sg = quantized_matmul(ctx, &x2, shared_gate);
     let su = quantized_matmul(ctx, &x2, shared_up);
-    let sact = super::elementwise::swiglu(ctx, &sg, &su);
-    let shared_y = quantized_matmul(ctx, &sact, shared_down);
     let gate_scalar = quantized_matmul(ctx, &x2, shared_expert_gate);
+
+    let gates = super::softmax::softmax(ctx, &gates, true);
+    let sact = super::elementwise::swiglu(ctx, &sg, &su);
+
+    let (inds, scores) = top_k(ctx, &gates, top_k_n);
+    let shared_y = quantized_matmul(ctx, &sact, shared_down);
+
+    let scores = if norm_topk_prob { normalize_scores(ctx, &scores) } else { scores };
     let shared_y = super::elementwise::sigmoid_gate(ctx, &gate_scalar, &shared_y);
+
+    let y = switch_glu(ctx, &x2, &inds, switch_gate, switch_up, switch_down);
+    let mixed = mix_experts(ctx, &y, &scores);
 
     let out = super::elementwise::add(ctx, &mixed, &shared_y);
     out.reshape(&x.shape)

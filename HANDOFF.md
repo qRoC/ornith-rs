@@ -8,6 +8,14 @@ stays 1:1 with the sources in `../vendor/` (mlx, mlx-lm, MTPLX), keeps every
 optimization those take, and is verified against MLX numerically rather than by
 reading the generated text.
 
+**That 1:1 state is pinned at `261fe0c`, and is no longer a requirement past
+it.** Everything up to that commit does what mlx does; from there a departure
+is an ordinary engineering decision, taken when it pays and written down here
+with what it bought. What does *not* move is the verification: `max_abs ==
+0.0` against MLX is how every one of these changes is shown to be a
+rearrangement and not a new model. A reordering that changes a number is a
+bug, not a trade-off.
+
 **The model talks, and it looks.** `cargo run --release` opens a chat; greedy
 decoding and sampled decoding both reproduce `mlx_lm.generate` token for token
 and character for character. `--mtp` adds speculative decoding off the native
@@ -147,6 +155,7 @@ src/mtp_generate.rs        the MTP draft/verify loop
 src/main.rs                the console chat
 src/refs.rs                golden-reference reader
 tools/dump_*.py            golden-reference writers (run against MLX)
+tools/epoch_schedule.py    how few barrier epochs a step's dependencies allow
 tools/gen_unicode.py       the Unicode tables the tokenizer needs
 refs/<case>/               the references themselves (not in git)
 tests/                     one test file per reference case
@@ -539,10 +548,28 @@ per kernel. `cargo run --release --bin dispatch_cost` measures what a dispatch
 costs with no work in it.
 
 The numbers below are greedy, 256 tokens, a 25-token prompt, on a quiet
-machine. Quiet matters: with a couple of unrelated CPU-bound jobs running,
-three consecutive runs of one binary came out 12.6, 14.4 and 15.3 ms/token --
-22% apart -- so anything smaller than that has to be measured back to back
-against its own control, or not claimed at all.
+machine. Quiet matters for the wall clock and only for the wall clock, and it
+matters more than first recorded. Five consecutive runs of one binary at load
+average 12:
+
+| wall | 58.8, 85.8, 47.0, 79.6, 82.5 tok/s | 82% apart |
+|---|---|---|
+| GPU busy | 11.01, 11.03, 11.22, 11.13, 11.10 ms/token | 1.9% apart |
+| GPU busy share | 65%, 95%, 53%, 89%, 92% | |
+
+**So measure GPU busy, not tok/s.** The mechanism is in the third row: the
+CPU-bound jobs do not compete for the GPU, they compete for the thread that
+encodes, `blocked in wait` goes from 6.3 ms to 18.0, and the GPU idles. What
+it executes takes the same time either way -- 11.0 to 11.2 ms whatever else
+the machine is doing, which is also what it measured when the machine was
+quiet. Waiting for a quiet machine buys nothing that reading the right column
+does not.
+
+The caveat that comes with it: GPU busy is summed `GPUEndTime - GPUStartTime`
+over command buffers, so it cannot see the gaps *between* them. It is the
+right metre for a change on the GPU's side -- kernels, barriers, epochs -- and
+the wrong one for a change in what the encoding costs the CPU. For those, and
+for the wall clock, a quiet machine is still the only way.
 
 (`mlx_lm`'s CLI renders the chat template its own way and gets 23 tokens from
 the same text, so the two generate different essays. `tests/generate.rs` is
@@ -742,19 +769,161 @@ It also corrects the arithmetic for a smaller artifact. "35% fewer bytes gives
 A read sitting at 21% of peak is limited by its own ramp, so halving its bytes
 buys less than half its time, and a smaller read ramps worse still.
 
-**The open question, and the next thing to measure**: of the 1216 barriers a
-token, how many are real? Some of that chain genuinely is sequential -- norm,
-projection, mixer, norm, router, experts. Some is not: `in_proj_qkv` with
-`in_proj_z`, `gate` with `up`, `q`/`k`/`v` in the full-attention layers. And
-there is a third possibility worth ruling out, which is that the tracking
-invents dependencies: it keys on the buffer's address, and the pool hands
-freed buffers straight back out, so an unrelated temporary can land on the
-buffer a previous dispatch just used and force a barrier that no data needs.
-Memory is not short here -- 27 GB of artifact against 64 GB -- so declining to
-recycle inside a barrier epoch is a cheap thing to try. Attributing each
-barrier to the kernel and the buffer that caused it is ~30 lines on top of the
-counters that already exist, and it says how much of the road from 250 to 465
-is actually open.
+**The open question was how many of the 1216 barriers a token are real.** It
+is measured now, and the section below is the answer.
+
+### Where the 1216 barriers come from, and what overlap is left
+
+`ORNITH_PROF=1` attributes every barrier to the pair of dispatches that forced
+it, the hazard it was (RAW / WAR / WAW), and what the two shared:
+
+- **real** -- overlapping bytes of one allocation. A dependency the data has.
+- **disjoint** -- one allocation bound at two ranges that do not overlap: two
+  halves of a fused projection, two experts of a stacked weight.
+- **recycled** -- two different allocations that share an address, because the
+  pool handed the freed one straight back out. Nothing flows between them.
+
+The last two cost a barrier all the same, because the tracking keys on the
+buffer -- which is what mlx does. A barrier is counted spurious only if *no*
+cause behind it was real.
+
+| per token | |
+|---|---|
+| barriers | 1216 |
+| with a real dependency behind them | 1186, 97.5% |
+| invented by the buffer pool | 30, 2.5% -- all one pair, `rms_norm` writing where `scalar_mul` had read |
+| invented by two views of one allocation | 0 |
+
+So the suspicion was right in kind and small in size. These counts do not
+depend on what else the machine is doing, and they reproduced exactly across
+runs. `ORNITH_NO_RECYCLE=1` makes the pool decline to hand back a buffer the
+current epoch has touched; it removes exactly those 30 and nothing else
+(1216 -> 1186, spurious -> 0), and `tests/model` passes bit-exact under it. It
+is worth under a percent of wall, which on a machine at load 13 is not
+distinguishable from noise. Not on by default: it is a deviation from mlx, and
+30 barriers do not pay for one.
+
+**The number that matters is not the barrier but the epoch.** A Metal barrier
+is encoder-wide -- it orders everything before it against everything after --
+so what can overlap is the run of dispatches between two barriers. 1669
+dispatches in 1230 epochs is **1.36 dispatches per epoch, and 80% of epochs
+hold exactly one**. The concurrent encoder is concurrent in name.
+
+`ORNITH_TRACE=<path>` writes one step's dispatches with every binding, and
+`tools/epoch_schedule.py` levelises them as-soon-as-possible to ask how few
+epochs the dependencies actually permit. That floor is reachable: no two
+dispatches on a level collide, and every collision is on an earlier level, so
+encoding the levels in order is a legal encode order.
+
+| | epochs/token | dispatches each |
+|---|---|---|
+| as encoded today | 1230 | 1.36 |
+| best order, tracking whole buffers as now | 1007 | 1.66 |
+| best order, byte ranges as well | 1007 | 1.66 |
+| best order, and no recycling inside an epoch | 947 | 1.76 |
+
+Three things fall out of it.
+
+- **223 epochs a token are encode order and nothing else** -- same tracking,
+  same semantics, just issuing independent dispatches next to each other. The
+  MoE block is where they are: the router's tail, the routed experts and the
+  shared expert are mutually independent and today run one after another. The
+  best order puts `affine_qmv` 8-bit with both shared-expert `qmv`s and an
+  8-bit `qmv_fast` in one epoch 32 times a token -- four weight-heavy reads at
+  once -- and hides the argsort and `take_along_last` under the expert gathers.
+- **Byte ranges buy nothing.** Tracking views precisely moves the floor by
+  zero epochs, and the attribution counts zero barriers caused by disjoint
+  views. Refining the tracking that way is ruled out before it costs anything,
+  which is the same shape of answer as the interleaved-affine-layout idea
+  above.
+- **And what those 223 epochs are worth is 12%.** Given the per-kernel times
+  from `ORNITH_COMMIT_EVERY=1`, charge every epoch its slowest member and let
+  the rest run underneath. That model prices the schedule as encoded at 8.88
+  ms against a step measured at 10.9-11.8 ms of GPU busy -- optimistic by
+  about a quarter, as it must be, since concurrent kernels share the memory
+  bus. Read the ratio, not the number:
+
+  | | epochs | priced |
+  |---|---|---|
+  | as encoded | 1230 | 8.88 ms |
+  | best order | 1007 | 7.81 ms, **-12%** |
+  | best order, no recycling | 947 | 7.38 ms, **-17%** |
+
+  So a perfect encode order is worth ~12%, ~17% with the pool change, and that
+  is the whole of what scheduling has left -- 88 tok/s becomes about 100.
+
+**The model is calibrated on the one experiment that has an answer.** Feed it
+the router-tail fusion from the section below -- merge those five dispatches
+into one carrying their summed time -- and it reproduces the build exactly,
+1669 dispatches to 1509, and prices it at nothing: -0.7% where the built
+version measured +0.5%. It predicted the failure it should have predicted,
+which is the reason to believe the 12% it predicts for reordering. Both come
+out of the same arithmetic.
+
+**Why it is not more, since two other numbers say 6 ms.** The critical path
+costs 5.95 ms of kernel time, and 2.83 GB at the machine's 465 GB/s is 6.09
+ms; the barrier-free run measured 6.9. All three describe a step with
+everything off the critical path hidden underneath it, and the schedule is
+1.76 wide, so there is nowhere to hide it. Half the kernel time is off the
+path -- the routed experts' 1.9 ms is almost all of it -- but an epoch that
+holds one big read and one small one cannot absorb another big read. The 6 ms
+step needs a decomposition with fewer, longer reads, not a better order of
+this one. Which puts what is left where "What the machine actually sustains"
+put it: bytes, or more than one token in flight.
+
+The floor is a property of *this decomposition into kernels*, not of the
+model: fusing kernels shortens the chain. It is also optimistic in two ways,
+both deliberate -- it ignores the 14 command-buffer boundaries a step has to
+have, and a binding's range is what the binding declares, so a kernel that
+reads past its array would add dependencies this does not see. Both push the
+same way: the real ceiling on overlap is no higher than 1.76.
+
+### Interleaving the MoE block, and what it bought
+
+The first thing done with the departure allowed above, and the measurement
+that calibrates the model in the section before it.
+
+The shared expert runs on every token and depends on `x2` alone -- nothing in
+it waits on the router. It was nevertheless issued after the whole router
+chain, which is a chain of small dispatches each holding a barrier epoch on
+its own. `sparse_moe_block` now issues the two together: the shared expert's
+three projections go out with the router's gate, its swiglu with the softmax,
+its down projection with the argsort. No kernel changes, no weight changes, no
+reduction order changes -- only the order the dispatches are issued in, so the
+result is bit-exact by construction, and `tests/moe`, `tests/model` and
+`tests/generate` all say so.
+
+| | |
+|---|---|
+| epochs | 1230 -> 1108 |
+| barriers | 1216 -> 1094 |
+| dispatches per epoch | 1.36 -> 1.51 |
+| GPU busy | 11.07 -> 10.71 ms/token, **-3.3%** |
+
+The GPU busy figures are the mean of four runs each, alternating, at load
+average 17: control 10.92 / 11.11 / 11.21 / 11.04, interleaved 10.61 / 10.80 /
+10.82 / 10.59. Every run of one is below every run of the other, which is what
+makes 3.3% a result at a spread of 2%.
+
+**And it is what says the schedule model is optimistic by 2.4x.** The model
+priced this change at -7.9% and it measured -3.3%. That is the first
+non-zero prediction it has made -- the router fusion it priced at nothing, and
+nothing is what that measured -- so 2.4 is the number to divide by. Its
+ranking is right and its magnitude is not, for the reason built into it: an
+epoch is charged its slowest member, as though the rest ran underneath for
+free, and bandwidth-bound kernels in one epoch share the bus instead.
+
+Applying that to what is left: the best possible order is another -8.1% in the
+model, so **~3.4% in reality**, and `ORNITH_NO_RECYCLE=1` on top of it another
+~0.8%. The whole of scheduling was ~7%, of which 3.3% is now banked.
+
+**Where the remaining ~100 epochs are, and why they cost more than these did.**
+Nowhere in particular: the slack is spread over 191 `qmv_fast`, 96 expert
+gathers, 186 `rms_norm` -- one epoch each, everywhere, rather than one more
+block issued in the wrong order. Taking it means reordering across layer and
+block boundaries, which the eager op layer cannot express; it needs something
+to defer with, which is mlx's lazy graph. That is a different size of change
+from the twelve lines this section is about.
 
 ### Fusing the router's tail, and why it is not here
 
@@ -788,17 +957,29 @@ kernels changes that.
 
 In order:
 
-1. **A quiet machine, and then every number above again.** Everything here
-   past the dispatch and barrier counts was measured while the machine had
-   other work on it; by the end a run of one binary varied by more than the
-   thing being measured, so the wall-clock figures are the shape of the
-   answer, not the answer.
-2. **Close the gap from 250 GB/s to the 465 the machine can give.** See
-   "What the machine actually sustains" above: the kernels are already at the
-   ceiling on a long read and nowhere near it on a short one, so the work is
-   getting independent reads to overlap rather than making them smaller.
-   Start by attributing each barrier to the kernel and buffer that caused it,
-   and rule out the buffer pool inventing them.
+1. **Every wall-clock number above again, on a quiet machine.** They were
+   all measured with other work on the machine, and a run of one binary
+   varies by 82% there, so they are the shape of the answer and not the
+   answer. This is now much less urgent than it reads: GPU busy holds to 2%
+   under any load (see "Where a decode step goes"), so anything being changed
+   on the GPU's side can be measured today and only the wall clock has to
+   wait.
+2. **Close the gap from 250 GB/s to the 465 the machine can give.** The
+   kernels are already at the ceiling on a long read and nowhere near it on a
+   short one. Overlap was the obvious lever and it has now been measured:
+   "Where the 1216 barriers come from" above says the dependency chain is 947
+   dispatches deep and at best 1.76 wide, so scheduling cannot get there. Two
+   things are still worth doing, in this order.
+   - **Encode order. Half of it is done and the rest is not worth it yet.**
+     Interleaving the shared expert with the router took 122 of the 223
+     available epochs and 3.3% of GPU busy -- see "Interleaving the MoE block"
+     above. What is left is ~3.4%, spread one epoch at a time over every
+     kernel in the step, and taking it means reordering across block and layer
+     boundaries, which needs a deferred op layer rather than another dozen
+     lines. Worth doing only if something else wants that layer anyway.
+   - **Then bytes, which is the only lever left at batch 1.** That is the
+     `fp_quantized` family in "Metal 4.1, fp8/fp4" above, and it is worth it
+     only if MXFP4 holds quality where affine int4 did not.
 3. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
    `lm_head` over a ranked sub-vocabulary, which is what removes the ~540 MB
    per draft step. The artifact ships no ranked vocabulary, so it would have
@@ -908,6 +1089,14 @@ memory, with no quantised matmul, and mlx does not use it on the GPU path.
 - `cargo run --release --bin bandwidth` measures what this machine sustains:
   a read-only kernel at several sizes, then `quantized_matmul` at M = 1 on real
   weights. Run it before believing any "% of peak" claim.
+- `ORNITH_PROF=1` also attributes each barrier to the pair of dispatches that
+  forced it and prints the epoch histogram; `ORNITH_NO_RECYCLE=1` stops the
+  pool handing back a buffer the current barrier epoch has touched, which is
+  the 30 invented barriers a token; `ORNITH_TRACE=<path>` writes one step's
+  dispatches with every binding, which `tools/epoch_schedule.py <path>`
+  levelises into the fewest epochs the dependencies permit. The barrier and
+  epoch counts do not care what else the machine is running -- they are the
+  numbers to reach for when it is busy.
 - `ORNITH_PROF=1` prints the per-token breakdown at the end of a run;
   `ORNITH_COMMIT_EVERY=N` sets the commit size (`N=1` attributes GPU time per
   kernel, and is ~3x slower); `ORNITH_SERIAL=1` puts back the serial encoder

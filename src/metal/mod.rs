@@ -24,7 +24,7 @@
 //! dependency across it. There are ~14 boundaries in a decode step, so it
 //! costs nothing measurable.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::rc::Rc;
@@ -67,6 +67,13 @@ pub enum FConst {
 pub struct Buffer {
     raw: MTLBuf,
     pub len: usize,
+    /// Which allocation this is. A fresh number every time a buffer is handed
+    /// out, including when the pool hands the same Metal object back, so two
+    /// unrelated arrays that land on one address can be told apart. The
+    /// hazard tracking does not use it -- the barrier is needed either way,
+    /// since the bytes really are shared -- but the attribution does, to say
+    /// whether a barrier was forced by data or by the allocator.
+    serial: u64,
     pool: Option<Rc<RefCell<Pool>>>,
 }
 
@@ -128,6 +135,17 @@ impl Pool {
         v.pop()
     }
 
+    /// `take`, but skipping any buffer the current barrier epoch has already
+    /// touched. Handing one of those out puts an unrelated array on an address
+    /// a live dispatch is using, which the tracking can only read as a
+    /// dependency. Only used under `ORNITH_NO_RECYCLE=1`, which is the
+    /// experiment that says how many barriers that costs.
+    fn take_untouched(&mut self, len: usize, touched: &dyn Fn(BufId) -> bool) -> Option<MTLBuf> {
+        let v = self.free.get_mut(&len)?;
+        let i = v.iter().rposition(|b| !touched(buf_id(b)))?;
+        Some(v.remove(i))
+    }
+
     fn put(&mut self, len: usize, buf: MTLBuf) {
         self.free.entry(len).or_default().push(buf);
     }
@@ -161,9 +179,30 @@ fn bucket(len: usize) -> usize {
 #[derive(Default)]
 pub struct Prof {
     pub on: bool,
-    /// Barriers actually inserted, i.e. how often the tracking found a real
+    /// Barriers actually inserted, i.e. how often the tracking found a
     /// dependency. Against the dispatch count it says what the marking bought.
     pub barriers: usize,
+    /// Of those, the ones where no cause was a dependency the data has: every
+    /// buffer that forced it was either a range of an allocation the earlier
+    /// dispatch did not touch, or a different allocation that happens to sit
+    /// at the same address because the pool recycled it.
+    pub barriers_spurious: usize,
+    /// `(kernel, culprit, kind, why, spurious) -> count`, keyed on the first
+    /// hazard the dispatch hit: which pair of dispatches forced a barrier and
+    /// what kind of sharing was between them.
+    barrier_causes: HashMap<(Rc<str>, Rc<str>, Kind, Why, bool), usize>,
+    /// How many dispatches each closed epoch held. A barrier orders everything
+    /// before it against everything after, so an epoch is the unit that can
+    /// actually overlap -- and its size, not the barrier count, is what says
+    /// how much of the step runs at once.
+    epoch_sizes: HashMap<usize, usize>,
+    /// Dispatches in the epoch now open.
+    epoch_dispatches: usize,
+    /// One decode step's dispatches in order, with the barrier before each --
+    /// enough to read the dependency chain rather than infer it from
+    /// histograms. `ORNITH_TRACE=<path>` turns it on; it stops after
+    /// [`TRACE_BUDGET`] dispatches, which is about one token.
+    trace: Option<Vec<String>>,
     pub commits: usize,
     pub dispatches: usize,
     /// Summed `GPUEndTime - GPUStartTime` over committed command buffers.
@@ -185,6 +224,11 @@ pub struct Prof {
     pending: Vec<(CommandBuffer, Option<String>)>,
 }
 
+/// Lines `ORNITH_TRACE` records before it stops. One decode step is ~1669
+/// dispatches plus its barriers, so this covers a step and a little over; the
+/// interest is in the shape of one step, not all of them.
+const TRACE_BUDGET: usize = 4096;
+
 // --- hazards ----------------------------------------------------------------
 
 /// How the encoder orders one dispatch against the next.
@@ -200,6 +244,54 @@ pub enum BarrierMode {
     /// Concurrent with no barriers at all: wrong, and only useful for putting
     /// a bound on what the barriers cost (`ORNITH_NO_BARRIER=1`).
     None,
+}
+
+/// Which of the three hazards forced a barrier.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Kind {
+    /// Read after write.
+    Raw,
+    /// Write after read.
+    War,
+    /// Write after write.
+    Waw,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Raw => "RAW",
+            Kind::War => "WAR",
+            Kind::Waw => "WAW",
+        }
+    }
+}
+
+/// Whether the hazard behind a barrier is a dependency the data has, or an
+/// artefact of tracking whole buffers by address -- which is what mlx does,
+/// and so what this port does. Only the attribution looks at this; the barrier
+/// goes in either way, because in both cases the bytes really are shared.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Why {
+    /// Overlapping bytes of one allocation: a dependency the data really has.
+    Real,
+    /// One allocation, two ranges that provably do not overlap -- two halves
+    /// of a fused projection, two experts of a stacked weight, two rows of a
+    /// cache. Ordering them is not something the data asks for.
+    Disjoint,
+    /// Two different allocations that share an address, because the pool
+    /// handed the freed one straight back out. Nothing flows between them.
+    Recycled,
+}
+
+impl Why {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Why::Real => "real",
+            Why::Disjoint => "disjoint",
+            Why::Recycled => "recycled",
+        }
+    }
 }
 
 /// A buffer's identity for hazard tracking: the address of the Metal object.
@@ -222,6 +314,23 @@ struct Hazards {
     next_in: HashSet<BufId>,
     next_out: HashSet<BufId>,
     needs_barrier: bool,
+    /// The rest is attribution, maintained only when profiling: who last read
+    /// and last wrote each buffer in this epoch, and what the dispatch now
+    /// being encoded collided with. `*_by` mirror the sets above key for key.
+    prev_in_by: HashMap<BufId, Touch>,
+    prev_out_by: HashMap<BufId, Touch>,
+    next_in_by: HashMap<BufId, Touch>,
+    next_out_by: HashMap<BufId, Touch>,
+    causes: Vec<(Kind, Why, Rc<str>)>,
+}
+
+/// One epoch-local touch of a buffer, for attribution.
+#[derive(Clone)]
+struct Touch {
+    serial: u64,
+    start: usize,
+    end: usize,
+    kernel: Rc<str>,
 }
 
 impl Hazards {
@@ -231,6 +340,32 @@ impl Hazards {
         self.next_in.clear();
         self.next_out.clear();
         self.needs_barrier = false;
+        self.prev_in_by.clear();
+        self.prev_out_by.clear();
+        self.next_in_by.clear();
+        self.next_out_by.clear();
+        self.causes.clear();
+    }
+
+    /// Has this epoch bound `id` at all? What `ORNITH_NO_RECYCLE=1` asks the
+    /// pool before handing a buffer back out.
+    fn touched(&self, id: BufId) -> bool {
+        self.prev_in.contains(&id)
+            || self.prev_out.contains(&id)
+            || self.next_in.contains(&id)
+            || self.next_out.contains(&id)
+    }
+}
+
+/// Why a barrier between `t` and `b` was inserted: the two either share bytes,
+/// or only an address.
+fn why(t: &Touch, b: &Bound) -> Why {
+    if t.serial != b.serial {
+        Why::Recycled
+    } else if t.end <= b.start || b.end <= t.start {
+        Why::Disjoint
+    } else {
+        Why::Real
     }
 }
 
@@ -273,6 +408,17 @@ pub struct Context {
     hazards: RefCell<Hazards>,
     /// The kernel now being encoded, so a failed hazard check can name it.
     last_kernel: RefCell<String>,
+    /// The same name, shareable, for the barrier attribution to keep in its
+    /// tables. Only maintained when profiling.
+    cur_kernel: RefCell<Rc<str>>,
+    /// Hands out [`Buffer::serial`].
+    next_serial: Cell<u64>,
+    /// Whether the pool may hand back a buffer this barrier epoch has already
+    /// touched. True in the port as it stands, which is what mlx does;
+    /// `ORNITH_NO_RECYCLE=1` turns it off to measure what the recycling costs
+    /// in barriers. Memory is not short here -- 27 GB of artifact in 64 -- so
+    /// declining is cheap.
+    recycle_in_epoch: bool,
     /// Buffers some dispatch has written, or the host filled at allocation.
     ///
     /// Reading one that is not in here means an op bound a fresh pooled buffer
@@ -339,6 +485,9 @@ impl Context {
             hazards: RefCell::new(Hazards::default()),
             written: RefCell::new(HashSet::new()),
             last_kernel: RefCell::new(String::new()),
+            cur_kernel: RefCell::new(Rc::from("")),
+            next_serial: Cell::new(1),
+            recycle_in_epoch: std::env::var_os("ORNITH_NO_RECYCLE").is_none(),
         })
     }
 
@@ -361,11 +510,24 @@ impl Context {
 
     // --- allocation ---------------------------------------------------------
 
+    /// The next [`Buffer::serial`].
+    fn serial(&self) -> u64 {
+        let n = self.next_serial.get();
+        self.next_serial.set(n + 1);
+        n
+    }
+
     pub fn alloc(&self, nbytes: usize) -> Buffer {
         let len = bucket(nbytes.max(1));
-        if let Some(raw) = self.pool.borrow_mut().take(len) {
+        let recycled = if self.recycle_in_epoch {
+            self.pool.borrow_mut().take(len)
+        } else {
+            let h = self.hazards.borrow();
+            self.pool.borrow_mut().take_untouched(len, &|id| h.touched(id))
+        };
+        if let Some(raw) = recycled {
             self.written.borrow_mut().remove(&buf_id(&raw));
-            return Buffer { raw, len, pool: Some(self.pool.clone()) };
+            return Buffer { raw, len, serial: self.serial(), pool: Some(self.pool.clone()) };
         }
         let raw = self
             .device
@@ -376,7 +538,7 @@ impl Context {
             p.live_bytes += len;
             p.peak_bytes = p.peak_bytes.max(p.live_bytes);
         }
-        Buffer { raw, len, pool: Some(self.pool.clone()) }
+        Buffer { raw, len, serial: self.serial(), pool: Some(self.pool.clone()) }
     }
 
     /// Allocate outside the pool, at exactly the requested size. Weights are
@@ -388,7 +550,7 @@ impl Context {
             .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
             .unwrap_or_else(|| panic!("newBufferWithLength({len}) failed"));
         self.written.borrow_mut().insert(buf_id(&raw));
-        Buffer { raw, len, pool: None }
+        Buffer { raw, len, serial: self.serial(), pool: None }
     }
 
     /// Wrap a whole mmap'd safetensors shard with no copy. The mapping stays
@@ -408,7 +570,7 @@ impl Context {
         }
         .expect("newBufferWithBytesNoCopy failed");
         self.written.borrow_mut().insert(buf_id(&raw));
-        Buffer { raw, len: map.map_len, pool: None }
+        Buffer { raw, len: map.map_len, serial: self.serial(), pool: None }
     }
 
     pub fn pool_stats(&self) -> (usize, usize) {
@@ -508,6 +670,18 @@ impl Context {
     /// Signal this encoder's fence and end it. Everything the next encoder
     /// does waits on that fence, so the boundary is ordered.
     fn end_encoder(&self, enc: &ComputeEncoder) {
+        {
+            let mut p = self.prof.borrow_mut();
+            if p.on && p.epoch_dispatches > 0 {
+                let n = std::mem::take(&mut p.epoch_dispatches);
+                *p.epoch_sizes.entry(n).or_default() += 1;
+                if let Some(t) = p.trace.as_mut()
+                    && t.len() < TRACE_BUDGET
+                {
+                    t.push("-- end of encoder".to_string());
+                }
+            }
+        }
         let mut idx = self.next_fence.borrow_mut();
         let fence = self.fences[*idx % self.fences.len()].clone();
         *idx += 1;
@@ -599,29 +773,58 @@ impl Context {
 
     // --- hazards ------------------------------------------------------------
 
-    /// `set_input_array`: a read of `id` needs a barrier if this epoch has
-    /// already written it.
-    fn note_input(&self, id: BufId) {
+    /// What the dispatch now being encoded does to `b`, for the attribution.
+    fn touch(&self, b: &Bound) -> Touch {
+        Touch {
+            serial: b.serial,
+            start: b.start,
+            end: b.end,
+            kernel: self.cur_kernel.borrow().clone(),
+        }
+    }
+
+    /// `set_input_array`: a read of `b` needs a barrier if this epoch has
+    /// already written it. `wrote` is what the dispatch does to `b`, which
+    /// only the attribution cares about -- it is the difference between
+    /// read-after-write and write-after-write.
+    fn note_input(&self, b: &Bound, wrote: bool) {
         assert!(
-            self.written.borrow().contains(&id),
+            self.written.borrow().contains(&b.id),
             "{} reads a pooled buffer nothing has written: whichever op writes \
              it bound it with `arr` instead of `out`",
             self.last_kernel.borrow()
         );
+        let prof_on = self.prof.borrow().on;
         let mut h = self.hazards.borrow_mut();
-        let raw_after_write = h.prev_out.contains(&id);
-        h.next_in.insert(id);
+        let raw_after_write = h.prev_out.contains(&b.id);
+        if prof_on {
+            if raw_after_write && let Some(t) = h.prev_out_by.get(&b.id).cloned() {
+                let kind = if wrote { Kind::Waw } else { Kind::Raw };
+                h.causes.push((kind, why(&t, b), t.kernel));
+            }
+            let t = self.touch(b);
+            h.next_in_by.insert(b.id, t);
+        }
+        h.next_in.insert(b.id);
         h.needs_barrier |= raw_after_write;
     }
 
     /// `register_output_array`: a write also counts as a read (so it picks up
-    /// write-after-write), and needs a barrier if this epoch has read `id`.
-    fn note_output(&self, id: BufId) {
-        self.written.borrow_mut().insert(id);
-        self.note_input(id);
+    /// write-after-write), and needs a barrier if this epoch has read `b`.
+    fn note_output(&self, b: &Bound) {
+        self.written.borrow_mut().insert(b.id);
+        self.note_input(b, true);
+        let prof_on = self.prof.borrow().on;
         let mut h = self.hazards.borrow_mut();
-        let war_after_read = h.prev_in.contains(&id);
-        h.next_out.insert(id);
+        let war_after_read = h.prev_in.contains(&b.id);
+        if prof_on {
+            if war_after_read && let Some(t) = h.prev_in_by.get(&b.id).cloned() {
+                h.causes.push((Kind::War, why(&t, b), t.kernel));
+            }
+            let t = self.touch(b);
+            h.next_out_by.insert(b.id, t);
+        }
+        h.next_out.insert(b.id);
         h.needs_barrier |= war_after_read;
     }
 
@@ -639,6 +842,23 @@ impl Context {
                 let mut prof = self.prof.borrow_mut();
                 if prof.on {
                     prof.barriers += 1;
+                    let kernel = self.cur_kernel.borrow().clone();
+                    record_causes(&mut prof, &kernel, &h.causes);
+                    let n = std::mem::take(&mut prof.epoch_dispatches);
+                    *prof.epoch_sizes.entry(n).or_default() += 1;
+                    if let Some(t) = prof.trace.as_mut()
+                        && t.len() < TRACE_BUDGET
+                    {
+                        let c = h.causes.first();
+                        t.push(match c {
+                            Some((kind, why, culprit)) => format!(
+                                "-- barrier {} {} after {culprit}",
+                                kind.as_str(),
+                                why.as_str()
+                            ),
+                            None => "-- barrier".to_string(),
+                        });
+                    }
                 }
             }
             h.needs_barrier = false;
@@ -646,12 +866,21 @@ impl Context {
             let next_out = std::mem::take(&mut h.next_out);
             h.prev_in = next_in;
             h.prev_out = next_out;
+            let in_by = std::mem::take(&mut h.next_in_by);
+            let out_by = std::mem::take(&mut h.next_out_by);
+            h.prev_in_by = in_by;
+            h.prev_out_by = out_by;
         } else {
             let next_in = std::mem::take(&mut h.next_in);
             let next_out = std::mem::take(&mut h.next_out);
             h.prev_in.extend(next_in);
             h.prev_out.extend(next_out);
+            let in_by = std::mem::take(&mut h.next_in_by);
+            let out_by = std::mem::take(&mut h.next_out_by);
+            h.prev_in_by.extend(in_by);
+            h.prev_out_by.extend(out_by);
         }
+        h.causes.clear();
     }
 
     // --- profiling ----------------------------------------------------------
@@ -664,6 +893,9 @@ impl Context {
         let mut k = self.last_kernel.borrow_mut();
         k.clear();
         k.push_str(name);
+        if self.prof.borrow().on {
+            *self.cur_kernel.borrow_mut() = Rc::from(name);
+        }
     }
 
     fn prof_name(&self, name: &str) {
@@ -713,6 +945,63 @@ impl Context {
         self.prof.borrow().barriers
     }
 
+    /// One dispatch's line in the trace: the kernel, then every binding as
+    /// `r|w:buffer:allocation:start:end`. That is everything the scheduling
+    /// question needs -- which dispatches could have run together is a
+    /// property of the bindings, not of the order they were encoded in.
+    fn trace_dispatch(&self, bound: &[Bound], marked: bool) {
+        let mut p = self.prof.borrow_mut();
+        let Some(t) = p.trace.as_mut() else { return };
+        if t.len() >= TRACE_BUDGET {
+            return;
+        }
+        let mut line = self.cur_kernel.borrow().to_string();
+        for b in bound {
+            let dir = if b.is_out || !marked { 'w' } else { 'r' };
+            line.push_str(&format!(
+                " {dir}:{:x}:{}:{}:{}",
+                b.id, b.serial, b.start, b.end
+            ));
+        }
+        t.push(line);
+    }
+
+    /// The recorded step, if `ORNITH_TRACE` asked for one.
+    pub fn prof_trace(&self) -> Vec<String> {
+        self.prof.borrow().trace.clone().unwrap_or_default()
+    }
+
+    /// `(dispatches in the epoch, how many epochs held that many)`, smallest
+    /// first. A barrier closes an epoch and so does an encoder.
+    pub fn prof_epoch_sizes(&self) -> Vec<(usize, usize)> {
+        let p = self.prof.borrow();
+        let mut v: Vec<(usize, usize)> = p.epoch_sizes.iter().map(|(k, n)| (*k, *n)).collect();
+        v.sort_by_key(|e| e.0);
+        v
+    }
+
+    /// Of those, the ones no data flowed through: see [`Why`].
+    pub fn prof_barriers_spurious(&self) -> usize {
+        self.prof.borrow().barriers_spurious
+    }
+
+    /// `(kernel, culprit, kind, why, spurious, count)`, most frequent first:
+    /// which dispatch forced a barrier, which earlier one it collided with,
+    /// over what kind of sharing, and whether the barrier as a whole had any
+    /// real dependency behind it.
+    pub fn prof_barrier_causes(&self) -> Vec<(String, String, Kind, Why, bool, usize)> {
+        let p = self.prof.borrow();
+        let mut v: Vec<(String, String, Kind, Why, bool, usize)> = p
+            .barrier_causes
+            .iter()
+            .map(|((k, c, kind, why, sp), n)| {
+                (k.to_string(), c.to_string(), *kind, *why, *sp, *n)
+            })
+            .collect();
+        v.sort_by(|a, b| b.5.cmp(&a.5).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+        v
+    }
+
     pub fn prof_on(&self) -> bool {
         self.prof.borrow().on
     }
@@ -749,6 +1038,13 @@ impl Context {
         }
         p.commits = 0;
         p.barriers = 0;
+        p.barriers_spurious = 0;
+        p.barrier_causes.clear();
+        p.epoch_sizes.clear();
+        p.epoch_dispatches = 0;
+        if std::env::var_os("ORNITH_TRACE").is_some() {
+            p.trace = Some(Vec::new());
+        }
         p.dispatches = 0;
         p.gpu_s = 0.0;
         p.wait_s = 0.0;
@@ -762,6 +1058,7 @@ impl Context {
             let mut p = self.prof.borrow_mut();
             if p.on {
                 p.dispatches += 1;
+                p.epoch_dispatches += 1;
             }
         }
         let mut n = self.dispatches.borrow_mut();
@@ -774,11 +1071,48 @@ impl Context {
     }
 }
 
+/// Fold one barrier's causes into the table. A barrier is only ever inserted
+/// once per dispatch, so it is keyed on the first hazard the dispatch hit --
+/// and counted as spurious only if *none* of its causes was a real one, since
+/// a single real dependency is enough to need it.
+fn record_causes(prof: &mut Prof, kernel: &Rc<str>, causes: &[(Kind, Why, Rc<str>)]) {
+    let spurious = !causes.is_empty() && causes.iter().all(|(_, why, _)| *why != Why::Real);
+    if spurious {
+        prof.barriers_spurious += 1;
+    }
+    if let Some((kind, why, culprit)) = causes.first() {
+        *prof
+            .barrier_causes
+            .entry((kernel.clone(), culprit.clone(), *kind, *why, spurious))
+            .or_default() += 1;
+    }
+}
+
 // --- dispatch builder -------------------------------------------------------
 
 /// Bindings a single dispatch can track. No kernel here comes close; the
 /// assert in `bind` says so out loud rather than silently dropping one.
 const MAX_BOUND: usize = 16;
+
+/// One binding, as the hazard tracking sees it: which buffer, which
+/// allocation of it, which bytes, and whether the kernel writes them. Only the
+/// id and the direction decide a barrier; the serial and the range are what
+/// the attribution needs to say whether that barrier was earned.
+#[derive(Clone, Copy)]
+struct Bound {
+    id: BufId,
+    serial: u64,
+    /// Byte range bound. `arr` and `out` know the array's extent; a
+    /// whole-buffer binding runs to the end, which is the conservative
+    /// direction -- it can only make a range look less disjoint than it is.
+    start: usize,
+    end: usize,
+    is_out: bool,
+}
+
+impl Bound {
+    const EMPTY: Bound = Bound { id: 0, serial: 0, start: 0, end: 0, is_out: false };
+}
 
 pub struct Dispatch<'a> {
     ctx: &'a Context,
@@ -787,7 +1121,7 @@ pub struct Dispatch<'a> {
     slot: usize,
     /// The buffers bound so far and whether the kernel writes them, for the
     /// hazard tracking in [`Context::maybe_barrier`].
-    bound: [(BufId, bool); MAX_BOUND],
+    bound: [Bound; MAX_BOUND],
     n_bound: usize,
     /// Set by the first [`Dispatch::out`]. Until an op says which of its
     /// bindings it writes, every one of them counts as a write, which forces
@@ -813,7 +1147,7 @@ impl<'a> Dispatch<'a> {
             enc,
             pipe,
             slot: 0,
-            bound: [(0, false); MAX_BOUND],
+            bound: [Bound::EMPTY; MAX_BOUND],
             n_bound: 0,
             marked: false,
         }
@@ -826,7 +1160,7 @@ impl<'a> Dispatch<'a> {
 
     pub fn buf_off(self, b: &Buffer, offset: usize) -> Self {
         unsafe { self.enc.setBuffer_offset_atIndex(Some(b.raw()), offset, self.slot) };
-        self.bind(b, false)
+        self.bind(b, offset, b.len - offset.min(b.len), false)
     }
 
     /// Bind the buffer this kernel *writes*. Same as [`Dispatch::buf`] to
@@ -834,7 +1168,7 @@ impl<'a> Dispatch<'a> {
     /// assume every binding is written.
     pub fn out_buf(self, b: &Buffer) -> Self {
         unsafe { self.enc.setBuffer_offset_atIndex(Some(b.raw()), 0, self.slot) };
-        self.bind(b, true)
+        self.bind(b, 0, b.len, true)
     }
 
     /// [`Dispatch::arr`] for the array the kernel writes.
@@ -842,13 +1176,19 @@ impl<'a> Dispatch<'a> {
         unsafe {
             self.enc.setBuffer_offset_atIndex(Some(a.buf.raw()), a.offset, self.slot)
         };
-        self.bind(&a.buf, true)
+        self.bind(&a.buf, a.offset, a.nbytes(), true)
     }
 
-    fn bind(mut self, b: &Buffer, is_out: bool) -> Self {
+    fn bind(mut self, b: &Buffer, offset: usize, nbytes: usize, is_out: bool) -> Self {
         if self.ctx.barriers == BarrierMode::Selective {
             assert!(self.n_bound < MAX_BOUND, "more than {MAX_BOUND} buffers in one dispatch");
-            self.bound[self.n_bound] = (b.id(), is_out);
+            self.bound[self.n_bound] = Bound {
+                id: b.id(),
+                serial: b.serial,
+                start: offset,
+                end: offset + nbytes,
+                is_out,
+            };
             self.n_bound += 1;
             self.marked |= is_out;
         }
@@ -861,20 +1201,24 @@ impl<'a> Dispatch<'a> {
         if self.ctx.barriers != BarrierMode::Selective {
             return;
         }
-        for &(id, is_out) in &self.bound[..self.n_bound] {
-            if is_out || !self.marked {
-                self.ctx.note_output(id);
+        for b in &self.bound[..self.n_bound] {
+            if b.is_out || !self.marked {
+                self.ctx.note_output(b);
             } else {
-                self.ctx.note_input(id);
+                self.ctx.note_input(b, false);
             }
         }
         self.ctx.maybe_barrier(&self.enc);
+        self.ctx.trace_dispatch(&self.bound[..self.n_bound], self.marked);
     }
 
     /// Bind an array: its buffer at the array's byte offset. This is how
     /// every op binds inputs and outputs, so views cost nothing.
     pub fn arr(self, a: &crate::array::Array) -> Self {
-        self.buf_off(&a.buf, a.offset)
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(Some(a.buf.raw()), a.offset, self.slot)
+        };
+        self.bind(&a.buf, a.offset, a.nbytes(), false)
     }
 
     /// Bind a small value inline (`setBytes:`), as mlx does for shapes,
