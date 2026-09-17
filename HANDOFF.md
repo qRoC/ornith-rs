@@ -695,6 +695,67 @@ percent, against the 5-6% this table was read to promise. Read the table for
 which kernels exist and what they cost in isolation; for what removing one
 *buys*, there is no substitute for removing it and measuring.
 
+### What the machine actually sustains
+
+546 GB/s is the number on the box. `cargo run --release --bin bandwidth` asks
+what a kernel can have: one that only reads, at several sizes, and then the
+real `quantized_matmul` at M = 1 on real weights.
+
+| a kernel that only reads | GB/s | of peak |
+|---|---|---|
+| 64 MB | 202 | 37% |
+| 256 MB | 401 | 73% |
+| 1024 MB | 465 | 85% |
+| 2048 MB | 452 | 83% |
+
+| `quantized_matmul`, M = 1 | size | GB/s | of peak |
+|---|---|---|---|
+| `lm_head`, 8-bit g64 | 540 MB | 455 | 83% |
+| `in_proj_qkv`, 8-bit g64 | 17.8 MB | 116 | 21% |
+| `o_proj`, 8-bit g64 | 8.9 MB | 61 | 11% |
+
+So the practical ceiling is **~465 GB/s**, 85% of the sticker, and it is only
+reached by a long read. The remaining 15% is the machine's, not ours.
+
+**The kernels are already at that ceiling.** `qmv` over `lm_head` sustains 455
+against the 465 a bare read gets. Which kills a plausible-sounding idea before
+it cost anything: that the affine layout hurts because `weight`, `scales` and
+`biases` are three separate arrays, so a group of 32 weights is 16 bytes from
+one region plus 2 and 2 from two others. Repacking them interleaved, the way
+llama.cpp's block formats do, would have been a week of kernels and a new
+artifact -- and it would have fixed something that is not broken.
+
+**What is broken is the size of the reads.** The same kernel that holds 83% on
+540 MB gets 21% on 17.8 MB and 11% on 8.9 MB: a short kernel never gets enough
+requests in flight to saturate the memory system, pays its ramp, and stops. A
+decode step is a few hundred small reads and one big one, which is exactly why
+it averages ~250 GB/s.
+
+**That resets where the prize is.** If every read behaved like `lm_head`'s, the
+step would be 2.74 GB / 465 GB/s = **5.9 ms, about 170 tok/s** against today's
+88. The barrier-free bound measured earlier says the same thing from the other
+side: 6.87 ms is 399 GB/s. The lever is **overlap**, not layout and not, in the
+first instance, bytes.
+
+It also corrects the arithmetic for a smaller artifact. "35% fewer bytes gives
+35% more speed" only holds for reads already limited by bandwidth -- `lm_head`.
+A read sitting at 21% of peak is limited by its own ramp, so halving its bytes
+buys less than half its time, and a smaller read ramps worse still.
+
+**The open question, and the next thing to measure**: of the 1216 barriers a
+token, how many are real? Some of that chain genuinely is sequential -- norm,
+projection, mixer, norm, router, experts. Some is not: `in_proj_qkv` with
+`in_proj_z`, `gate` with `up`, `q`/`k`/`v` in the full-attention layers. And
+there is a third possibility worth ruling out, which is that the tracking
+invents dependencies: it keys on the buffer's address, and the pool hands
+freed buffers straight back out, so an unrelated temporary can land on the
+buffer a previous dispatch just used and force a barrier that no data needs.
+Memory is not short here -- 27 GB of artifact against 64 GB -- so declining to
+recycle inside a barrier epoch is a cheap thing to try. Attributing each
+barrier to the kernel and the buffer that caused it is ~30 lines on top of the
+counters that already exist, and it says how much of the road from 250 to 465
+is actually open.
+
 ### Fusing the router's tail, and why it is not here
 
 Tried and reverted, so that it is not tried again for the same reasons.
@@ -732,7 +793,13 @@ In order:
    other work on it; by the end a run of one binary varied by more than the
    thing being measured, so the wall-clock figures are the shape of the
    answer, not the answer.
-2. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
+2. **Close the gap from 250 GB/s to the 465 the machine can give.** See
+   "What the machine actually sustains" above: the kernels are already at the
+   ceiling on a long read and nowhere near it on a short one, so the work is
+   getting independent reads to overlap rather than making them smaller.
+   Start by attributing each barrier to the kernel and buffer that caused it,
+   and rule out the buffer pool inventing them.
+3. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
    `lm_head` over a ranked sub-vocabulary, which is what removes the ~540 MB
    per draft step. The artifact ships no ranked vocabulary, so it would have
    to be derived.
@@ -838,6 +905,9 @@ memory, with no quantised matmul, and mlx does not use it on the GPU path.
   its images.
 
       cargo test --release --test vision_generate -- --ignored --nocapture --test-threads=1
+- `cargo run --release --bin bandwidth` measures what this machine sustains:
+  a read-only kernel at several sizes, then `quantized_matmul` at M = 1 on real
+  weights. Run it before believing any "% of peak" claim.
 - `ORNITH_PROF=1` prints the per-token breakdown at the end of a run;
   `ORNITH_COMMIT_EVERY=N` sets the commit size (`N=1` attributes GPU time per
   kernel, and is ~3x slower); `ORNITH_SERIAL=1` puts back the serial encoder
