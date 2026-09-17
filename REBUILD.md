@@ -226,8 +226,43 @@ Only then delete.
 
 ## Phase 2 -- reproduce what we had, before changing anything
 
-Build with the saved recipe **unmodified**, and compare per-file sha256
-against `.mtplx-source.json`.
+**Start here in a new session.** Phase 0 is captured in `baseline/`, the old
+artifact is deleted, and the parent is pulled.
+
+Build with the saved recipe **unmodified**:
+
+    cd ~/Projects/ai/ornith-rs
+    mtplx forge build \
+      --repo ornith-ai/Ornith-1.5-35B-A3B \
+      --model-root ~/.mtplx/models \
+      --out /tmp/forge --run-id phase2 \
+      --recipe "$(cat baseline/BUILD_RECIPE.json)" \
+      --branded-name ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx
+
+One thing to watch: `BUILD_RECIPE.json` is the artifact's *record* of its
+recipe, so it carries keys that are history rather than input --
+`artifact_name`, `source_model`, `source_revision`, `release_repo`,
+`architecture_signature`, `source_signature`. `_read_recipe` only parses JSON
+and the builder reads the keys it knows (`forge.py:1448` and around), so the
+extras should be inert; if forge objects, strip them to the ones the recipe
+actually sets: `body_bits`, `body_group_size`, `body_mode`, `body_dtype`,
+`module_overrides`, `mtp_policy`, `vision_policy`, `recipe_id`,
+`recipe_version`, `adapter_id`, and the `expected_*` counts.
+
+Then check it:
+
+    python3 tools/check_rebuild.py ~/.mtplx/models/<branded name>
+
+That script encodes every condition found while writing this plan, split into
+INVARIANT (must hold for any rebuild, including the two the golden tests are
+blind to) and RECIPE (must hold in Phase 2, expected to break in Phase 4).
+**It has never been run against a real artifact** -- the old one was deleted
+before it was written -- so its first failure is as likely to be the script as
+the rebuild. The inventory half can be sanity-checked against the parent
+itself as soon as the pull lands, since those six counts came from the
+parent's own index.
+
+Compare per-file sha256 against `.mtplx-source.json`.
 
 - **Byte-identical:** the mechanism is proven, the parent is right, and every
   later variant differs only by what the recipe says. This is the outcome to
@@ -291,16 +326,16 @@ steps.
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
 
-| step | free after |
-|---|---|
-| delete the current artifact (27 GB) | 111 GB |
-| pull the parent (~70 GB) | ~41 GB |
-| build one artifact (~27 GB) | ~14 GB |
+**This constraint is gone.** It was written against 84 GB free; the disk now
+has **592 GB**, which holds the parent and several variants at once. Variants
+*can* be compared side by side, so build them all and keep them until the
+numbers are in.
 
-The order is forced by that table: Phase 0's captures, then the delete, then
-the pull. Pulling first leaves 14 GB and no room for forge's output, and
-deleting before Phase 0 throws away the only baseline the experiment can be
-judged against.
+What the old table forced is still worth recording, because it is why Phase 0
+happened when it did: with 84 GB free, the order had to be captures, then
+delete, then pull -- and deleting before capturing would have thrown away the
+only baseline the experiment can be judged against. That ordering is no longer
+forced by disk, but the reason for Phase 0 has nothing to do with disk.
 
 That leaves room for the parent plus **one** artifact at a time, and forge
 needs scratch on top. So variants cannot be compared side by side on this
