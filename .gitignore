@@ -8,3 +8,6 @@
 /refs/
 
 .DS_Store
+
+# Python bytecode from the tools/ writers.
+__pycache__/
