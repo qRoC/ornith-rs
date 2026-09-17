@@ -383,7 +383,43 @@ run and are the most quality-critical thing in a MoE -- are 0.8%. Requantizing
 them is all risk and no reward, and the first version of this plan would have
 done it, because it moved all 260 at once.
 
-*Why mxfp4 is the wrong first choice.* Against affine int4 g32 it trades a
+*What each format actually costs in precision.* `tools/quant_error.py`
+quantizes a million draws and measures the relative RMS weight error. Scales
+and biases are rounded to bfloat16 as the artifact stores them, so affine is
+not flattered:
+
+| format | bits/w | gaussian | laplace | student-t(4) |
+|---|---|---|---|---|
+| affine int8 g64 -- **today** | 8.50 | **0.54%** | 0.67% | 0.70% |
+| affine int4 g32 -- the body today | 5.00 | 7.82% | 9.18% | 9.37% |
+| nvfp4 g16 | 4.50 | 9.51% | 9.28% | 9.18% |
+| mxfp4 g32 | 4.25 | 20.32% | 21.19% | 22.00% |
+
+Three things fall out, and they reorder everything.
+
+**mxfp4 is not a contender.** 20-22% against affine int4's 8-9% -- 2.3x the
+error for 0.75 fewer bits. The power-of-two scale is that expensive. Drop it
+from the ladder rather than demote it.
+
+**nvfp4 is not better than affine int4, it is equal.** Slightly worse on
+gaussian, slightly better on heavy tails, 0.5 bits cheaper. So it buys bytes,
+not quality -- and that matters, because it means the experiment is not "does
+a better format succeed where int4 failed".
+
+**The first experiment needs no new kernels at all.** If nvfp4 is merely equal
+to affine int4, then the question -- do these modules tolerate 4 bits? -- can
+be asked with the format this port already runs and already verifies. Moving
+the four families from 8-bit g64 to the body's own 4-bit g32 is 8.50 -> 5.00
+bits over 57% of traffic: **-23.5% of all bytes**, against nvfp4's -26.8%.
+Three points for a whole `fp_quantized` port, and only worth paying once 4
+bits is known to work at all.
+
+**And it names what is being asked honestly:** those 260 modules would go from
+~0.6% weight error to ~8-9%, which is what the other 192 already live with.
+Not "a better format", but "the same precision the rest of the model already
+has".
+
+*Why mxfp4 looked like the first choice, and was not.* Against affine int4 g32 it trades a
 bf16 scale **and a zero-point** for a power-of-two-only E8M0 scale and **no
 zero-point**, to save 0.75 bits. A power-of-two scale wastes up to 2x of a
 group's dynamic range and the missing zero-point hurts asymmetric
@@ -398,18 +434,20 @@ the odds.
 a half points apart, for a real E4M3 scale instead of a power of two and a
 group of 16 instead of 32. Start there.
 
-| # | change | what it answers | bytes |
-|---|---|---|---|
-| A | none (Phase 2) | control -- reproduces what we had | -- |
-| B | the four byte-heavy families to **nvfp4** | **the prize**: does a 4-bit format with a real scale hold where affine int4 did not? | -26.8% |
-| C | B at **mxfp4** instead | is the coarser scale good enough to be worth 1.6 points more? | -28.4% |
-| D | extend B to `switch_mlp` and `q/o_proj` | another 13.8% of traffic, on shapes that are read less densely | -34% |
-| -- | the 80 gate modules, `embed_tokens` | **never**: 0.8% of bytes, the highest sensitivity in the model | -- |
-| E | the 4-bit body affine -> mxfp4 | saves 0.6% overall and likely loses a little quality. A control for the format, not a goal | -0.6% |
+| # | change | what it answers | bytes | new kernels |
+|---|---|---|---|---|
+| A | none (Phase 2) | control -- reproduces what we had | -- | no |
+| **B** | the four byte-heavy families from 8-bit g64 to the body's **affine int4 g32** | **the whole question**: do these modules tolerate 4 bits? | -23.5% | **no** |
+| C | B, then the same four to **nvfp4 g16** | three more points of bytes at equal error, once 4 bits is known to work | -26.8% | yes, `fp_quantized` |
+| D | extend to `switch_mlp` and `q/o_proj` | another 13.8% of traffic | -34% | -- |
+| -- | the 80 gate modules, `embed_tokens` | **never**: 0.8% of bytes, the highest sensitivity in the model | -- | -- |
+| -- | mxfp4, anywhere | **dropped**: 20-22% weight error | -- | -- |
 
-B is the experiment. E is the one to run only if B's result needs explaining,
-and it is listed to be argued with rather than assumed: the first version of
-this plan had it as step one.
+**B is the experiment, and it is nearly free.** It changes `module_overrides`
+in a recipe and nothing else -- no new Metal, no new oracle, the existing
+`tests/quantized.rs` covers the format already. If B fails on quality, C
+cannot save it, because nvfp4 is not the more precise format; and if B holds,
+C is a bytes-only follow-up that can be judged on its own.
 
 **Judge each variant on three numbers, in this order.** Perplexity against
 `baseline/`'s 6.3327 is the coarse gate. The KL against `baseline/logprobs.bin`
