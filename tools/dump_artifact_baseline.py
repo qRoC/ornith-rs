@@ -20,11 +20,14 @@ Three things, in one model load:
                so they answer "is it still the same model" by how late the
                streams diverge, not by equality.
 
-    cd tools && PYTHONPATH=../../vendor/mlx-lm python3 dump_artifact_baseline.py
+    cd tools && PYTHONPATH=../../vendor/mlx-lm python3 dump_artifact_baseline.py [<model dir>]
+
+The output directory is ../refs/artifact/old; ORNITH_BASELINE_OUT overrides it.
 """
 
 import json
 import math
+import os
 import pathlib
 import sys
 
@@ -33,7 +36,9 @@ import numpy as np
 from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache
 
-OUT = pathlib.Path("../refs/artifact/old")
+# Phase 0 wrote "old"; point ORNITH_BASELINE_OUT at "new" to capture the
+# rebuild and get the other side of the comparison.
+OUT = pathlib.Path(os.environ.get("ORNITH_BASELINE_OUT", "../refs/artifact/old"))
 CORPUS = pathlib.Path("../refs/artifact/ppl_corpus.txt")
 CHUNK = 256
 
@@ -88,11 +93,9 @@ def save(report):
 def main():
     model_dir = sys.argv[1] if len(sys.argv) > 1 else None
     if model_dir is None:
-        import os
-
         model_dir = os.environ.get("ORNITH_MODEL") or str(
             pathlib.Path.home()
-            / ".mtplx/models/Shiftedx--ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx"
+            / ".mtplx/models/ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx"
         )
     OUT.mkdir(parents=True, exist_ok=True)
     model, tokenizer = load(model_dir)
