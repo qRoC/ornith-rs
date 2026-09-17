@@ -275,7 +275,7 @@ impl VisionTower {
         .arr(x)
         .arr(cos)
         .arr(sin)
-        .arr(&out)
+        .out(&out)
         .bytes(&(heads as u32))
         .bytes(&(hd as u32))
         .threads((n, 1, 1), (tg, 1, 1));
@@ -347,8 +347,8 @@ impl VisionTower {
         let tg = 256.min(n.next_power_of_two()).max(1);
         ctx.kernel("vision_cos_sin")
             .arr(&freqs)
-            .arr(&cos)
-            .arr(&sin)
+            .out(&cos)
+            .out(&sin)
             .threads((n, 1, 1), (tg, 1, 1));
         (cos, sin)
     }
@@ -359,7 +359,7 @@ impl VisionTower {
         let half = dim / 2;
         let inv_freq = Array::empty(ctx, &[half], Dtype::F32);
         ctx.kernel("vision_inv_freq")
-            .arr(&inv_freq)
+            .out(&inv_freq)
             .bytes(&ROPE_THETA)
             .bytes(&(dim as u32))
             .threads((half, 1, 1), (half.min(256).max(1), 1, 1));
@@ -369,7 +369,7 @@ impl VisionTower {
         let tg = 256.min(n.next_power_of_two()).max(1);
         ctx.kernel("vision_freq_table")
             .arr(&inv_freq)
-            .arr(&table)
+            .out(&table)
             .bytes(&(half as u32))
             .threads((n, 1, 1), (tg, 1, 1));
         table
@@ -402,7 +402,7 @@ impl VisionTower {
         ctx.kernel("pos_embed_blend_bfloat16")
             .arr(&gathered)
             .arr(&wts)
-            .arr(&blended)
+            .out(&blended)
             .bytes(&(total as u32))
             .bytes(&(dims as u32))
             .threads((n, 1, 1), (tg, 1, 1));

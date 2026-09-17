@@ -60,7 +60,7 @@ pub fn take_along_last_axis(ctx: &Context, src: &Array, idx: &Array) -> Array {
     ctx.kernel(&format!("gather_axis{}uint32_intcc", tname(src.dtype)))
         .arr(src)
         .arr(idx)
-        .arr(&out)
+        .out(&out)
         .bytes_slice(&shape)
         .bytes_slice(&src_strides)
         .bytes_slice(&idx_strides)
@@ -94,7 +94,7 @@ pub fn put_along_last_axis(
     let total = out.numel();
     ctx.kernel(&format!("sampler_copy_{}", tname(src.dtype)))
         .arr(src)
-        .arr(&out)
+        .out(&out)
         .threads((total, 1, 1), (1024.min(total), 1, 1));
 
     let shape = [rows as i32];
@@ -109,7 +109,7 @@ pub fn put_along_last_axis(
     ctx.kernel(&format!("scatter_axis{}uint32_none_int{variant}", tname(src.dtype)))
         .arr(values)
         .arr(idx)
-        .arr(&out)
+        .out(&out)
         .bytes_slice(&shape)
         .bytes_slice(&upd_strides)
         .bytes_slice(&idx_strides)

@@ -481,7 +481,8 @@ what pins them token for token, on identical ids.)
 
 | | |
 |---|---|
-| ornith | 82 tok/s, 12.2 ms/token |
+| ornith, before the barrier work below | 82 tok/s, 12.2 ms/token |
+| ornith, now | 88 tok/s, 11.3 ms/token |
 | `mlx_lm.generate`, same prompt text | 88 tok/s, 11.4 ms/token |
 | GPU busy | 11.8 ms of the 12.2 -- 97%, so the step is not waiting on the CPU |
 | dispatches | 1669 per token, in 14 command buffers (1759 before single-row slices became views) |
@@ -492,15 +493,67 @@ the ~800 dispatches were the problem -- was wrong on both counts: the sync
 costs nothing measurable (the GPU is busy 97% of the wall) and there are twice
 as many dispatches as that.
 
-What the dispatch count does cost is the barrier between each pair.
-`dispatch_cost` puts an empty dispatch at **1.0-1.25 us** in the serial encoder
-this port uses, and at **0.15-0.25 us** in a concurrent one with no barriers --
-so ~1 us of every dispatch is the barrier, and 1669 of them are **~1.6 ms of
-the 12.2 ms step**. mlx does not pay this: its encoder is
-`MTL::DispatchTypeConcurrent` and `maybeInsertBarrier` inserts one only when a
-dispatch reads what a previous dispatch in the same epoch wrote. That is the
-one real divergence between this port's dispatch path and mlx's, and it is
-about the size of the gap to `mlx_lm`.
+What the dispatch count costs is the barrier between each pair.
+`dispatch_cost` puts an empty dispatch at **1.0-1.25 us** in a serial encoder
+and at **0.15-0.25 us** in a concurrent one with no barriers -- so ~1 us of
+every dispatch is the barrier, and 1669 of them would be **~1.6 ms of the
+12.2 ms step**. This port used to pay all of it, where mlx pays only for the
+dependencies it actually has; that was the one real divergence in the dispatch
+path, and it was about the size of the gap to `mlx_lm`. It is ported now, and
+the rest of this section is what that took.
+
+### The barrier between dispatches
+
+The encoder is `MTLDispatchTypeConcurrent`, and a barrier goes in only where
+the data says it must -- mlx's rule, ported from `CommandEncoder`'s
+`set_input_array` / `register_output_array` / `maybeInsertBarrier`. A barrier
+splits the encoder into epochs; within one, dispatches may overlap, so the one
+being encoded needs a barrier before it if it reads a buffer this epoch wrote,
+writes one this epoch read, or writes one this epoch wrote.
+
+The tracking keys on the Metal buffer, not the array, so two views of one
+allocation are a hazard and so is a buffer the pool has handed out again --
+both want the barrier, and both get it.
+
+What this needs from an op is to say which of its bindings it writes:
+`.out(a)` instead of `.arr(a)`. An op that says nothing is treated as writing
+everything it binds, which forces the barrier it used to get from the serial
+encoder, so an unmigrated op is slow rather than wrong.
+
+Getting that marking wrong in the other direction -- a write bound as `arr` --
+is a race, and a race is not something a bit-exact test can be trusted to
+catch, since it may simply win. So the Metal layer tracks which buffers have
+been written and asserts that nothing reads a pooled buffer no dispatch has
+written yet. That is exactly the shape of a missed `out`, and it found three
+of them on the first run (the multi-block sort's `dev_vals_out`/`dev_idxs_out`,
+which reach the binding under an alias the migration script could not see).
+
+It cannot see the other shape: an in-place write into a buffer something has
+already written. Those were found by hand and checked against the kernels'
+own signatures, where a written buffer is `device T*` and a read one is
+`const device T*` -- `causal_mask`, `zero`, `qmm_t`, the `sum_*` reductions,
+`cache_copy`'s `dst` and `splice_rows`' `flat`.
+
+The mirror-image mistake -- an input bound as `out` -- is safe, since it only
+asks for a barrier that was not needed. It is also invisible, and it eats
+exactly what the change was for. They hide where one array is bound by two
+dispatches in the same function, written by the first and read by the second:
+`take_along_last`'s indices, `div_by_row`'s denominators, the split-K
+accumulate's partials, the second SDPA pass's `partials`/`sums`/`maxs`, the
+patch-conv gemm's padded input and the vision rotary table's `inv_freq` all
+started out marked as writes. Unmarking them did not move the barrier count on
+a text decode -- those dispatches had a real dependency behind them anyway --
+but they are the shape to look for if the count is ever worth attacking again.
+
+What it bought: **1216 barriers a token instead of 1669**, a quarter of them
+gone, and a step of **11.3 ms against the serial encoder's 12.7** run back to
+back. That is the gap to `mlx_lm` closed, which is what the ceiling said to
+expect.
+
+`ORNITH_SERIAL=1` puts the serial encoder back, as the control to measure
+against and the fallback if the tracking is ever in doubt. `ORNITH_PROF=1`
+counts the barriers actually inserted, which is the one number here that does
+not care what else the machine is doing.
 
 Commit size matters too, and not in the direction the comment on
 `max_dispatches_per_commit` assumed: each command buffer costs ~60 us of GPU
@@ -532,20 +585,11 @@ plus ~5.3 ms of serialisation plus ~1.7 ms of dispatch and commit overhead.
 
 In order:
 
-1. **The per-dispatch barrier.** Port mlx's `maybeInsertBarrier`: create the
-   encoder with `MTLDispatchTypeConcurrent` and insert
-   `memoryBarrier(BarrierScopeBuffers)` only when a dispatch reads a buffer a
-   previous dispatch in the same epoch wrote (RAW) or writes one a previous
-   dispatch read (WAR) -- `set_input_array` / `register_output_array` in
-   `mlx/backend/metal/device.cpp`. Expect it to close the gap to `mlx_lm` and
-   not much more -- mlx has this rule and runs at 88 tok/s against our 82, so
-   ~7%, not the 77% the barrier-free bound above suggests. The work is marking
-   outputs: `Dispatch` would grow an `.out(a)`
-   beside `.arr(a)`, with unmarked ops treating every binding as both input
-   and output so they keep today's behaviour and the migration can go op by
-   op, each re-checked by its own golden test. 92 `Array::empty` sites is the
-   upper bound on what has to be marked. A barrier changes when a kernel runs,
-   never what it computes, so `max_abs == 0.0` stays the check.
+1. **A quiet machine, and then every number above again.** Everything here
+   past the dispatch and barrier counts was measured while the machine had
+   other work on it; by the end a run of one binary varied by more than the
+   thing being measured, so the wall-clock figures are the shape of the
+   answer, not the answer.
 2. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
    `lm_head` over a ranked sub-vocabulary, which is what removes the ~540 MB
    per draft step. The artifact ships no ranked vocabulary, so it would have
@@ -624,9 +668,11 @@ taps (this `vision_config` ships none), and mlx's graph-level fusion engine
       cargo test --release --test vision_generate -- --ignored --nocapture --test-threads=1
 - `ORNITH_PROF=1` prints the per-token breakdown at the end of a run;
   `ORNITH_COMMIT_EVERY=N` sets the commit size (`N=1` attributes GPU time per
-  kernel, and is ~3x slower); `ORNITH_NO_BARRIER=1` drops every barrier, which
-  is wrong but bounds what the barriers cost. `cargo run --release --bin
-  dispatch_cost` times an empty dispatch.
+  kernel, and is ~3x slower); `ORNITH_SERIAL=1` puts back the serial encoder
+  that barriers between every pair, as the control for the selective one;
+  `ORNITH_NO_BARRIER=1` drops every barrier, which is wrong but bounds what
+  they cost. `cargo run --release --bin dispatch_cost` times an empty
+  dispatch.
 - `tools/gen_unicode.py` regenerates `src/tokenizer/tables.rs`. It is checked
   in; only re-run it when the Python that produced it moves to a new Unicode
   version, and re-run `tests/tokenizer.rs` afterwards.

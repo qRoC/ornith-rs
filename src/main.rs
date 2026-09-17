@@ -208,12 +208,13 @@ fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
     let ms = |s: f64| s * 1e3 / n;
     eprintln!(
         "[prof: {:.2} ms/token wall, {:.2} gpu ({:.0}%), {:.2} blocked in wait; \
-         {:.0} dispatches, {:.1} commits per token]",
+         {:.0} dispatches, {:.0} barriers, {:.1} commits per token]",
         ms(gen_time),
         ms(gpu_s),
         100.0 * gpu_s / gen_time.max(1e-9),
         ms(wait_s),
         dispatches as f64 / n,
+        ctx.prof_barriers() as f64 / n,
         commits as f64 / n,
     );
     let (by, mixed) = ctx.prof_kernel_times();

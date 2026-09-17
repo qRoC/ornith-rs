@@ -57,7 +57,7 @@ pub fn logsumexp_last_axis(ctx: &Context, x: &Array) -> Array {
         SIMD_SIZE * needed.div_ceil(SIMD_SIZE)
     };
     assert!(tg <= d.max_threads_per_threadgroup());
-    d.arr(x).arr(&out).bytes(&(axis_size as i32)).threads((n_rows * tg, 1, 1), (tg, 1, 1));
+    d.arr(x).out(&out).bytes(&(axis_size as i32)).threads((n_rows * tg, 1, 1), (tg, 1, 1));
     out
 }
 
@@ -87,7 +87,7 @@ pub fn argmax_last_axis(ctx: &Context, x: &Array) -> Array {
     // `get_2d_grid_dims(out.shape(), out.strides())`, which for the contiguous
     // outputs here is just the element count laid out along x.
     let rows: usize = out.numel();
-    let d = d.arr(x).arr(&out);
+    let d = d.arr(x).out(&out);
     let d = if ndim == 0 {
         d.bytes(&0i32).bytes(&0i64).bytes(&0i64)
     } else {
@@ -117,7 +117,7 @@ pub fn subtract_scalar(ctx: &Context, a: &Array, b: &Array) -> Array {
     let nthreads = n.div_ceil(wpt);
     let d = ctx.kernel(&name);
     let tg = d.max_threads_per_threadgroup().min(nthreads);
-    d.arr(a).arr(b).arr(&out).bytes(&(n as u32)).threads((nthreads, 1, 1), (tg, 1, 1));
+    d.arr(a).arr(b).out(&out).bytes(&(n as u32)).threads((nthreads, 1, 1), (tg, 1, 1));
     out
 }
 
@@ -147,7 +147,7 @@ pub fn exp_for_test(ctx: &Context, x: &Array) -> Array {
     let n = x.numel();
     ctx.kernel(&format!("sampler_exp_{}", type_name(x.dtype)))
         .arr(x)
-        .arr(&out)
+        .out(&out)
         .threads((n, 1, 1), (1024.min(n), 1, 1));
     out
 }
@@ -158,7 +158,7 @@ pub fn negate_for_test(ctx: &Context, x: &Array) -> Array {
     let n = x.numel();
     ctx.kernel(&format!("sampler_negative_{}", type_name(x.dtype)))
         .arr(x)
-        .arr(&out)
+        .out(&out)
         .threads((n, 1, 1), (1024.min(n), 1, 1));
     out
 }

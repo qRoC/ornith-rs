@@ -55,7 +55,7 @@ pub fn rms_norm(ctx: &Context, x: &Array, w: Option<&Array>, eps: f32) -> Array 
     assert!(threadgroup_size <= d.max_threads_per_threadgroup());
     d.arr(x)
         .arr(w_arr)
-        .arr(&out)
+        .out(&out)
         .bytes(&eps)
         .bytes(&(axis_size as u32))
         .bytes(&w_stride)
@@ -101,7 +101,7 @@ pub fn layer_norm(ctx: &Context, x: &Array, w: &Array, b: &Array, eps: f32) -> A
     d.arr(x)
         .arr(w)
         .arr(b)
-        .arr(&out)
+        .out(&out)
         .bytes(&eps)
         .bytes(&(axis_size as u32))
         .bytes(&(w.strides()[0] as u32))

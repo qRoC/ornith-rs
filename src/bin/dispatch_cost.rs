@@ -18,13 +18,13 @@ fn run(ctx: &Context, n: usize, elems: usize, per_commit: usize) -> (f64, f64) {
     let y = Array::empty(ctx, &[elems], x.dtype);
     let tg = elems.min(1024);
     // Warm the pipeline cache, then let the queue drain.
-    ctx.kernel("sampler_exp_float32").arr(&x).arr(&y).threads((elems, 1, 1), (tg, 1, 1));
+    ctx.kernel("sampler_exp_float32").arr(&x).out(&y).threads((elems, 1, 1), (tg, 1, 1));
     ctx.sync();
     ctx.prof_reset();
 
     let t0 = std::time::Instant::now();
     for i in 0..n {
-        ctx.kernel("sampler_exp_float32").arr(&x).arr(&y).threads((elems, 1, 1), (tg, 1, 1));
+        ctx.kernel("sampler_exp_float32").arr(&x).out(&y).threads((elems, 1, 1), (tg, 1, 1));
         if (i + 1) % per_commit == 0 {
             ctx.flush();
         }

@@ -22,7 +22,7 @@ pub fn searchsorted(ctx: &Context, sorted: &Array, values: &Array, right: bool) 
     let tg = d.max_threads_per_threadgroup().min(out.numel());
     d.arr(sorted)
         .arr(values)
-        .arr(&out)
+        .out(&out)
         .bytes(&n)
         .bytes(&a_stride)
         .threads((out.numel(), 1, 1), (tg, 1, 1));

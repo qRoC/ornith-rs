@@ -177,10 +177,10 @@ pub fn steel_matmul(
     });
     let d = ctx.kernel_with(&name, &consts).arr(a).arr(b);
     let d = match (&c, &addmm_params) {
-        (Some(c), Some(p)) => d.arr(c.c).arr(out).bytes(&params).bytes(p),
+        (Some(c), Some(p)) => d.arr(c.c).out(out).bytes(&params).bytes(p),
         _ => d
             .skip() // buffer 2 is the addmm source `c`
-            .arr(out)
+            .out(out)
             .bytes(&params)
             .skip(), // buffer 5 is GEMMAddMMParams
     };
@@ -284,7 +284,7 @@ pub fn steel_gemm_splitk(
     ctx.kernel(&name)
         .arr(a)
         .arr(b)
-        .arr(&c_split)
+        .out(&c_split)
         .bytes(&params)
         .groups((tn, tm, split_k_partitions), (32, wn, wm));
 
@@ -304,8 +304,10 @@ pub fn steel_gemm_splitk(
     );
     let d = ctx
         .kernel(&name)
+        // `gemm_splitk_accum` takes the partials `const device`: the gemm
+        // above wrote them, this pass sums them into `out`.
         .arr(&c_split)
-        .arr(out)
+        .out(out)
         .bytes(&(split_k_partitions as i32))
         .bytes(&(split_k_partition_stride as i32))
         .bytes(&(n as i32));
@@ -421,7 +423,7 @@ pub fn gemv(
         .arr(mat)
         .arr(vec)
         .skip() // buffer 2 is the axpby source
-        .arr(out)
+        .out(out)
         .bytes(&(in_vector_len as i32))
         .bytes(&(out_vector_len as i32))
         .bytes(&(mat_ld as i32))
@@ -645,7 +647,7 @@ pub fn gather_mv(
         .arr(w)
         .arr(x)
         .skip() // buffer 2 is the axpby bias
-        .arr(&out)
+        .out(&out)
         .bytes(&(k as i32))
         .bytes(&(n as i32))
         .bytes(&(k as i32)) // marix_ld

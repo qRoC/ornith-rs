@@ -47,7 +47,7 @@ pub fn gather_rows(ctx: &Context, table: &Array, ids: &Array, row: usize) -> Arr
     ctx.kernel(name)
         .arr(table)
         .arr(ids)
-        .arr(&out)
+        .out(&out)
         .bytes(&(row as u32))
         .threads((total, 1, 1), (tg, 1, 1));
     out
@@ -82,6 +82,6 @@ pub fn dequantize(
     d.arr(w)
         .arr(scales)
         .arr(biases)
-        .arr(out)
+        .out(out)
         .threads((nthreads, 1, 1), (tg, 1, 1));
 }

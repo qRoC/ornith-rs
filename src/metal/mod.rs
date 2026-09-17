@@ -8,24 +8,24 @@
 //!
 //! Ordering model, in two parts.
 //!
-//! *Inside* an encoder, Metal's default `MTLDispatchTypeSerial` inserts a
-//! barrier between consecutive dispatches, so writes from dispatch N are
-//! visible to dispatch N+1 with no explicit synchronisation, and a recycled
-//! buffer can never be written by a later dispatch while an earlier one still
-//! reads it.
+//! *Inside* an encoder, dispatches are concurrent and ordered by the barriers
+//! [`Hazards`] works out -- mlx's rule, and the reason a dispatch that depends
+//! on nothing before it does not have to wait for it. `MTLDispatchTypeSerial`,
+//! which barriers between every pair, is still one `ORNITH_SERIAL=1` away.
 //!
-//! *Across* encoders the queue is what orders the work, and mlx relies on
-//! exactly that -- its `commit()` starts the next command buffer with no
-//! synchronisation of its own. What mlx does add is a fence per encoder
+//! *Across* encoders the queue orders the command buffers, and mlx relies on
+//! exactly that -- its `commit()` starts the next one with no synchronisation
+//! of its own. What it does add is a fence per encoder
 //! (`CommandEncoder::end_encoding`), waited on by whichever later encoder
-//! reads that encoder's outputs; it needs them because its encoders are
-//! concurrent. This port signals one fence at the end of every encoder and
-//! waits on it in the next, which is the coarse version of the same thing. It
-//! costs nothing measurable and it makes the boundary explicit rather than
-//! inherited from the queue.
+//! reads that encoder's outputs, and it needs them because its encoders are
+//! concurrent. So are these, now, which is what makes the fence here load
+//! bearing rather than belt and braces: every encoder signals one before it
+//! ends and the next waits on it, ordering the boundary whatever the
+//! dependency across it. There are ~14 boundaries in a decode step, so it
+//! costs nothing measurable.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::rc::Rc;
 
@@ -35,8 +35,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice, MTLDispatchType,
-    MTLFence, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice,
+    MTLDispatchType, MTLFence, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::safetensors::Mapping;
@@ -73,6 +73,11 @@ pub struct Buffer {
 impl Buffer {
     pub fn raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.raw
+    }
+
+    /// Identity for hazard tracking: the Metal object's address.
+    fn id(&self) -> usize {
+        buf_id(&self.raw)
     }
 
     /// Host pointer. Valid because every allocation is `StorageModeShared`:
@@ -128,6 +133,11 @@ impl Pool {
     }
 }
 
+/// A Metal buffer's identity: the address of the objc object.
+fn buf_id(raw: &MTLBuf) -> usize {
+    &**raw as *const ProtocolObject<dyn MTLBuffer> as *const () as usize
+}
+
 /// Round an allocation up so similar sizes share a bucket.
 fn bucket(len: usize) -> usize {
     const MIN: usize = 256;
@@ -151,6 +161,9 @@ fn bucket(len: usize) -> usize {
 #[derive(Default)]
 pub struct Prof {
     pub on: bool,
+    /// Barriers actually inserted, i.e. how often the tracking found a real
+    /// dependency. Against the dispatch count it says what the marking bought.
+    pub barriers: usize,
     pub commits: usize,
     pub dispatches: usize,
     /// Summed `GPUEndTime - GPUStartTime` over committed command buffers.
@@ -170,6 +183,55 @@ pub struct Prof {
     /// once the GPU is done with them. Carries the one kernel name when the
     /// buffer holds exactly one dispatch.
     pending: Vec<(CommandBuffer, Option<String>)>,
+}
+
+// --- hazards ----------------------------------------------------------------
+
+/// How the encoder orders one dispatch against the next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BarrierMode {
+    /// mlx's rule: a concurrent encoder, and a barrier only where a dispatch
+    /// touches a buffer an earlier one in the same epoch used the other way.
+    Selective,
+    /// `MTLDispatchTypeSerial`, which barriers between every pair. What this
+    /// port did before the tracking existed; kept as the control to measure
+    /// and to fall back on (`ORNITH_SERIAL=1`).
+    Serial,
+    /// Concurrent with no barriers at all: wrong, and only useful for putting
+    /// a bound on what the barriers cost (`ORNITH_NO_BARRIER=1`).
+    None,
+}
+
+/// A buffer's identity for hazard tracking: the address of the Metal object.
+/// Two views of one allocation share it, and so does a buffer the pool has
+/// handed out again -- both are hazards, and both want the barrier.
+type BufId = usize;
+
+/// Port of the bookkeeping in `mlx`'s `CommandEncoder`
+/// (`set_input_array` / `register_output_array` / `maybeInsertBarrier`).
+///
+/// A barrier splits the encoder into epochs. Within one, dispatches may run in
+/// any order and overlap, so a dispatch needs a barrier before it if it reads
+/// what an earlier dispatch in this epoch wrote (RAW), writes what one read
+/// (WAR), or writes what one wrote (WAW). `prev_*` is what the epoch has seen,
+/// `next_*` what the dispatch now being encoded binds.
+#[derive(Default)]
+struct Hazards {
+    prev_in: HashSet<BufId>,
+    prev_out: HashSet<BufId>,
+    next_in: HashSet<BufId>,
+    next_out: HashSet<BufId>,
+    needs_barrier: bool,
+}
+
+impl Hazards {
+    fn clear(&mut self) {
+        self.prev_in.clear();
+        self.prev_out.clear();
+        self.next_in.clear();
+        self.next_out.clear();
+        self.needs_barrier = false;
+    }
 }
 
 // --- context ----------------------------------------------------------------
@@ -207,7 +269,19 @@ pub struct Context {
     /// end where the GPU starts waiting. `ORNITH_COMMIT_EVERY` overrides it.
     pub max_dispatches_per_commit: usize,
     prof: RefCell<Prof>,
-    no_barrier: bool,
+    barriers: BarrierMode,
+    hazards: RefCell<Hazards>,
+    /// The kernel now being encoded, so a failed hazard check can name it.
+    last_kernel: RefCell<String>,
+    /// Buffers some dispatch has written, or the host filled at allocation.
+    ///
+    /// Reading one that is not in here means an op bound a fresh pooled buffer
+    /// as an input -- which is how a missed `out` shows up: the op that wrote
+    /// the buffer called it an input, so the tracking recorded a read where
+    /// there was a write and will not order the next reader against it. That
+    /// is a race, and a race is not something a golden test can be trusted to
+    /// catch, so it is an assert instead.
+    written: RefCell<HashSet<BufId>>,
 }
 
 impl Context {
@@ -255,7 +329,16 @@ impl Context {
                 on: std::env::var_os("ORNITH_PROF").is_some(),
                 ..Prof::default()
             }),
-            no_barrier: std::env::var_os("ORNITH_NO_BARRIER").is_some(),
+            barriers: if std::env::var_os("ORNITH_NO_BARRIER").is_some() {
+                BarrierMode::None
+            } else if std::env::var_os("ORNITH_SERIAL").is_some() {
+                BarrierMode::Serial
+            } else {
+                BarrierMode::Selective
+            },
+            hazards: RefCell::new(Hazards::default()),
+            written: RefCell::new(HashSet::new()),
+            last_kernel: RefCell::new(String::new()),
         })
     }
 
@@ -281,6 +364,7 @@ impl Context {
     pub fn alloc(&self, nbytes: usize) -> Buffer {
         let len = bucket(nbytes.max(1));
         if let Some(raw) = self.pool.borrow_mut().take(len) {
+            self.written.borrow_mut().remove(&buf_id(&raw));
             return Buffer { raw, len, pool: Some(self.pool.clone()) };
         }
         let raw = self
@@ -303,6 +387,7 @@ impl Context {
             .device
             .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
             .unwrap_or_else(|| panic!("newBufferWithLength({len}) failed"));
+        self.written.borrow_mut().insert(buf_id(&raw));
         Buffer { raw, len, pool: None }
     }
 
@@ -322,6 +407,7 @@ impl Context {
             )
         }
         .expect("newBufferWithBytesNoCopy failed");
+        self.written.borrow_mut().insert(buf_id(&raw));
         Buffer { raw, len: map.map_len, pool: None }
     }
 
@@ -400,16 +486,17 @@ impl Context {
             return e.clone();
         }
         let cb = self.queue.commandBuffer().expect("commandBuffer failed");
-        // `ORNITH_NO_BARRIER=1` is a measurement mode, not an option: a
-        // concurrent encoder with no barriers at all lets every dispatch in a
-        // buffer overlap, which is wrong but puts a ceiling on what removing
-        // the serial encoder's per-dispatch barrier could ever buy.
-        let enc = if self.no_barrier {
-            cb.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-                .expect("computeCommandEncoder failed")
-        } else {
-            cb.computeCommandEncoder().expect("computeCommandEncoder failed")
+        let enc = match self.barriers {
+            BarrierMode::Serial => {
+                cb.computeCommandEncoder().expect("computeCommandEncoder failed")
+            }
+            BarrierMode::Selective | BarrierMode::None => cb
+                .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+                .expect("computeCommandEncoder failed"),
         };
+        // A new encoder is a new epoch: the fence below orders it against
+        // everything the previous one did, so nothing carries over.
+        self.hazards.borrow_mut().clear();
         if let Some(f) = self.last_fence.borrow().as_ref() {
             enc.waitForFence(f);
         }
@@ -440,7 +527,8 @@ impl Context {
         let enc = self.ensure_encoder();
         enc.setComputePipelineState(&pipe);
         self.prof_name(name);
-        return Dispatch { ctx: self, enc, pipe, slot: 0 };
+        self.note_kernel(name);
+        return Dispatch::new(self, enc, pipe);
     }
 
     pub fn kernel_typed<'a>(&'a self, name: &str, consts: &[(usize, FConst)]) -> Dispatch<'a> {
@@ -448,7 +536,8 @@ impl Context {
         let enc = self.ensure_encoder();
         enc.setComputePipelineState(&pipe);
         self.prof_name(name);
-        Dispatch { ctx: self, enc, pipe, slot: 0 }
+        self.note_kernel(name);
+        Dispatch::new(self, enc, pipe)
     }
 
     /// End the current encoder and submit. Does not wait.
@@ -508,7 +597,74 @@ impl Context {
         self.retained.borrow_mut().push(b);
     }
 
+    // --- hazards ------------------------------------------------------------
+
+    /// `set_input_array`: a read of `id` needs a barrier if this epoch has
+    /// already written it.
+    fn note_input(&self, id: BufId) {
+        assert!(
+            self.written.borrow().contains(&id),
+            "{} reads a pooled buffer nothing has written: whichever op writes \
+             it bound it with `arr` instead of `out`",
+            self.last_kernel.borrow()
+        );
+        let mut h = self.hazards.borrow_mut();
+        let raw_after_write = h.prev_out.contains(&id);
+        h.next_in.insert(id);
+        h.needs_barrier |= raw_after_write;
+    }
+
+    /// `register_output_array`: a write also counts as a read (so it picks up
+    /// write-after-write), and needs a barrier if this epoch has read `id`.
+    fn note_output(&self, id: BufId) {
+        self.written.borrow_mut().insert(id);
+        self.note_input(id);
+        let mut h = self.hazards.borrow_mut();
+        let war_after_read = h.prev_in.contains(&id);
+        h.next_out.insert(id);
+        h.needs_barrier |= war_after_read;
+    }
+
+    /// `maybeInsertBarrier`, called once the dispatch's bindings are known and
+    /// before it is encoded. A barrier starts a new epoch, so the dispatch
+    /// that forced it becomes all the epoch has seen.
+    fn maybe_barrier(&self, enc: &ComputeEncoder) {
+        if self.barriers != BarrierMode::Selective {
+            return;
+        }
+        let mut h = self.hazards.borrow_mut();
+        if h.needs_barrier {
+            enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+            {
+                let mut prof = self.prof.borrow_mut();
+                if prof.on {
+                    prof.barriers += 1;
+                }
+            }
+            h.needs_barrier = false;
+            let next_in = std::mem::take(&mut h.next_in);
+            let next_out = std::mem::take(&mut h.next_out);
+            h.prev_in = next_in;
+            h.prev_out = next_out;
+        } else {
+            let next_in = std::mem::take(&mut h.next_in);
+            let next_out = std::mem::take(&mut h.next_out);
+            h.prev_in.extend(next_in);
+            h.prev_out.extend(next_out);
+        }
+    }
+
     // --- profiling ----------------------------------------------------------
+
+    /// Remember the kernel being encoded (for the hazard assert's message).
+    fn note_kernel(&self, name: &str) {
+        if self.barriers != BarrierMode::Selective {
+            return;
+        }
+        let mut k = self.last_kernel.borrow_mut();
+        k.clear();
+        k.push_str(name);
+    }
 
     fn prof_name(&self, name: &str) {
         let mut p = self.prof.borrow_mut();
@@ -552,6 +708,11 @@ impl Context {
         (p.commits, p.dispatches, p.gpu_s, p.wait_s)
     }
 
+    /// Barriers inserted since the last reset.
+    pub fn prof_barriers(&self) -> usize {
+        self.prof.borrow().barriers
+    }
+
     pub fn prof_on(&self) -> bool {
         self.prof.borrow().on
     }
@@ -587,6 +748,7 @@ impl Context {
             return;
         }
         p.commits = 0;
+        p.barriers = 0;
         p.dispatches = 0;
         p.gpu_s = 0.0;
         p.wait_s = 0.0;
@@ -614,11 +776,23 @@ impl Context {
 
 // --- dispatch builder -------------------------------------------------------
 
+/// Bindings a single dispatch can track. No kernel here comes close; the
+/// assert in `bind` says so out loud rather than silently dropping one.
+const MAX_BOUND: usize = 16;
+
 pub struct Dispatch<'a> {
     ctx: &'a Context,
     enc: ComputeEncoder,
     pipe: Pipeline,
     slot: usize,
+    /// The buffers bound so far and whether the kernel writes them, for the
+    /// hazard tracking in [`Context::maybe_barrier`].
+    bound: [(BufId, bool); MAX_BOUND],
+    n_bound: usize,
+    /// Set by the first [`Dispatch::out`]. Until an op says which of its
+    /// bindings it writes, every one of them counts as a write, which forces
+    /// the barrier an unmigrated op used to get from the serial encoder.
+    marked: bool,
 }
 
 impl Drop for Context {
@@ -633,6 +807,18 @@ impl Drop for Context {
 }
 
 impl<'a> Dispatch<'a> {
+    fn new(ctx: &'a Context, enc: ComputeEncoder, pipe: Pipeline) -> Dispatch<'a> {
+        Dispatch {
+            ctx,
+            enc,
+            pipe,
+            slot: 0,
+            bound: [(0, false); MAX_BOUND],
+            n_bound: 0,
+            marked: false,
+        }
+    }
+
     /// Bind a buffer at the next argument index.
     pub fn buf(self, b: &Buffer) -> Self {
         self.buf_off(b, 0)
@@ -640,7 +826,49 @@ impl<'a> Dispatch<'a> {
 
     pub fn buf_off(self, b: &Buffer, offset: usize) -> Self {
         unsafe { self.enc.setBuffer_offset_atIndex(Some(b.raw()), offset, self.slot) };
+        self.bind(b, false)
+    }
+
+    /// Bind the buffer this kernel *writes*. Same as [`Dispatch::buf`] to
+    /// Metal; the difference is that the hazard tracking stops having to
+    /// assume every binding is written.
+    pub fn out_buf(self, b: &Buffer) -> Self {
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(b.raw()), 0, self.slot) };
+        self.bind(b, true)
+    }
+
+    /// [`Dispatch::arr`] for the array the kernel writes.
+    pub fn out(self, a: &crate::array::Array) -> Self {
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(Some(a.buf.raw()), a.offset, self.slot)
+        };
+        self.bind(&a.buf, true)
+    }
+
+    fn bind(mut self, b: &Buffer, is_out: bool) -> Self {
+        if self.ctx.barriers == BarrierMode::Selective {
+            assert!(self.n_bound < MAX_BOUND, "more than {MAX_BOUND} buffers in one dispatch");
+            self.bound[self.n_bound] = (b.id(), is_out);
+            self.n_bound += 1;
+            self.marked |= is_out;
+        }
         Self { slot: self.slot + 1, ..self }
+    }
+
+    /// Hand the bindings to the tracker and let it decide on a barrier. Must
+    /// run before the dispatch is encoded.
+    fn order(&self) {
+        if self.ctx.barriers != BarrierMode::Selective {
+            return;
+        }
+        for &(id, is_out) in &self.bound[..self.n_bound] {
+            if is_out || !self.marked {
+                self.ctx.note_output(id);
+            } else {
+                self.ctx.note_input(id);
+            }
+        }
+        self.ctx.maybe_barrier(&self.enc);
     }
 
     /// Bind an array: its buffer at the array's byte offset. This is how
@@ -685,6 +913,7 @@ impl<'a> Dispatch<'a> {
     /// `dispatchThreadgroups:` -- grid is counted in threadgroups, like
     /// mlx's `dispatch_threadgroups`.
     pub fn groups(self, grid: (usize, usize, usize), tg: (usize, usize, usize)) {
+        self.order();
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: grid.0, height: grid.1, depth: grid.2 },
             MTLSize { width: tg.0, height: tg.1, depth: tg.2 },
@@ -695,6 +924,7 @@ impl<'a> Dispatch<'a> {
     /// `dispatchThreads:` -- grid is counted in threads, like mlx's
     /// `dispatch_threads`, which the JIT `mx.fast.metal_kernel` path uses.
     pub fn threads(self, grid: (usize, usize, usize), tg: (usize, usize, usize)) {
+        self.order();
         self.enc.dispatchThreads_threadsPerThreadgroup(
             MTLSize { width: grid.0, height: grid.1, depth: grid.2 },
             MTLSize { width: tg.0, height: tg.1, depth: tg.2 },

@@ -119,7 +119,7 @@ fn strided_reduce_small(ctx: &Context, input: &Array, out: &Array, args: &mut Co
     // `output_grid_for_col_reduce` collapses every output axis whose stride is
     // below the reduction stride, which for a flat output is all of them.
     let grid = (reduction_stride_blocks.div_ceil(threadgroup_x), 1, 1);
-    args.encode(d.arr(input).arr(out)).groups(grid, (threadgroup_x, threadgroup_y, 1));
+    args.encode(d.arr(input).out(out)).groups(grid, (threadgroup_x, threadgroup_y, 1));
 }
 
 fn strided_reduce_looped(ctx: &Context, input: &Array, out: &Array, args: &mut ColReduceArgs) {
@@ -131,7 +131,7 @@ fn strided_reduce_looped(ctx: &Context, input: &Array, out: &Array, args: &mut C
     let grid = (threadgroup_size * args.reduction_stride.div_ceil(bn), 1, 1);
     let d = ctx.kernel(&name);
     // Note: threads, not threadgroups -- mlx uses dispatch_threads here.
-    args.encode(d.arr(input).arr(out)).threads(grid, (threadgroup_size, 1, 1));
+    args.encode(d.arr(input).out(out)).threads(grid, (threadgroup_size, 1, 1));
 }
 
 fn strided_reduce_2pass(ctx: &Context, input: &Array, out: &Array, args: &mut ColReduceArgs) {
@@ -146,7 +146,7 @@ fn strided_reduce_2pass(ctx: &Context, input: &Array, out: &Array, args: &mut Co
     let name = format!("col_reduce_2pass_1_{bm}_{bn}_reduce_sum{}", type_name(input.dtype));
     let grid = (threadgroup_size * args.reduction_stride.div_ceil(bn), 32, 1);
     let d = ctx.kernel(&name);
-    args.encode(d.arr(input).arr(&intermediate)).threads(grid, (threadgroup_size, 1, 1));
+    args.encode(d.arr(input).out(&intermediate)).threads(grid, (threadgroup_size, 1, 1));
 
     let mut second = ColReduceArgs::for_leading_axis(32, out.numel());
     strided_reduce_small(ctx, &intermediate, out, &mut second);
@@ -163,7 +163,7 @@ fn strided_reduce_longcolumn(ctx: &Context, input: &Array, out: &Array, args: &m
     let threadgroup_x = args.reduction_stride.min(32);
     let threadgroup_y = (d.max_threads_per_threadgroup() / threadgroup_x).min(total_reduction_size);
     let grid = (args.reduction_stride.div_ceil(threadgroup_x), outer_blocks, 1);
-    args.encode(d.arr(input).arr(&intermediate))
+    args.encode(d.arr(input).out(&intermediate))
         .bytes(&(out.numel() as u64))
         .groups(grid, (threadgroup_x, threadgroup_y, 1));
 
@@ -198,7 +198,7 @@ pub fn sum_last_axis(ctx: &Context, input: &Array, out: &Array) {
     // holds here (non_row_reductions == 1), so one thread per output row.
     let tg = n_rows.min(1024);
     d.arr(input)
-        .arr(out)
+        .out(out)
         .bytes(&(row_size as u64))
         .bytes(&1u64) // non_row_reductions
         .bytes_slice(&shape)
@@ -244,7 +244,7 @@ fn strided_reduce_small_rows(
     let d = ctx.kernel(&name);
     let threadgroup_y = 8.min((d.max_threads_per_threadgroup() / threadgroup_x).min(total));
     let grid = (reduction_stride_blocks.div_ceil(threadgroup_x), out_rows, 1);
-    args.encode(d.arr(input).arr(out)).groups(grid, (threadgroup_x, threadgroup_y, 1));
+    args.encode(d.arr(input).out(out)).groups(grid, (threadgroup_x, threadgroup_y, 1));
 }
 
 // --- whole-array reductions --------------------------------------------------
@@ -268,7 +268,7 @@ pub fn all_reduce(ctx: &Context, input: &Array, op: &str) -> Array {
         tg = tg.div_ceil(32) * 32;
         ctx.kernel(&name)
             .arr(input)
-            .arr(&out)
+            .out(&out)
             .bytes(&(in_size as u64))
             .bytes(&(in_size as u64))
             .threads((tg, 1, 1), (tg, 1, 1));
@@ -284,14 +284,14 @@ pub fn all_reduce(ctx: &Context, input: &Array, op: &str) -> Array {
     tg = tg.div_ceil(32) * 32;
     ctx.kernel(&name)
         .arr(input)
-        .arr(&intermediate)
+        .out(&intermediate)
         .bytes(&(in_size as u64))
         .bytes(&(row_size as u64))
         .threads((tg, n_rows, 1), (tg, 1, 1));
 
     ctx.kernel(&name)
         .arr(&intermediate)
-        .arr(&out)
+        .out(&out)
         .bytes(&(n_rows as u64))
         .bytes(&(n_rows as u64))
         .threads((tg_2nd, 1, 1), (tg_2nd, 1, 1));

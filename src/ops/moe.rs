@@ -82,7 +82,7 @@ pub fn argsort_last_axis(ctx: &Context, x: &Array) -> Array {
     let name = format!("carg_block_sort_{}_uint32_bn{bn}_tn{tn}", tname(x.dtype));
     ctx.kernel(&name)
         .arr(x)
-        .arr(&out)
+        .out(&out)
         .bytes(&(n as i32)) // size_sorted_axis
         .bytes(&1i32) // in_stride_sorted_axis
         .bytes(&1i32) // out_stride_sorted_axis
@@ -103,7 +103,7 @@ pub fn top_k(ctx: &Context, gates: &Array, k: usize) -> (Array, Array) {
     let (grid, tg) = flat(rows * k);
     ctx.kernel("slice_tail_uint32")
         .arr(&order)
-        .arr(&inds)
+        .out(&inds)
         .bytes(&(n as u32))
         .bytes(&(k as u32))
         .threads(grid, tg);
@@ -112,7 +112,7 @@ pub fn top_k(ctx: &Context, gates: &Array, k: usize) -> (Array, Array) {
     ctx.kernel(&format!("take_along_last_{}", tname(gates.dtype)))
         .arr(gates)
         .arr(&inds)
-        .arr(&scores)
+        .out(&scores)
         .bytes(&(n as u32))
         .bytes(&(k as u32))
         .threads(grid, tg);
@@ -132,7 +132,7 @@ pub fn normalize_scores(ctx: &Context, scores: &Array) -> Array {
     ctx.kernel(&format!("div_by_row_{}", tname(scores.dtype)))
         .arr(scores)
         .arr(&denom)
-        .arr(&out)
+        .out(&out)
         .bytes(&(k as u32))
         .threads(grid, tg);
     out
@@ -179,14 +179,14 @@ pub fn switch_glu_sorted(
         ctx.kernel(&format!("gather_rows_div_{}", tname(x.dtype)))
             .arr(x)
             .arr(&order)
-            .arr(&xs)
+            .out(&xs)
             .bytes(&(dim as u32))
             .bytes(&(k as u32))
             .threads(grid, tg);
 
         let idx = Array::empty(ctx, &[rows], Dtype::U32);
         let (g2, t2) = flat(rows);
-        ctx.kernel("gather_u32").arr(inds).arr(&order).arr(&idx).threads(g2, t2);
+        ctx.kernel("gather_u32").arr(inds).arr(&order).out(&idx).threads(g2, t2);
         (xs, idx, Some(inv_order))
     } else {
         // Unsorted: each token's row is reused for all k experts, which the
@@ -219,7 +219,7 @@ pub fn switch_glu_sorted(
             ctx.kernel(&format!("unsort_rows_{}", tname(y.dtype)))
                 .arr(&y)
                 .arr(&inv)
-                .arr(&out)
+                .out(&out)
                 .bytes(&(dim as u32))
                 .threads(grid, tg);
             out.reshape(&[tokens, k, dim])
@@ -236,7 +236,7 @@ pub fn unsort_for_test(ctx: &Context, y: &Array, inv: &Array) -> Array {
     ctx.kernel(&format!("unsort_rows_{}", tname(y.dtype)))
         .arr(y)
         .arr(inv)
-        .arr(&out)
+        .out(&out)
         .bytes(&(dim as u32))
         .threads(grid, tg);
     out
@@ -251,7 +251,7 @@ pub fn gather_rows_for_test(ctx: &Context, x: &Array, order: &Array, k: usize) -
     ctx.kernel(&format!("gather_rows_div_{}", tname(x.dtype)))
         .arr(x)
         .arr(order)
-        .arr(&xs)
+        .out(&xs)
         .bytes(&(dim as u32))
         .bytes(&(k as u32))
         .threads(grid, tg);
@@ -272,9 +272,9 @@ fn counting_sort(ctx: &Context, inds: &Array, n_experts: usize) -> (Array, Array
     let counts = Array::empty(ctx, &[n_experts], Dtype::U32);
     ctx.kernel("counting_sort_experts")
         .arr(inds)
-        .arr(&order)
-        .arr(&inv_order)
-        .arr(&counts)
+        .out(&order)
+        .out(&inv_order)
+        .out(&counts)
         .bytes(&(n as u32))
         .bytes(&(n_experts as u32))
         .threads((1, 1, 1), (1, 1, 1));
@@ -344,7 +344,7 @@ fn scale_rows(ctx: &Context, y: &Array, scores: &Array) -> Array {
     ctx.kernel(&format!("mul_by_row_{}", tname(y.dtype)))
         .arr(scores)
         .arr(y)
-        .arr(&out)
+        .out(&out)
         .bytes(&(dim as u32))
         .threads(grid, tg);
     out

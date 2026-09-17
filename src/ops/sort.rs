@@ -67,8 +67,8 @@ pub fn multi_block_argsort(ctx: &Context, x: &Array) -> Array {
 
     ctx.kernel(&format!("sort_mbsort_{t}_uint32_bn{bn}_tn{tn}"))
         .arr(x)
-        .arr(&vals0)
-        .arr(&idxs0)
+        .out(&vals0)
+        .out(&idxs0)
         .bytes(&(n as i32))
         .bytes(&1i32) // stride_sorted_axis
         .bytes(&1i32) // nc_dim
@@ -90,7 +90,7 @@ pub fn multi_block_argsort(ctx: &Context, x: &Array) -> Array {
         ping = !ping;
 
         ctx.kernel(&format!("partition_mbsort_{t}_uint32_bn{bn}_tn{tn}"))
-            .arr(&partitions)
+            .out(&partitions)
             .arr(vin)
             .arr(iin)
             .bytes(&(n as i32))
@@ -99,11 +99,13 @@ pub fn multi_block_argsort(ctx: &Context, x: &Array) -> Array {
             .groups((1, n_rows, 1), (n_thr_per_group, 1, 1));
 
         ctx.kernel(&format!("merge_mbsort_{t}_uint32_bn{bn}_tn{tn}"))
+            // `mb_block_merge` takes the partitions `const device`: the
+            // partition kernel above wrote them, this one only reads them.
             .arr(&partitions)
             .arr(vin)
             .arr(iin)
-            .arr(vout)
-            .arr(iout)
+            .out(vout)
+            .out(iout)
             .bytes(&(n as i32))
             .bytes(&(merge_tiles as i32))
             .bytes(&(n_blocks as i32))
@@ -119,7 +121,7 @@ pub fn multi_block_argsort(ctx: &Context, x: &Array) -> Array {
     let total = out.numel();
     ctx.kernel("sampler_copy_uint32")
         .arr(out_idxs)
-        .arr(&out)
+        .out(&out)
         .threads((total, 1, 1), (1024.min(total), 1, 1));
     out
 }

@@ -95,7 +95,7 @@ fn compact_cache(ctx: &Context, x: &Array, capacity: usize) -> Array {
     };
     ctx.kernel(&format!("cache_copy_{tname}"))
         .arr(x)
-        .arr(&out)
+        .out(&out)
         .bytes(&(capacity as u32))
         .bytes(&(used as u32))
         .bytes(&(used as u32))
@@ -175,7 +175,7 @@ fn sdpa_fused_vector_strided(
             .arr(q)
             .arr(k)
             .arr(v)
-            .arr(&out)
+            .out(&out)
             .bytes(&(gqa_factor as i32))
             .bytes(&(n as i32))
             .bytes(&k_head_stride)
@@ -203,9 +203,9 @@ fn sdpa_fused_vector_strided(
         .arr(q)
         .arr(k)
         .arr(v)
-        .arr(&partials)
-        .arr(&sums)
-        .arr(&maxs)
+        .out(&partials)
+        .out(&sums)
+        .out(&maxs)
         .skip() // buffer 6 is unused
         .bytes(&(n as i32))
         .bytes(&k_head_stride)
@@ -216,11 +216,13 @@ fn sdpa_fused_vector_strided(
         .groups((hkv, b, blocks), (32, gqa_factor, l));
 
     let name2 = format!("sdpa_vector_2pass_2_{tname}_{vd}");
+    // Pass 2 reduces what pass 1 wrote: `partials`, `sums` and `maxs` are all
+    // `const device` here, and only `out` is written.
     ctx.kernel(&name2)
         .arr(&partials)
         .arr(&sums)
         .arr(&maxs)
-        .arr(&out)
+        .out(&out)
         .bytes(&(blocks as i32))
         .groups((b * hq, l, 1), (1024, 1, 1));
     out
@@ -370,7 +372,7 @@ pub fn steel_attention(ctx: &Context, q: &Array, k: &Array, v: &Array, scale: f3
         .arr(q)
         .arr(k)
         .arr(v)
-        .arr(&out)
+        .out(&out)
         .bytes(&params)
         .groups((nq, h, b), (32, wm, wn));
     out

@@ -54,7 +54,7 @@ pub fn rope(ctx: &Context, x: &Array, dims: usize, base: f32, scale: f32, offset
         let group = block_dims(dim0, dim1, 1);
         ctx.kernel_with(&name, &consts)
             .arr(src)
-            .arr(&out)
+            .out(&out)
             .bytes(&(offset as i32))
             .bytes(&scale)
             .bytes(&out_strides[0])
@@ -74,7 +74,7 @@ pub fn rope(ctx: &Context, x: &Array, dims: usize, base: f32, scale: f32, offset
         let group = block_dims(dim0, dim1, dim2);
         ctx.kernel_with(&name, &consts)
             .arr(src)
-            .arr(&out)
+            .out(&out)
             .arr(&offsets)
             .bytes(&scale)
             .bytes_slice(&strides)

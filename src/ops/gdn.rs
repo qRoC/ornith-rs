@@ -20,7 +20,7 @@ pub fn concat_time(ctx: &Context, head: &Array, tail: &Array) -> Array {
     ctx.kernel(&format!("concat_time_{}", tname(head.dtype)))
         .arr(head)
         .arr(tail)
-        .arr(&out)
+        .out(&out)
         .bytes(&(ht as u32))
         .bytes(&(tt as u32))
         .bytes(&(dim as u32))
@@ -49,7 +49,7 @@ pub fn depthwise_conv1d(ctx: &Context, x: &Array, w: &Array) -> Array {
     ctx.kernel(&format!("depthwise_conv_1d_{}", tname(x.dtype)))
         .arr(x)
         .arr(w)
-        .arr(&out)
+        .out(&out)
         .bytes_slice(&s32)
         .bytes(&(k as i32))
         .threads((d, t_out, b), group);
@@ -68,7 +68,7 @@ pub fn compute_g(ctx: &Context, a_log: &Array, a: &Array, dt_bias: &Array) -> Ar
         .arr(a_log)
         .arr(a)
         .arr(dt_bias)
-        .arr(&out)
+        .out(&out)
         .bytes(&(n_heads as u32))
         .threads((n, 1, 1), (tg, 1, 1));
     out
@@ -81,7 +81,7 @@ pub fn beta(ctx: &Context, b: &Array) -> Array {
     let tg = 256.min(n.next_power_of_two()).max(1);
     ctx.kernel(&format!("gdn_beta_{}", tname(b.dtype)))
         .arr(b)
-        .arr(&out)
+        .out(&out)
         .threads((n, 1, 1), (tg, 1, 1));
     out
 }
@@ -182,8 +182,8 @@ fn gated_delta_impl(
             .arr(beta)
             .arr(state)
             .bytes(&(t as i32))
-            .arr(&y)
-            .arr(&state_out)
+            .out(&y)
+            .out(&state_out)
             .threads((32, dv / 8, b * hv), (32, 2, 1));
     } else if let Some(mask) = mask {
         let name = format!("gated_delta_mask_{shape_suffix}");
@@ -196,8 +196,8 @@ fn gated_delta_impl(
             .arr(state)
             .bytes(&(t as i32))
             .arr(mask)
-            .arr(&y)
-            .arr(&state_out)
+            .out(&y)
+            .out(&state_out)
             .threads((32, dv, b * hv), (32, 4, 1));
     } else {
         let name = format!("gated_delta_{shape_suffix}");
@@ -209,8 +209,8 @@ fn gated_delta_impl(
             .arr(beta)
             .arr(state)
             .bytes(&(t as i32))
-            .arr(&y)
-            .arr(&state_out)
+            .out(&y)
+            .out(&state_out)
             .threads((32, dv, b * hv), (32, 4, 1));
     }
     (y, state_out)

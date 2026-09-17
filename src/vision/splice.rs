@@ -126,7 +126,9 @@ pub fn spliced_chunk_embeddings(
             d => panic!("no splice for {}", d.name()),
         }
     ))
-    .arr(&embedded)
+    // `splice_rows` takes the embedding buffer as `device T* flat` and writes
+    // the tower's rows into it in place.
+    .out(&embedded)
     .arr(&rows)
     .arr(&pos)
     .bytes(&(dims as u32))

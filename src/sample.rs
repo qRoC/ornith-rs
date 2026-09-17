@@ -61,7 +61,7 @@ fn weak_bf16(v: f64) -> u16 {
 fn unary(ctx: &Context, kernel: &str, x: &Array, out_dtype: Dtype) -> Array {
     let out = Array::empty(ctx, &x.shape, out_dtype);
     let (g, t) = flat(x.numel());
-    ctx.kernel(&format!("{kernel}_{}", tname(x.dtype))).arr(x).arr(&out).threads(g, t);
+    ctx.kernel(&format!("{kernel}_{}", tname(x.dtype))).arr(x).out(&out).threads(g, t);
     out
 }
 
@@ -69,7 +69,7 @@ fn filled(ctx: &Context, shape: &[usize], dtype: Dtype, bits: &[u8]) -> Array {
     let out = Array::empty(ctx, shape, dtype);
     let (g, t) = flat(out.numel());
     ctx.kernel(&format!("sampler_fill_{}", tname(dtype)))
-        .arr(&out)
+        .out(&out)
         .bytes_slice(bits)
         .threads(g, t);
     out
@@ -89,7 +89,7 @@ pub fn apply_top_p(ctx: &Context, logprobs: &Array, top_p: f64) -> Array {
     let (g, t) = flat(n);
     ctx.kernel(&format!("sampler_greater_scalar_{}", tname(logprobs.dtype)))
         .arr(&cumulative)
-        .arr(&sorted_keep)
+        .out(&sorted_keep)
         .bytes(&thresh)
         .threads(g, t);
 
@@ -103,7 +103,7 @@ pub fn apply_top_p(ctx: &Context, logprobs: &Array, top_p: f64) -> Array {
     ctx.kernel(&format!("sampler_select_scalar_{}", tname(logprobs.dtype)))
         .arr(&keep)
         .arr(logprobs)
-        .arr(&out)
+        .out(&out)
         .bytes(&neg_inf)
         .threads(g, t);
     out
@@ -146,7 +146,7 @@ pub fn categorical_sampling(
     let (g, t) = flat(n);
     ctx.kernel(&format!("sampler_mul_scalar_{}", tname(logits.dtype)))
         .arr(logits)
-        .arr(&scaled)
+        .out(&scaled)
         .bytes(&scale)
         .threads(g, t);
 
@@ -155,7 +155,7 @@ pub fn categorical_sampling(
     let m = all_reduce(ctx, &x, "max");
 
     let w = Array::empty(ctx, &[n], Dtype::F32);
-    ctx.kernel("sampler_cdf_weights").arr(&x).arr(&m).arr(&w).threads(g, t);
+    ctx.kernel("sampler_cdf_weights").arr(&x).arr(&m).out(&w).threads(g, t);
 
     let cdf = cumsum_last_axis(ctx, &w, false);
     let total = all_reduce(ctx, &w, "sum");
@@ -171,14 +171,14 @@ pub fn categorical_sampling(
     ctx.kernel("sampler_uniform_scaled")
         .arr(&raw)
         .arr(&total)
-        .arr(&u)
+        .out(&u)
         .bytes(&maxval)
         .bytes(&upper)
         .threads((1, 1, 1), (1, 1, 1));
 
     let idx = searchsorted(ctx, &cdf, &u, true);
     let out = Array::empty(ctx, &[1], Dtype::U32);
-    ctx.kernel("sampler_minus_one").arr(&idx).arr(&out).threads((1, 1, 1), (1, 1, 1));
+    ctx.kernel("sampler_minus_one").arr(&idx).out(&out).threads((1, 1, 1), (1, 1, 1));
     out
 }
 
@@ -232,7 +232,7 @@ pub fn uniform_for_test(ctx: &Context, raw: &Array) -> Array {
     ctx.kernel("sampler_uniform_scaled")
         .arr(raw)
         .arr(&one)
-        .arr(&u)
+        .out(&u)
         .bytes(&(u32::MAX as f32))
         .bytes(&f32::from_bits(0x3f7f_ffff))
         .threads((raw.numel(), 1, 1), (1, 1, 1));

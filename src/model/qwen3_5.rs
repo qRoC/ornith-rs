@@ -580,7 +580,7 @@ pub fn slice_time(ctx: &Context, x: &Array, start: usize, n: usize) -> Array {
     // One row per (batch, time): take the last n of t.
     ctx.kernel(&format!("slice_inner_{tname}"))
         .arr(x)
-        .arr(&out)
+        .out(&out)
         .bytes(&((t * d) as u32))
         .bytes(&((n * d) as u32))
         .bytes(&((start * d) as u32))

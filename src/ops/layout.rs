@@ -45,7 +45,7 @@ pub fn slice_inner(ctx: &Context, x: &Array, start: usize, len: usize) -> Array 
     let (grid, tg) = flat(out.numel());
     ctx.kernel(&format!("slice_inner_{}", tname(x.dtype)))
         .arr(x)
-        .arr(&out)
+        .out(&out)
         .bytes(&(row as u32))
         .bytes(&(len as u32))
         .bytes(&(start as u32))
@@ -64,7 +64,7 @@ pub fn transpose_lh(ctx: &Context, x: &Array) -> Array {
     let (grid, tg) = flat(out.numel());
     ctx.kernel(&format!("transpose_lh_{}", tname(x.dtype)))
         .arr(x)
-        .arr(&out)
+        .out(&out)
         .bytes(&(l as u32))
         .bytes(&(h as u32))
         .bytes(&(d as u32))
@@ -82,7 +82,7 @@ pub fn transpose_hl(ctx: &Context, x: &Array) -> Array {
     let (grid, tg) = flat(out.numel());
     ctx.kernel(&format!("transpose_hl_{}", tname(x.dtype)))
         .arr(x)
-        .arr(&out)
+        .out(&out)
         .bytes(&(l as u32))
         .bytes(&(h as u32))
         .bytes(&(d as u32))
@@ -102,7 +102,7 @@ pub fn concat_inner(ctx: &Context, a: &Array, b: &Array) -> Array {
     ctx.kernel(&format!("concat_inner_{}", tname(a.dtype)))
         .arr(a)
         .arr(b)
-        .arr(&out)
+        .out(&out)
         .bytes(&(ar as u32))
         .bytes(&(br as u32))
         .threads(grid, tg);

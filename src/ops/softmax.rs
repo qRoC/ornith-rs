@@ -44,7 +44,7 @@ pub fn softmax(ctx: &Context, x: &Array, precise: bool) -> Array {
     };
     assert!(threadgroup_size <= d.max_threads_per_threadgroup());
     d.arr(x)
-        .arr(&out)
+        .out(&out)
         .bytes(&(axis_size as i32))
         .threads((n_rows * threadgroup_size, 1, 1), (threadgroup_size, 1, 1));
     out

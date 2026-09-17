@@ -46,7 +46,7 @@ pub fn cumsum_last_axis(ctx: &Context, x: &Array, inclusive: bool) -> Array {
     // `get_2d_grid_dims(in.shape(), in.strides(), divisor=size)` collapses to
     // the row count for a row-contiguous input.
     d.arr(x)
-        .arr(&out)
+        .out(&out)
         .bytes(&(axis_size as u64))
         .threads((tg, n_rows, 1), (tg, 1, 1));
     out

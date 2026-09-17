@@ -33,7 +33,7 @@ pub fn bits(ctx: &Context, keys: &Array, shape: &[usize]) -> Array {
     let grid = (num_keys, half_size + usize::from(odd), 1);
     ctx.kernel("rbitsc")
         .arr(keys)
-        .arr(&out)
+        .out(&out)
         .bytes(&odd)
         .bytes(&(bytes_per_key as u64))
         .threads(grid, super::indexing::block_dims(grid.0, grid.1, 1));

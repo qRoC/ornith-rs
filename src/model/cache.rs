@@ -191,7 +191,7 @@ pub fn zero(ctx: &Context, a: &Array) {
         Dtype::U32 => "fill_zero_uint32",
         d => panic!("no fill kernel for {}", d.name()),
     };
-    ctx.kernel(name).arr(a).threads((n, 1, 1), (tg, 1, 1));
+    ctx.kernel(name).out(a).threads((n, 1, 1), (tg, 1, 1));
 }
 
 /// Copy `[B, H, used, D]` out of a `[B, H, src_cap, D]` buffer into the front
@@ -205,7 +205,7 @@ fn copy_seq(ctx: &Context, src: &Array, dst: &Array, src_cap: usize, dst_cap: us
     let tg = 256.min(n.next_power_of_two()).max(1);
     ctx.kernel(&format!("cache_copy_{}", tname(src.dtype)))
         .arr(src)
-        .arr(dst)
+        .out(dst)
         .bytes(&(src_cap as u32))
         .bytes(&(dst_cap as u32))
         .bytes(&(used as u32))
@@ -221,7 +221,7 @@ fn write_seq(ctx: &Context, src: &Array, dst: &Array, dst_cap: usize, offset: us
     let tg = 256.min(n.next_power_of_two()).max(1);
     ctx.kernel(&format!("cache_copy_{}", tname(src.dtype)))
         .arr(src)
-        .arr(dst)
+        .out(dst)
         .bytes(&(l as u32))
         .bytes(&(dst_cap as u32))
         .bytes(&(l as u32))
