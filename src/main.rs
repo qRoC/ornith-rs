@@ -277,6 +277,16 @@ fn report_gaps(ctx: &Context, n: f64, gen_time: f64) {
         100.0 * gap / gen_time.max(1e-9),
         after_sync * 1e3 / n,
     );
+    let (wake, wakes) = ctx.prof_wake();
+    if wakes > 0 {
+        eprintln!(
+            "  {:>7.3} ms  x{:<6.1} of it waiting for a core, not for the GPU \
+             ({:.0} us a round trip)",
+            wake * 1e3 / n,
+            wakes as f64 / n,
+            wake * 1e6 / wakes as f64,
+        );
+    }
     for (k, s, times) in ctx.prof_gap_by_kernel().iter().take(8) {
         eprintln!(
             "  {:>7.3} ms  x{:<6.1} waiting to be handed {}",

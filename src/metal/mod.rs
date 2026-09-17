@@ -41,6 +41,28 @@ use objc2_metal::{
 
 use crate::safetensors::Mapping;
 
+/// Host time in seconds, on the clock `MTLCommandBuffer` reports
+/// `GPUStartTime` and `GPUEndTime` on -- `mach_absolute_time` scaled by the
+/// timebase, which is what `CACurrentMediaTime` is. Comparing the two says how
+/// long after the GPU finished the CPU actually got to run again, which is not
+/// something either side's own timers can see.
+fn host_seconds() -> f64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let mut tb = Timebase::default();
+    unsafe { mach_timebase_info(&mut tb) };
+    let ns = unsafe { mach_absolute_time() } as f64 * tb.numer as f64 / tb.denom as f64;
+    ns * 1e-9
+}
+
 /// The metallib built by `build.rs` from `kernels/`.
 static METALLIB: &[u8] = include_bytes!(env!("ORNITH_METALLIB"));
 
@@ -228,6 +250,12 @@ pub struct Prof {
     sync_pending: bool,
     /// Time blocked in `waitUntilCompleted`.
     pub wait_s: f64,
+    /// Summed time between the GPU finishing the buffer that was waited on and
+    /// `waitUntilCompleted` returning -- the CPU waiting for a core, not for
+    /// the GPU. On a machine with other work on it this is the one part of a
+    /// round trip that is nobody's fault but the scheduler's.
+    pub wake_s: f64,
+    pub wakes: usize,
     pub by_kernel: HashMap<String, usize>,
     /// GPU seconds per kernel. Only filled when a command buffer holds a
     /// single dispatch (`ORNITH_COMMIT_EVERY=1`), since a buffer's timestamps
@@ -787,7 +815,14 @@ impl Context {
             let t0 = self.prof.borrow().on.then(std::time::Instant::now);
             cb.waitUntilCompleted();
             if let Some(t0) = t0 {
-                self.prof.borrow_mut().wait_s += t0.elapsed().as_secs_f64();
+                let resume = host_seconds();
+                let end = cb.GPUEndTime();
+                let mut p = self.prof.borrow_mut();
+                p.wait_s += t0.elapsed().as_secs_f64();
+                if end > 0.0 && resume > end {
+                    p.wake_s += resume - end;
+                    p.wakes += 1;
+                }
             }
         }
         // The queue is serial, so everything committed before that buffer has
@@ -994,6 +1029,12 @@ impl Context {
         self.prof.borrow().syncs
     }
 
+    /// `(seconds between the GPU finishing and the CPU resuming, how often)`.
+    pub fn prof_wake(&self) -> (f64, usize) {
+        let p = self.prof.borrow();
+        (p.wake_s, p.wakes)
+    }
+
     /// `(total idle between command buffers, of which after a round trip)`.
     pub fn prof_gaps(&self) -> (f64, f64) {
         let p = self.prof.borrow();
@@ -1118,6 +1159,8 @@ impl Context {
         p.dispatches = 0;
         p.gpu_s = 0.0;
         p.wait_s = 0.0;
+        p.wake_s = 0.0;
+        p.wakes = 0;
         p.gap_s = 0.0;
         p.gap_after_sync_s = 0.0;
         p.gap_by_kernel.clear();
