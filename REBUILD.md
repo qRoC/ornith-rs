@@ -358,15 +358,58 @@ One variant at a time; see the disk note below. For each: build, regenerate
 refs, run the suite, then measure perplexity, bytes a token, and GPU busy a
 token.
 
-| # | recipe change | what it answers |
-|---|---|---|
-| A | none (Phase 2) | control |
-| B | `body_mode: "mxfp4"`, `body_group_size: 32` | does MXFP4 match affine int4 at 4 bits? 5.00 -> 4.25 bits a weight |
-| C | B, plus moving the 260 q8 overrides to 4-bit mxfp4 | **the actual prize**: does a better 4-bit format hold where affine int4 did not? ~35% of traffic |
-| D | `nvfp4` group 16, if C is close but not close enough | 4.50 bits, a finer grid |
+**Not all 260 modules, and probably not mxfp4.** Two things, worked out from
+`baseline/config.json` and the architecture, reshape the obvious plan.
 
-C is the one worth doing all of this for. B is the step that proves the format
-works at all before betting the 8-bit half on it.
+*Where the bytes are.* The 260 are not uniform. Per token, at 8.5 bits a
+weight:
+
+| family | count | MB/token | of all traffic |
+|---|---|---|---|
+| `lm_head` | 1 | 540 | 19.1% |
+| `linear_attn.in_proj_qkv` | 30 | 535 | 18.9% |
+| `linear_attn.in_proj_z` | 30 | 267 | 9.4% |
+| `linear_attn.out_proj` | 30 | 267 | 9.4% |
+| `switch_mlp.*`, top-8 read | 8 | 214 | 7.6% |
+| `self_attn.q_proj` + `o_proj` | 10 | 178 | 6.2% |
+| `shared_expert.*` | 8 | 27 | 0.9% |
+| **`mlp.gate` (the router)** | **40** | **22** | **0.8%** |
+| `self_attn.k_proj` + `v_proj` | 10 | 22 | 0.8% |
+| `shared_expert_gate`, `embed_tokens` | 41 | ~0 | 0.0% |
+
+Four families are **57% of everything a decode step reads**. The 80 gate
+modules -- the router and the shared-expert gate, which decide *which* experts
+run and are the most quality-critical thing in a MoE -- are 0.8%. Requantizing
+them is all risk and no reward, and the first version of this plan would have
+done it, because it moved all 260 at once.
+
+*Why mxfp4 is the wrong first choice.* Against affine int4 g32 it trades a
+bf16 scale **and a zero-point** for a power-of-two-only E8M0 scale and **no
+zero-point**, to save 0.75 bits. A power-of-two scale wastes up to 2x of a
+group's dynamic range and the missing zero-point hurts asymmetric
+distributions; against that it offers a non-uniform grid, which does suit
+weights. The expected net for weights is **slightly worse than affine int4**,
+which is why nvfp4 exists. So asking mxfp4 to succeed where affine int4
+already failed -- which is why these 260 are at 8 bits -- is betting against
+the odds.
+
+**nvfp4 costs almost nothing over mxfp4 here.** On those four families:
+8.5 bits -> 4.50 saves 26.8% of all traffic, 8.5 -> 4.25 saves 28.4%. One and
+a half points apart, for a real E4M3 scale instead of a power of two and a
+group of 16 instead of 32. Start there.
+
+| # | change | what it answers | bytes |
+|---|---|---|---|
+| A | none (Phase 2) | control -- reproduces what we had | -- |
+| B | the four byte-heavy families to **nvfp4** | **the prize**: does a 4-bit format with a real scale hold where affine int4 did not? | -26.8% |
+| C | B at **mxfp4** instead | is the coarser scale good enough to be worth 1.6 points more? | -28.4% |
+| D | extend B to `switch_mlp` and `q/o_proj` | another 13.8% of traffic, on shapes that are read less densely | -34% |
+| -- | the 80 gate modules, `embed_tokens` | **never**: 0.8% of bytes, the highest sensitivity in the model | -- |
+| E | the 4-bit body affine -> mxfp4 | saves 0.6% overall and likely loses a little quality. A control for the format, not a goal | -0.6% |
+
+B is the experiment. E is the one to run only if B's result needs explaining,
+and it is listed to be argued with rather than assumed: the first version of
+this plan had it as step one.
 
 **Judge each variant on three numbers, in this order.** Perplexity against
 `baseline/`'s 6.3327 is the coarse gate. The KL against `baseline/logprobs.bin`
