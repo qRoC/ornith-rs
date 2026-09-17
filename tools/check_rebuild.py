@@ -55,6 +55,19 @@ def main():
     art = pathlib.Path(sys.argv[1]).expanduser()
     if not art.is_dir():
         sys.exit(f"not a directory: {art}")
+    # Pointed at the bf16 parent instead of a rebuilt artifact, every check
+    # below fails for the right reasons and reads like a disaster. The parent
+    # has no quantization block, its `conv1d.weight` is still the torch
+    # `[D, 1, K]` that conversion transposes, and its config has no
+    # `rope_parameters` for mlx to have normalised yet.
+    cfg_probe = json.loads((art / "config.json").read_text())
+    if not cfg_probe.get("quantization"):
+        sys.exit(
+            f"{art} has no quantization block, so it is the bf16 parent and not a\n"
+            "rebuilt artifact. Nothing here applies to it: conv1d.weight is still\n"
+            "[D, 1, K] until conversion transposes it, and rope_parameters does not\n"
+            "exist until mlx writes it. Point this at the forge output."
+        )
     print(f"rebuilt artifact: {art}\nbaseline:         {BASE}\n")
 
     # --- the parent's tensors survived the conversion ---
@@ -83,7 +96,7 @@ def main():
         check("INVARIANT", "conv1d.weight is [D, K, 1] (blind)",
               len(shape) == 3 and shape[2] == 1, f"{conv} {shape}")
 
-    cfg = json.loads((art / "config.json").read_text())
+    cfg = cfg_probe
     tc = cfg.get("text_config", cfg)
     rope = (tc.get("rope_parameters") or {}).get("type")
     check("INVARIANT", "rope_parameters.type is default (blind)",

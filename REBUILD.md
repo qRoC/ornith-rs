@@ -256,11 +256,19 @@ Then check it:
 That script encodes every condition found while writing this plan, split into
 INVARIANT (must hold for any rebuild, including the two the golden tests are
 blind to) and RECIPE (must hold in Phase 2, expected to break in Phase 4).
-**It has never been run against a real artifact** -- the old one was deleted
-before it was written -- so its first failure is as likely to be the script as
-the rebuild. The inventory half can be sanity-checked against the parent
-itself as soon as the pull lands, since those six counts came from the
-parent's own index.
+Its inventory half was verified against the parent once the pull landed: all
+six counts pass (1811 / 785 / 333 / 30 / 30 / 30), so the download is complete
+and that half of the script works. The rest has still never run against a real
+rebuilt artifact, so treat a first failure there as possibly the script's.
+
+Pointing it at the **parent** is a category error and it now refuses, because
+everything else fails for the right reasons and reads like a disaster: the
+parent's `conv1d.weight` is still the torch `[8192, 1, 4]` that conversion
+transposes into `[D, K, 1]`, and its config has no `rope_parameters` at all
+until mlx writes one. Both differences are conversion doing its job -- and
+they confirm from the other side that the sanitisation this port depends on
+happens during the forge, which is exactly why it has to be re-checked on the
+output.
 
 Compare per-file sha256 against `.mtplx-source.json`.
 
