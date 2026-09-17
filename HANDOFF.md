@@ -90,8 +90,8 @@ run on macOS 27.0.
 
 **The inversion to remember.** "A memory-footprint feature, not a performance
 feature" is a verdict from compute-bound GEMM. A decode step here is the
-opposite: 96% GPU busy, waiting on 2.83 GB of weight reads at ~250 GB/s of a
-possible 546. Halving operand bytes for 6% of the arithmetic is, at batch 1,
+opposite: 95-96% GPU busy, waiting on 2.83 GB of weight reads at ~272 GB/s of
+a possible 546. Halving operand bytes for 6% of the arithmetic is, at batch 1,
 close to a win proportional to the bytes saved. Footprint *is* performance
 here, which is exactly why the paper's dismissal does not transfer.
 
@@ -194,7 +194,7 @@ Any size is fine -- `smart_resize` and Pillow's bicubic resampler are both
 ported, so the picture is resized exactly as MTPLX would have resized it.
 
 Loading is ~16 s warm (mmap + per-tensor copy into Metal buffers), ~70 s cold.
-Decode runs at ~79 tok/s, greedy and sampled alike -- the sampler's two
+Decode runs at ~92 tok/s, greedy and sampled alike -- the sampler's two
 248320-wide argsorts cost about a percent, which is well inside the noise.
 
 ---
@@ -735,16 +735,43 @@ what pins them token for token, on identical ids.)
 
 | | |
 |---|---|
-| ornith, before the barrier work below | 82 tok/s, 12.2 ms/token |
-| ornith, now | 88 tok/s, 11.3 ms/token |
-| `mlx_lm.generate`, same prompt text | 88 tok/s, 11.4 ms/token |
-| GPU busy | 11.8 ms of the 12.2 -- 97%, so the step is not waiting on the CPU |
+**Read the GPU column.** Wall figures below are the best of five interleaved
+runs and still move with what else the machine is doing; GPU busy holds to 2%
+under any load and is the number to compare against.
+
+| | wall tok/s | GPU busy ms/token |
+|---|---|---|
+| ornith, before the barrier work below | 82 | -- |
+| ornith at the 1:1 commit, `261fe0c` | 88 | 11.3 |
+| **ornith now** | **92** | **10.3-10.5** |
+| ornith `--mtp-depth 1 --frspec` | 94 at best, and it swings | **9.0** |
+| `mlx_lm.generate`, same prompt text | 86 | -- |
+
+So the port is now ahead of the reference it was written against rather than
+level with it, by the two changes mlx does not have: the MoE block issued
+interleaved and the buffer pool declining to recycle inside a barrier epoch.
+And the speculative pairing does 14% less GPU work a token than plain decoding
+while only tying on the wall, for the reason in "It does not pay off here".
+
+| a decode step, now | |
+|---|---|
+| GPU busy | 10.3-10.5 ms of a 10.85-11.34 ms wall -- 95-96% |
+| idle between command buffers | 0.47-0.56 ms a token, essentially one round trip |
 | dispatches | 1669 per token, in 14 command buffers (1759 before single-row slices became views) |
-| weights read | ~2.83 GB per token, i.e. 232 GB/s against this machine's 546 |
+| barriers | 1064 per token (1216 at the 1:1 commit, 1669 before the barrier work) |
+| epochs | 1078 per token, 1.55 dispatches each |
+| host round trips | 1.00 per token |
+| weights read | ~2.83 GB per token, i.e. **272 GB/s** against a measured ceiling of 465 and a sticker of 546 |
+
+| the prompt, at chunk 2048 | |
+|---|---|
+| GPU busy | 2.05-2.34 s for 2600 tokens -- ~1230 tokens a second of GPU work |
+| wall | 380-614 tok/s, i.e. 33-49% busy, the rest lost to memory pressure |
+| `mlx_lm.generate`, same prompt | 809 tok/s |
 
 So the step is GPU-bound, and the earlier guess -- that the per-step `sync` and
 the ~800 dispatches were the problem -- was wrong on both counts: the sync
-costs nothing measurable (the GPU is busy 97% of the wall) and there are twice
+costs nothing measurable (the GPU is busy 95-96% of the wall) and there are twice
 as many dispatches as that.
 
 What the dispatch count costs is the barrier between each pair.
@@ -950,7 +977,7 @@ artifact -- and it would have fixed something that is not broken.
 540 MB gets 21% on 17.8 MB and 11% on 8.9 MB: a short kernel never gets enough
 requests in flight to saturate the memory system, pays its ramp, and stops. A
 decode step is a few hundred small reads and one big one, which is exactly why
-it averages ~250 GB/s.
+it averages ~272 GB/s.
 
 **And the same fact says a verify window is nearly free.** The matmuls again,
 across the M a speculative window of `depth + 1` tokens produces, as a multiple
@@ -1081,7 +1108,8 @@ Three things fall out of it.
   | best order, no recycling | 947 | 7.38 ms, **-17%** |
 
   So a perfect encode order is worth ~12%, ~17% with the pool change, and that
-  is the whole of what scheduling has left -- 88 tok/s becomes about 100.
+  is the whole of what scheduling has left. Half of it is now banked (the MoE
+  block below), so what remains is ~3.4%: 92 tok/s would become about 95.
 
 **The model is calibrated on the one experiment that has an answer.** Feed it
 the router-tail fusion from the section below -- merge those five dispatches
@@ -1224,14 +1252,16 @@ kernels changes that.
 
 In order:
 
-1. **Every wall-clock number above again, on a quiet machine.** They were
-   all measured with other work on the machine, and a run of one binary
-   varies by 82% there, so they are the shape of the answer and not the
-   answer. This is now much less urgent than it reads: GPU busy holds to 2%
-   under any load (see "Where a decode step goes"), so anything being changed
-   on the GPU's side can be measured today and only the wall clock has to
-   wait.
-2. **Close the gap from 250 GB/s to the 465 the machine can give.** The
+1. **A machine that is not swapping.** This is first because it is what the
+   next two are waiting on, and it is not something the code can fix. Every
+   GPU-side number in this document is now current and trustworthy -- they
+   were all re-measured, and GPU busy holds to 2% under any load. Every
+   wall-clock number is not: the same binary has come out 82% apart on the
+   wall while its GPU busy did not move, and the swing tracks the swap file,
+   not the load average. MTP's four-fold swing, FR-Spec's collapsed runs and
+   prefill's half-idle GPU are one problem with three faces. Read
+   `sysctl vm.swapusage` before believing a wall figure.
+2. **Close the gap from 272 GB/s to the 465 the machine can give.** The
    kernels are already at the ceiling on a long read and nowhere near it on a
    short one. Overlap was the obvious lever and it has now been measured:
    "Where the 1216 barriers come from" above says the dependency chain is 947
@@ -1249,7 +1279,7 @@ In order:
      only if MXFP4 holds quality where affine int4 did not.
 3. **The MTP stall**, which is now the only thing between speculative
    decoding and a wall-clock win. FR-Spec is done and `--mtp-depth 1
-   --frspec` does 13.5% less GPU work a token than autoregression; what it
+   --frspec` does 14% less GPU work a token than autoregression; what it
    does not do is convert that into tok/s, because the loop leaves the GPU
    idle ~2.5 ms a token against autoregression's 0.5. Seven explanations are
    measured away in "It does not pay off here"; the eighth needs a machine
@@ -1307,7 +1337,7 @@ Qwen3/Qwen3.5. Three things rule it out, in order of how final they are.
   bytes per token if done on the fly -- the opposite of what a memory-bound
   decode wants.
 - **Decode is bound by memory, not arithmetic.** 2.83 GB a token, a 5.2 ms
-  floor at this machine's 546 GB/s against an 11.3 ms step. The ANE's case is
+  floor at this machine's 546 GB/s against a 10.4 ms step. The ANE's case is
   TOPS, and it shares the same unified memory, so there is nothing for it to
   win at batch 1.
 - **It would end the verification.** The published figure for that path is
@@ -1344,7 +1374,7 @@ not a reason; it was assumed here and it does not hold.
 
 That reopens exactly one idea, and it is the largest one left: hand the CPU a
 slice of a decode step's *output rows* while the GPU takes the rest. Decode is
-the path with somewhere to put it -- it gets ~250 GB/s of a possible 465 --
+the path with somewhere to put it -- it gets ~272 GB/s of a possible 465 --
 and prefill is not, since prefill's idle is memory pressure rather than a
 bandwidth ceiling.
 
