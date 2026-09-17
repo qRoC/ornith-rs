@@ -167,6 +167,30 @@ None of these would have been visible from output text:
     assigned to a `bfloat16_t` variable, and mlx materialises every
     intermediate. Nine of the 65536 bfloat16 inputs to `gelu_pytorch_tanh`
     disagree between the two forms.
+11. `sync` did not wait when a dispatch landed exactly on a commit boundary,
+    so the host could read a buffer whose kernel had not run. Latent at the
+    shipped commit size; see below.
+
+### The bug the profiler found first
+
+`Context::sync` used to return early when neither an encoder nor a command
+buffer was open -- but "nothing open" is not "nothing running". A dispatch
+that lands exactly on a commit boundary leaves both empty while the GPU is
+still working, so `sync` waited for nothing and the host read a buffer whose
+kernel had not run. It reads as zeros.
+
+At the shipped `max_dispatches_per_commit = 128` a decode step ends 95
+dispatches into a buffer, so the boundary never lands on the last dispatch of
+a step and nothing ever went wrong -- the whole test suite passes on both
+sides of this fix. It is shape-dependent luck: any prompt, image or draft
+whose dispatch count is a multiple of the commit size would have read
+garbage. `ORNITH_COMMIT_EVERY=1` makes every dispatch land on a boundary, and
+`tests/model.rs` then fails on the first thing it checks, the embedding
+gather, with `got 0 want -0.287`.
+
+`sync` now keeps the last buffer `flush` committed and waits on that when
+nothing is open. The queue is serial, so waiting on the newest buffer means
+every earlier one has completed too.
 
 ---
 
@@ -434,15 +458,94 @@ prompt.
 
 ---
 
+## Where a decode step goes
+
+`ORNITH_PROF=1` turns on counters in the Metal layer and a summary at the end
+of a run: wall, GPU busy (summed `GPUEndTime - GPUStartTime` over the step's
+command buffers), time blocked in `waitUntilCompleted`, dispatches and commits
+per token, and a dispatch count per kernel. `ORNITH_COMMIT_EVERY=N` overrides
+the commit size; at `N=1` every command buffer holds one dispatch, so its
+timestamps attribute to a single kernel and the summary breaks GPU time down
+per kernel. `cargo run --release --bin dispatch_cost` measures what a dispatch
+costs with no work in it.
+
+The numbers below are greedy, 256 tokens, a 25-token prompt, on a quiet
+machine. Quiet matters: with a couple of unrelated CPU-bound jobs running,
+three consecutive runs of one binary came out 12.6, 14.4 and 15.3 ms/token --
+22% apart -- so anything smaller than that has to be measured back to back
+against its own control, or not claimed at all.
+
+(`mlx_lm`'s CLI renders the chat template its own way and gets 23 tokens from
+the same text, so the two generate different essays. `tests/generate.rs` is
+what pins them token for token, on identical ids.)
+
+| | |
+|---|---|
+| ornith | 82 tok/s, 12.2 ms/token |
+| `mlx_lm.generate`, same prompt text | 88 tok/s, 11.4 ms/token |
+| GPU busy | 11.8 ms of the 12.2 -- 97%, so the step is not waiting on the CPU |
+| dispatches | 1669 per token, in 14 command buffers (1759 before single-row slices became views) |
+| weights read | ~2.83 GB per token, i.e. 232 GB/s against this machine's 546 |
+
+So the step is GPU-bound, and the earlier guess -- that the per-step `sync` and
+the ~800 dispatches were the problem -- was wrong on both counts: the sync
+costs nothing measurable (the GPU is busy 97% of the wall) and there are twice
+as many dispatches as that.
+
+What the dispatch count does cost is the barrier between each pair.
+`dispatch_cost` puts an empty dispatch at **1.0-1.25 us** in the serial encoder
+this port uses, and at **0.15-0.25 us** in a concurrent one with no barriers --
+so ~1 us of every dispatch is the barrier, and 1669 of them are **~1.6 ms of
+the 12.2 ms step**. mlx does not pay this: its encoder is
+`MTL::DispatchTypeConcurrent` and `maybeInsertBarrier` inserts one only when a
+dispatch reads what a previous dispatch in the same epoch wrote. That is the
+one real divergence between this port's dispatch path and mlx's, and it is
+about the size of the gap to `mlx_lm`.
+
+Commit size matters too, and not in the direction the comment on
+`max_dispatches_per_commit` assumed: each command buffer costs ~60 us of GPU
+time, so committing more often makes it slower, not smoother.
+
+| commits/token | tok/s |
+|---|---|
+| 55 (`ORNITH_COMMIT_EVERY=32`) | 68 |
+| 14 (128, the default) | 82 |
+
+| 4 (512) | 79 -- now the GPU waits for the CPU to fill a buffer |
+
+And the barrier's real price is not its fixed cost but the overlap it forbids.
+`ORNITH_NO_BARRIER=1` runs the same dispatches in a concurrent encoder
+with no barriers at all: the output is wrong, but the step drops from 12.2 ms
+to **6.9 ms**. That is an unreachable bound -- the dependency chain in a decode
+step is mostly real, and mlx, which does insert the necessary barriers, gets
+88 tok/s rather than 146. So porting mlx's rule is worth closing the gap to
+mlx, ~7%, not the 77% the bound suggests.
+
+What the bound does say is that the kernels themselves are fine. 2.83 GB at
+this machine's 546 GB/s is 5.2 ms, and unserialised they take 6.9 -- about 75%
+of peak bandwidth. The 12.2 ms step is 5.2 ms of unavoidable weight reading
+plus ~5.3 ms of serialisation plus ~1.7 ms of dispatch and commit overhead.
+
+---
+
 ## What is left
 
 In order:
 
-1. **Decode speed.** ~83 tok/s autoregressive, against the artifact's recorded
-   ~109 tok/s *with* MTP depth 3 -- and speculative decoding is a loss here
-   (see the table above), so the autoregressive path is where any win has to
-   come from. Nothing has been profiled; the suspects are the per-step `sync`
-   and the ~800 small dispatches a token takes.
+1. **The per-dispatch barrier.** Port mlx's `maybeInsertBarrier`: create the
+   encoder with `MTLDispatchTypeConcurrent` and insert
+   `memoryBarrier(BarrierScopeBuffers)` only when a dispatch reads a buffer a
+   previous dispatch in the same epoch wrote (RAW) or writes one a previous
+   dispatch read (WAR) -- `set_input_array` / `register_output_array` in
+   `mlx/backend/metal/device.cpp`. Expect it to close the gap to `mlx_lm` and
+   not much more -- mlx has this rule and runs at 88 tok/s against our 82, so
+   ~7%, not the 77% the barrier-free bound above suggests. The work is marking
+   outputs: `Dispatch` would grow an `.out(a)`
+   beside `.arr(a)`, with unmarked ops treating every binding as both input
+   and output so they keep today's behaviour and the migration can go op by
+   op, each re-checked by its own golden test. 92 `Array::empty` sites is the
+   upper bound on what has to be marked. A barrier changes when a kernel runs,
+   never what it computes, so `max_abs == 0.0` stays the check.
 2. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
    `lm_head` over a ranked sub-vocabulary, which is what removes the ~540 MB
    per draft step. The artifact ships no ranked vocabulary, so it would have
@@ -519,6 +622,11 @@ taps (this `vision_config` ships none), and mlx's graph-level fusion engine
   its images.
 
       cargo test --release --test vision_generate -- --ignored --nocapture --test-threads=1
+- `ORNITH_PROF=1` prints the per-token breakdown at the end of a run;
+  `ORNITH_COMMIT_EVERY=N` sets the commit size (`N=1` attributes GPU time per
+  kernel, and is ~3x slower); `ORNITH_NO_BARRIER=1` drops every barrier, which
+  is wrong but bounds what the barriers cost. `cargo run --release --bin
+  dispatch_cost` times an empty dispatch.
 - `tools/gen_unicode.py` regenerates `src/tokenizer/tables.rs`. It is checked
   in; only re-run it when the Python that produced it moves to a new Unicode
   version, and re-run `tests/tokenizer.rs` afterwards.
