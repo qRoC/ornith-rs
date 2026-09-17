@@ -121,7 +121,12 @@ no.** `kernels/fp_quantized_inst.metal` instantiates nvfp4 g16 for bf16 and
 f32; `src/ops/quantized.rs` carries both halves of mlx's dispatcher behind a
 `QuantMode`; `tests/quantized_nvfp4.rs` pins every branch at `max_abs == 0.0`
 and `tests/model.rs` runs the whole 40-layer model on an nvfp4 artifact at the
-same bar. It delivers its bytes -- 2.076 -> 1.925 GB a token against
+same bar. FR-Spec works on it too, which is not free: nvfp4's scales are uint8
+E4M3 rather than bf16, so pruning `lm_head` needs a byte row gather
+(`gather_rows_by_id_uint8`). The check that it is right is the acceptance
+rate, not the output -- a wrong gather would still emit the verify forward's
+argmax, just from garbage drafts -- and acceptance does not move at all,
+0.94 with the pruned head and 0.94 with the full one. It delivers its bytes -- 2.076 -> 1.925 GB a token against
 `int4-head-linattn`, and 9.17 -> 8.55 ms of GPU busy, which is the byte saving
 converting almost one for one, as a memory-bound step should. It does not
 deliver its quality: the max KL goes 0.048 -> 0.429 nats, which leaves it
