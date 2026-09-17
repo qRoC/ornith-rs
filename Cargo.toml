@@ -1,0 +1,25 @@
+[package]
+name = "ornith-rs"
+version = "0.1.0"
+edition = "2024"
+
+# Only platform bindings are external. Everything else -- JSON, safetensors,
+# BPE, the chat template, every kernel and every layer -- is ported by hand
+# from mlx / mlx-lm / MTPLX (see ../vendor/).
+[dependencies]
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+dispatch2 = "0.3.1"
+
+[profile.release]
+opt-level = 3
+debug = true
+
+[lib]
+name = "ornith_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ornith"
+path = "src/main.rs"

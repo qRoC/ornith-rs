@@ -1,0 +1,10 @@
+# Cargo build output, including the compiled metallib.
+/target/
+
+# Golden reference tensors dumped from MLX -- ~510 MB of raw .bin, and
+# regenerable: every case has a tools/dump_<case>.py that writes it.
+# See "Working notes" in HANDOFF.md for how to run them (vendored mlx-lm,
+# MTPLX on the path for the MTP and vision cases).
+/refs/
+
+.DS_Store

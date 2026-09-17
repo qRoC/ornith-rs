@@ -1,0 +1,541 @@
+# ornith-rs — state of the port
+
+A from-scratch Rust + Metal port of the MLX inference path for
+`~/.mtplx/models/Shiftedx--ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx`.
+
+The point of the exercise is to **understand how the model works**, so the port
+stays 1:1 with the sources in `../vendor/` (mlx, mlx-lm, MTPLX), keeps every
+optimization those take, and is verified against MLX numerically rather than by
+reading the generated text.
+
+**The model talks, and it looks.** `cargo run --release` opens a chat; greedy
+decoding and sampled decoding both reproduce `mlx_lm.generate` token for token
+and character for character. `--mtp` adds speculative decoding off the native
+MTP head. `--image` runs the vision tower and reproduces MTPLX's description of
+the same picture, likewise token for token.
+
+---
+
+## The model
+
+Qwen3.5-MoE (`qwen3_5_moe`), 35B total / ~3B active:
+
+| | |
+|---|---|
+| Layers | 40: 30 `linear_attention` (GatedDeltaNet) + 10 `full_attention`, every 4th is full |
+| Hidden | 2048, head_dim 256, 16 query heads, 2 kv heads (GQA factor 8) |
+| Attention | partial RoPE over the first 64 of 256 channels, theta 1e7, plus a sigmoid output gate (`attn_output_gate`) |
+| Linear attention | conv kernel 4, 16 key heads x 128, 32 value heads x 128, float32 recurrent state |
+| MoE | 256 experts, top-8, `moe_intermediate_size` 512, plus a shared expert (512) with its own sigmoid gate |
+| Quantization | 4-bit/group 32 by default; 8-bit/group 64 for attention, `linear_attn` projections, both router gates, `embed_tokens`, `lm_head`, and the experts + shared experts of 8 of the 40 layers. Per-module, read from `config.json`'s `quantization` block |
+| BF16 (unquantized) | `conv1d.weight`, `A_log`, `dt_bias`, `in_proj_a/b`, every norm, the whole MTP head (1.7 GB) and the whole vision tower (0.9 GB) |
+| MTP | one appended NextN predictor: `pre_fc_norm_embedding`, `pre_fc_norm_hidden`, `fc` (2H -> H), one full-attention decoder layer with its own 256-expert MoE, `norm`; lm_head is shared with the trunk. Sidecar `mtp/weights.safetensors` |
+| Vision | 27-block ViT, hidden 1152, 16 heads of 72, intermediate 4304, 3D patch embed (2x16x16x3), interpolated 48x48 position embedding, 2D RoPE, LayerNorm, two GELUs, spatial merge 2, out 2048. Every linear carries a bias, which nothing else in this model does |
+| Tokenizer | BPE, 248044 entries + 33 added tokens, NFC, the GPT-4 split regex, ByteLevel |
+
+Artifact quirks that matter:
+
+- The checkpoint is **already sanitized**: `conv1d.weight` is `[D, K, 1]`, so
+  mlx-lm's `TextModel.sanitize` does **not** add 1.0 to the norm weights. Doing
+  it anyway is the "double shift" MTPLX's `qwen3_5_mtp_patch.py` warns about.
+- `rope_parameters.type` is `"default"`, so despite the `mrope_section` next to
+  it the text path takes plain rotary, not mrope. MTPLX agrees from the other
+  side: `openai.py` builds an M-RoPE table only when
+  `spec.model_type == "qwen4_exp"`, and this artifact says `qwen3_5_moe`. So
+  image tokens are roped sequentially, like any other token.
+- Tensor offsets in the safetensors are **not** aligned (odd byte offsets), so
+  weights must be copied into device buffers; zero-copy is impossible.
+- **The tokenizer has two behaviours and they disagree.** See below.
+
+## This machine
+
+`applegpu_g16s` (M4 Max, 64 GB). Two consequences, both asserted in code so a
+different Mac fails loudly instead of silently diverging:
+
+- `metal::is_nax_available()` is false (needs gen >= 17), so none of mlx's
+  Metal 4 / `mpp::tensor_ops` kernels run. They are not ported.
+- `GEMM_TPARAM_MACRO` classes this as a "medium device", so the steel gemm tile
+  is always 64x64x16 / wm=wn=2. Only that tile is instantiated.
+
+---
+
+## Layout
+
+```
+kernels/mlx/...            mlx's Metal sources, verbatim, original paths kept
+kernels/*.metal            our instantiation lists + the kernels mlx JITs
+src/metal/                 device, pipeline cache, buffer pool, encoding
+src/{json,safetensors,array,weights}.rs   loading
+src/ops/                   kernel dispatch, one module per mlx primitive family
+src/model/                 config, caches, layers, the MTP head
+src/vision/                the tower, its preprocessing (incl. Pillow's
+                           bicubic resampler) and the prompt splice
+src/tokenizer/             NFC, the split regex, BPE, the added vocabulary
+src/chat.rs                chat_template.jinja, hand-compiled
+src/sample.rs              make_sampler: top-p, top-k, categorical
+src/generate.rs            generate_step: prefill chunking and the decode loop
+src/mtp_generate.rs        the MTP draft/verify loop
+src/main.rs                the console chat
+src/refs.rs                golden-reference reader
+tools/dump_*.py            golden-reference writers (run against MLX)
+tools/gen_unicode.py       the Unicode tables the tokenizer needs
+refs/<case>/               the references themselves
+tests/                     one test file per reference case
+```
+
+`build.rs` compiles every `.metal` under `kernels/` into one metallib with
+mlx's own flags plus `-fmetal-math-mode=safe`, and `src/metal/mod.rs` embeds it
+with `include_bytes!`.
+
+---
+
+## Running it
+
+```
+cargo run --release                          # chat, temp 0.6 / top_p 0.95 / top_k 20
+cargo run --release -- --greedy              # temperature 0
+cargo run --release -- -p "..." -m 200       # one shot
+cargo run --release -- --raw -p "..."        # no chat template
+cargo run --release -- --tokenizer-json ...  # tokenizer.json's split regex
+cargo run --release -- --mtp                 # speculative decoding, depth 3
+cargo run --release -- --mtp-depth 1         # shallower draft, see the table below
+cargo run --release -- --image p.bmp -p "..." # one image (repeat for more)
+cargo run --release -- --image p.rgb --image-size 768x448
+```
+
+There is no image *decoder* in Rust, on purpose: `--image` takes a binary PPM,
+an uncompressed BMP, or raw RGB. macOS ships the decoder:
+
+```
+sips -s format bmp photo.heic --out photo.bmp
+```
+
+Any size is fine -- `smart_resize` and Pillow's bicubic resampler are both
+ported, so the picture is resized exactly as MTPLX would have resized it.
+
+Loading is ~16 s warm (mmap + per-tensor copy into Metal buffers), ~70 s cold.
+Decode runs at ~79 tok/s, greedy and sampled alike -- the sampler's two
+248320-wide argsorts cost about a percent, which is well inside the noise.
+
+---
+
+## What is done and verified
+
+All tests assert **`max_abs == 0.0`** against MLX -- bit-exact, not a
+tolerance. Both sides run the same kernels, so any difference means the
+dispatch diverged.
+
+| Test | Covers |
+|---|---|
+| `quantized.rs` | `quantized_matmul` on real weights, 4-bit/g32 and 8-bit/g64, M = 1/2/4/8/16/64/256 (qmv_fast, qmv_wide, qmm_t_splitk + reduce) |
+| `ops.rs` | rms_norm (weighted, weightless, head_dim), rope (decode + prefill, offsets), fused elementwise |
+| `activations.rs` | silu / swiglu / precise_swiglu / sigmoid over **every** bfloat16 input |
+| `attn.rs` | matmul (incl. broadcast batch), softmax, attention at 6 shapes across all three SDPA branches |
+| `gdn.rs` | conv concat, depthwise conv + silu, `compute_g`, beta, packed and unpacked recurrence, T = 1/7/512 |
+| `moe.rs` | router, top-k, score normalisation, SwitchGLU on all three gather paths, sort permutation, whole block, T = 1/7/24/512 |
+| `layer0.rs` | layer 0's gated-delta path step by step on real weights |
+| `model.rs` | **the whole 40-layer model**: 24-token prefill + 3 decode steps, checked at the embeddings, layers 0/1/2/3/4/7/8/39, pre-norm residual, final hidden and logits. `#[ignore]`d because it loads 25.5 GB |
+| `tokenizer.rs` | the split regex's character classes over **all 0x110000 codepoints**, NFC over every codepoint plus ~15k combining sequences, and `encode`/`decode` over a ~1200-case corpus -- in **both** tokenizer dialects |
+| `chat.rs` | 120 conversations through the chat template, compared as rendered text *and* as token ids |
+| `resample.rs` | Pillow's bicubic resampler, **byte for byte** against Pillow, at ten (in -> out) size pairs: both axes down, both up, one axis only, a huge downscale, a tiny upscale and the pairs `smart_resize` produces for real photographs |
+| `vision_ops.rs` | the ops only the tower reaches: `layer_norm`, both GELUs over **every** bfloat16 input, `addmm` at ten shapes across split-K and the regular steel gemm, the 3D patch convolution, and mlx's *full* fused attention at head dim 72 -> 80 |
+| `vision.rs` | **the whole 27-block tower** at three image sizes (256x256, 320x224, 512x512), checked at the patch embedding, the interpolated position embedding, the 2D rotary tables, block 0's norm and attention, blocks 0/1/26 and the merger -- plus the preprocessing, from the file's bytes to the patch rows, including two sizes that `smart_resize` changes and so go through the resampler |
+| `vision_generate.rs` | **pixels in, text out against MTPLX**: two photographs (one the processor resamples) and a synthetic image, one and two images per prompt, through the tower, the pad expansion, the splice and greedy decoding. `#[ignore]`d because it loads 26.4 GB |
+| `sampler.rs` | every stage of `make_sampler(0.6, 0.95, 20)`: the multi-block merge sort, the bfloat16 and float32 scans, whole-array max/sum, gather/scatter along an axis, searchsorted, threefry, and the drawn tokens off a fixed seed |
+| `generate.rs` | **end to end against `mlx_lm.generate`**: 8 greedy prompts (raw and chat, one crossing the 2048-token prefill step) and one sampled run, token ids and printed text. `#[ignore]`d |
+| `mtp.rs` | the MTP head against MTPLX's `mtp_forward`: the unquantized 256-expert block, the head's input after `pre_fc_norm` + `fc`, a whole `mtp_forward`, the depth-3 draft chain and the verify window. Then the capturing trunk forward against the packed one, and speculative decoding against autoregressive. `#[ignore]`d |
+
+### Bugs the golden tests caught
+
+None of these would have been visible from output text:
+
+1. mlx sums bfloat16 **in bfloat16**; a float32 accumulator is wrong.
+2. Reduction order differs by kernel (`col_reduce_small` sequential vs
+   `col_reduce_looped`'s `simd_sum` butterfly) — an ULP apart.
+3. mlx's sigmoid is the stable `1/(1+exp(|x|))` form.
+4. mlx's JIT (`mx.compile`) and precompiled kernels disagree: `fast::exp` vs
+   `precise::exp`. One bfloat16 input in 6660 differs.
+5. Host writes raced with encoded-but-unexecuted dispatches through the buffer
+   pool.
+6. Rounded-up dispatch grids wrote past buffer ends (only visible at T = 24).
+7. `in_proj_a/b` take the split-K steel gemm at prefill, not the regular one.
+8. The fused SDPA has a `q_len * gqa_factor <= 32` limit on top of the head-dim
+   rules, so only 4 query rows stay fused here.
+9. `transformers` 5.x does not use the artifact's tokenizer (see below).
+10. A bfloat16 expression written as one line is not the same as mlx's chain of
+    bfloat16 arrays: Metal keeps `a * b` at float precision unless it is
+    assigned to a `bfloat16_t` variable, and mlx materialises every
+    intermediate. Nine of the 65536 bfloat16 inputs to `gelu_pytorch_tanh`
+    disagree between the two forms.
+
+---
+
+## The tokenizer has two behaviours
+
+`tokenizer.json` describes a Split pre-tokenizer with the newer Qwen pattern:
+
+```
+(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}
+| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+```
+
+`transformers` 5.x **ignores it**. `Qwen2Tokenizer` there is a
+`TokenizersBackend` that rebuilds the tokenizer from `vocab.json` and
+`merges.txt` and installs its own module-level `PRETOKENIZE_REGEX`
+(`transformers/models/qwen2/tokenization_qwen2.py`), which is the older Qwen2
+pattern with **no `\p{M}`** in either class. It also ignores the
+`pretokenize_regex` key `tokenizer_config.json` carries, which holds the
+`\p{M}` version.
+
+The two disagree on anything with a combining mark: Devanagari, Arabic
+diacritics, Hangul jamo, an emoji with a variation selector. For
+`यह हिन्दी में` it is 11 tokens against 19.
+
+mlx-lm loads the tokenizer through `AutoTokenizer`, so **the transformers
+behaviour is what `mlx_lm.generate` runs**, and it is what this port defaults
+to (`Dialect::Transformers`). `Dialect::TokenizerJson` runs the artifact's own
+pattern; `--tokenizer-json` selects it. Both are verified against their own
+reference on the same corpus. Which one the model was *trained* with is a
+question for the artifact's authors -- the `\p{M}` form is the one Qwen ships.
+
+Two other details of the pre-tokenizer are pinned by probing rather than
+assumed, because `tokenizers` runs the pattern through oniguruma:
+
+- `\s` is the Unicode `White_Space` property, not Ruby's ASCII-only `\s`.
+  U+00A0 and U+3000 are `\s`; U+200B and U+001C are not.
+- `(?i:)` folds with simple case folding, so `'s` also matches `'\u{17f}`
+  (LATIN SMALL LETTER LONG S). No other character folds onto `s t r e v m l d`.
+
+`tools/dump_tokenizer.py` re-derives the character classes from the live
+pre-tokenizer, one probe per codepoint, and `tests/tokenizer.rs` compares them
+against `src/tokenizer/tables.rs`.
+
+---
+
+## MTP speculative decoding
+
+The head is one full-attention decoder layer plus its own 256-expert MoE, and
+the whole 1.7 GB sidecar is BF16 -- `mtp_prequantized: false`, so
+`_quantize_mtp_module` returns without doing anything and every projection is a
+dense `matmul`. That makes the MoE an **unquantized** `SwitchGLU`, which is the
+one genuinely new kernel path: `mx.gather_mm` with M == 1 routes to
+`gather_mv`, i.e. mlx's `gemv_gather`, where the trunk's quantized blocks route
+to `gather_qmv`.
+
+Three things about the wiring are not what the file names suggest:
+
+- **`qwen3_5_mtp_patch.py` does not run.** `is_qwen3_5_mtp_config` needs
+  `model_type == "qwen3_5_mtp"` and this artifact says `qwen3_5_moe`, so the
+  generic `inject_mtp_support` in `mtp_patch.py` handles it. That matters:
+  the qwen3_5-specific patch hardcodes `hidden_variant = "pre_norm"`, the
+  generic one takes the contract's `post_norm`.
+- **The contract lives in `mtplx_runtime.json`, not `config.json`** -- and it
+  is exactly `MTPContract`'s defaults: `post_norm` in and out,
+  `embedding_hidden`, `mtp_position_mode: cache`, not prequantized.
+- **The history policy that matters is `committed`, not `cycle`.** Several
+  dataclasses in `generation.py` default to `cycle`, but `cli.py` passes
+  `mtp_history_policy="committed"` and `_resolve_mtp_history_policy` calls
+  that "the product default". Measured over three prompts:
+
+  | policy | depth 1 | depth 2 | depth 3 |
+  |---|---|---|---|
+  | `cycle` | 0.43 - 0.71 | 0.12 - 0.24 | 0.00 - 0.18 |
+  | `committed` | 0.53 - 0.84 | 0.31 - 0.57 | 0.00 - 0.27 |
+  | `committed` + prompt seeding | 0.54 - 0.79 | 0.31 - 0.55 | 0.00 - 0.25 |
+
+  against the 0.78 / 0.35 / 0.13 the artifact records. `committed` is the
+  default here. Seeding the head's cache over the prompt -- what
+  `_append_mtp_history(..., phase="prefill")` does -- measurably does not
+  help, which is convenient: it is the only thing that would have needed
+  mlx's steel *gather* gemm, since a prompt-length append crosses
+  `SwitchGLU`'s `indices.size >= 64` sort threshold.
+
+### Rewinding a cache that cannot be trimmed
+
+mlx-lm's own `speculative_generate_step` refuses this model outright: it needs
+`can_trim_prompt_cache`, and the 30 gated-delta layers' `ArraysCache` reports
+`is_trimmable() -> False`. There is nothing to trim -- their memory is a conv
+window and a recurrent state, not a sequence.
+
+`TrunkCapture` is the way round, and it is exact rather than approximate
+because of one property of the recurrence kernel: it is a strict
+`for (t = 0; t < T; ++t)` loop carrying the state in float32 registers. So
+stepping it one token at a time and writing the state out between steps is
+**bit-identical** to one T-token call (checked at T = 4, 7, 24 and 64, and
+again through all 40 layers in `tests/mtp.rs`). The capturing forward therefore
+keeps every intermediate `(conv window, recurrent state)` at no numerical cost
+and almost no bandwidth cost -- each step already allocates its own outputs, so
+a snapshot is a reference rather than a copy.
+
+### It does not pay off here
+
+Interleaved runs, same prompt, 200 tokens, greedy:
+
+| | tok/s | acceptance by depth |
+|---|---|---|
+| autoregressive | 83.8, 83.2 | -- |
+| `--mtp-depth 1` | 74.0, 76.1 | ~0.58 |
+| `--mtp-depth 2` | 69.4, 68.0 | ~0.53 / 0.36 |
+| `--mtp-depth 3` | 62.8, 55.5 | ~0.52 / 0.40 / 0.30 |
+
+Acceptance is in the band the artifact records (0.78 / 0.35 / 0.13), so the
+head and the loop are doing their job -- but every depth is *slower* than
+plain autoregression. Two structural reasons:
+
+1. **Every draft step runs the full `lm_head`.** It is 8-bit over a 248320
+   vocabulary, so ~540 MB read per draft -- ~1.6 GB for a depth-3 chain,
+   comparable to a whole trunk forward, for three tokens that are then mostly
+   rejected. This is exactly what MTPLX's FR-Spec (`frspec_ids`, a pruned
+   draft head over a ranked sub-vocabulary) exists to avoid, and it is not
+   ported.
+2. **The verify forward multiplies MoE traffic.** Its `depth + 1` tokens each
+   pick their own top-8 of 256 experts, so a 4-token window can read up to
+   four times the expert weights a single token would. `SwitchGLU` keeps
+   32 (token, expert) pairs on the *unsorted* gather path too, because mlx-lm
+   sorts only at `indices.size >= 64`, so nothing amortises the reads.
+
+A dense model would win here; a 3B-active MoE with an unpruned draft head does
+not. Both fixes are real optimizations rather than porting work, which is why
+neither is in: FR-Spec needs a ranked vocabulary the artifact does not ship,
+and forcing the sorted gather at 32 rows would stop matching mlx-lm.
+
+### How exact it is
+
+The acceptance rule and the rewind are exact. The output is not quite: the
+verify forward runs `depth + 1` tokens at once, and `quantized_matmul` picks a
+different kernel for M = 4 than for M = 1, with a different reduction order and
+therefore a different last bit. Two logits an ulp apart can swap and the
+speculative and autoregressive streams part company.
+`window_and_steps_both_match_mlx` pins both halves: this port reproduces mlx's
+window forward *and* its single-step forward bit for bit, and the two disagree
+with each other by up to 1.44 on a hidden whose scale is 35 -- a few bfloat16
+ulps compounded through 40 residual layers, against top-2 logit gaps that are
+sometimes 0.31. So the streams part company after 8 - 18 tokens, and no
+speculative decoder on this stack can do better, MTPLX's included.
+`speculative_tracks_autoregressive` measures how far they stay together.
+
+---
+
+## The vision tower
+
+333 tensors, all bfloat16, under `vision_tower.` in
+`model-vision-00001-of-00001.safetensors`. **mlx-lm is not the reference
+here**: `qwen3_5_moe.Model.sanitize` drops every `vision_tower.*` key and
+`qwen3_vl.Model.sanitize` pops the whole submodule, so mlx-lm runs this
+artifact text-only. MTPLX's `mtplx/vision/` is the only source, and
+`tests/vision*.rs` check against it rather than against `mlx_lm.generate`.
+
+```
+  pixels  -> Qwen2VLImageProcessorFast  -> [patches, 3*2*16*16] float32
+          -> conv3d 2x16x16x3 -> 1152   + bias
+          +  fast_pos_embed_interpolate  bilinear over a learned 48x48 grid
+          -> 27 x (LayerNorm, 16-head attention with 2D RoPE, LayerNorm, MLP)
+          -> PatchMerger                 2x2 patches -> one 2048-wide token
+  rows    -> spliced over the <|image_pad|> run of the embedded prompt
+```
+
+A 768x448 photo is 48x28 patches, 336 language tokens, and the tower takes
+~0.25 s. Nothing about it is quantized.
+
+Six dispatch decisions are worth writing down, because none of them is what
+the Python looks like:
+
+- **The patch embedding is an implicit-GEMM convolution over *padded*
+  channels.** `dispatch_conv_3D_gpu` tests `C_per_group % 16 == 0`, which at 3
+  input channels is false, so it takes `pad_and_slice_conv_3D_gpu`: both the
+  input and the weight are zero-padded to 16 channels and the implicit gemm
+  runs on the padded problem, M = patches, N = 1152, K = 2*16*16*16 = 8192.
+  Convolving the unpadded thing instead would be a different kernel with a
+  different reduction order.
+- **Every linear is `mx.addmm`, and the two gemms disagree about what
+  "axpby" means.** `nn.Linear` with a bias is `mx.addmm(bias, x, w.T)`, alpha
+  = beta = 1. In `steel_matmul_regular_axpby` that sets `use_out_source` but
+  leaves `do_axpby` *off* (`alpha != 1 || beta != 1`); in
+  `steel_gemm_splitk_axpby` the accumulate kernel's test is `alpha != 1 ||
+  beta != 0`, so it *does* take the `_axbpy` variant. Both paths are live:
+  `proj`, the MLP's second layer and both merger layers fall into split-K for
+  small images and into the regular gemm for large ones, and
+  `tests/vision_ops.rs` pins ten shapes across the boundary.
+- **The attention runs mlx's *full* fused kernel, which the trunk never
+  reaches.** MTPLX's `_fused_sdpa` pads head dim 72 up to 80 (`_FUSED_SDPA_DIMS
+  = (64, 80, 128)`) and slices back; an image is always more than 8 patches, so
+  `has_fused_kernel` takes its `query_sequence_length > 8` branch, where 80 is
+  supported, and `use_fallback`'s tail only rejects 192 and 256. So
+  `steel_attention_bfloat16_bq32_bk32_bd80_wm4_wn1` runs -- a kernel the text
+  path has no use for, since at head_dim 256 prefill goes unfused.
+- **Two different GELUs.** The block MLP is `nn.GELU(approx="tanh")`, the
+  `gelu_pytorch_tanh` the config names; the merger is a bare `nn.GELU()`, which
+  is the exact erf form. The reference really does use both, and they differ by
+  more than an ULP. `tests/vision_ops.rs` compares each over all 65536
+  bfloat16 inputs.
+- **LayerNorm, not RMSNorm**, at eps 1e-6, with both a weight and a bias --
+  mlx's `layer_norm.metal`, whose mean, variance and normalizer are float32
+  whatever the array dtype is.
+- **The position embedding is interpolated on the host.**
+  `fast_pos_embed_interpolate` builds the four bilinear corner indices and
+  weights in Python with `mx.linspace`, a truncating cast and four products,
+  then `.tolist()`s them into `mx.array(..., dtype=bfloat16)`. So the weights
+  round to bfloat16 *before* the gather, and the port computes the same table
+  in float32 on the CPU and rounds it the same way
+  (`tests/vision.rs::interpolation_table_matches_mlx`).
+
+Three things are hoisted rather than recomputed. Each moves only exact values,
+and each is called out where it happens: the convolution weight's channel
+padding (mlx redoes it per call), the `moveaxis(1, 4)` fused into that padding
+(mlx does a strided view plus a copy), and the `cos`/`sin` tables, which mlx
+rebuilds inside `_apply_rotary_pos_emb_vision` twice per block and which are a
+pure function of the patch grid.
+
+### Where the line is: the resampler is in, the decoder is out
+
+`preprocess_images` calls `smart_resize` and, when it asks for different
+dimensions, `Image.resize(..., Image.BICUBIC)`. Both are ported -- the second
+one in `vision/resample.rs`, from Pillow's `src/libImaging/Resample.c`.
+
+That is a different call from the image *decoder*, which stays outside.
+Decoding is open-ended (formats, ICC profiles, EXIF orientation, chroma
+upsampling) and its output is exactly what this port asks to be handed. The
+resampler is closed: one filter, ~150 lines of deterministic integer
+arithmetic, sitting *inside* a vendored file, and it decides which pixels the
+model sees. Leaving it out meant the port could only reproduce MTPLX on
+images pre-sized by something else, which is a hole in the one property
+everything here is checked for.
+
+Three details of it are the whole game, and `tests/resample.rs` pins them byte
+for byte:
+
+- the `double` filter coefficients are **quantized to 22-bit fixed point**
+  (`normalize_coeffs_8bpc`), so the convolution itself is integer;
+- it is **two passes**, horizontal then vertical, with the intermediate
+  rounded back to `uint8` in between -- one fused pass does not agree;
+- a pass is **skipped** when that axis keeps its size, which is not the same
+  as running an identity pass through the quantizer.
+
+`smart_resize` itself has one trap: it rounds with Python's `round`, which is
+round-half-to-even, and `f64::round` is not. A 48-pixel side at factor 32 has
+to round down.
+
+The one thing to keep an eye on: this pins the internals of a Pillow *version*
+(12.3.0 here), not a model contract. `dump_resample.py` records the version and
+`tests/resample.rs` prints it.
+
+### The splice
+
+The chat template renders one `<|image_pad|>` (248056) per image, between
+`<|vision_start|>` (248053) and `<|vision_end|>` (248054). The request then
+expands it to one pad per tower row (`_expand_image_pads`) and prefill replaces
+those rows' *embeddings* with the tower's output, so an image never goes
+through `embed_tokens` at all -- the pad id only marks positions. Prefill
+consumes chunks strictly left to right, so the splice is a cursor:
+`generate.rs`'s `model_call` embeds a chunk, scatters the next rows into it and
+hands the result to `forward_from_embeddings`. A chunk with no pads returns
+`None` and keeps the plain token-id path, which is every chunk of a text
+prompt.
+
+---
+
+## What is left
+
+In order:
+
+1. **Decode speed.** ~83 tok/s autoregressive, against the artifact's recorded
+   ~109 tok/s *with* MTP depth 3 -- and speculative decoding is a loss here
+   (see the table above), so the autoregressive path is where any win has to
+   come from. Nothing has been profiled; the suspects are the per-step `sync`
+   and the ~800 small dispatches a token takes.
+2. **FR-Spec**, if the MTP path is ever meant to be fast: a pruned draft
+   `lm_head` over a ranked sub-vocabulary, which is what removes the ~540 MB
+   per draft step. The artifact ships no ranked vocabulary, so it would have
+   to be derived.
+
+Smaller gaps, each with an assert or a comment where it bites:
+
+- The chat template's `tools` system block and the assistant `tool_calls`
+  block are not ported. Both render through jinja's `tojson`, which
+  `transformers` replaces with `json.dumps(..., ensure_ascii=False)`, so they
+  need a JSON *writer* over an order-preserving value -- nothing else in this
+  port wants one yet. Every other branch of the template is there, including
+  `tool` messages and the reasoning-content split.
+- MTPLX's runtime adds a lot on top of the draft/verify loop that is not here:
+  the acceptance EMA with its suspend/backoff and probation, the copy-blocks,
+  FR-Spec, the `last_window` history policy, and probability-ratio acceptance
+  for sampled drafts. Acceptance here is by token equality, which is exact for
+  a greedy sampler and only approximate for a stochastic one -- `--mtp` says so
+  when it is paired with sampling.
+- The REPL keeps one cache across turns and reuses it only when the new prompt
+  extends what the cache already holds; anything else starts over. A
+  gated-delta state cannot be trimmed, so that is not an optimization to fix
+  cheaply. A prompt carrying an image never reuses it at all: every image
+  expands to the same `<|image_pad|>` id, so a token-id prefix match cannot
+  tell two pictures apart. MTPLX guards the same hazard from the other side,
+  with a content digest (`vision_bank_key_ids`) and `vision_image_spans`;
+  neither is ported, because this REPL has no session bank to key.
+- Video is not ported. `chat.rs` renders `Part::Video` as `<|video_pad|>`
+  because the template does, but nothing expands or splices it, and
+  `VisionTower::forward` asserts a single still frame -- which is also all
+  MTPLX ever hands it, since it runs the tower once per image.
+
+Not ported, deliberately, with `assert!`s guarding each: the `*_nax` Metal 4
+kernels (M5 only, including the 72 -> 96 head-dim pad the vision attention
+would otherwise take), `qmv_quad` (no 64/128-wide input in this model), `qvm`
+(every linear here is transposed), `gemv_wide` and `gemv_axbpy` (the vision
+tower's M is the patch count, never the <= 15 rows those want), the deepstack
+taps (this `vision_config` ships none), and mlx's graph-level fusion engine
+(the fused forms it produces are written out by hand instead, in
+`kernels/ornith_elementwise.metal`, `kernels/sampler_ops.metal` and
+`kernels/vision_ops.metal`).
+
+---
+
+## Working notes
+
+- Generate references with the **vendored** mlx-lm, not the installed one:
+  `cd tools && PYTHONPATH=../../vendor/mlx-lm python3 dump_<case>.py`.
+  Vendored is 0.32.0 (has the packed gated-delta kernel); installed is 0.31.3.
+- `cargo test --release` runs everything but the full-model and end-to-end
+  tests. Those need `--ignored` *and* `--test-threads=1`, because each one
+  loads the whole 25.5 GB model and two at once do not fit:
+
+      cargo test --release --test model    -- --ignored --nocapture
+      cargo test --release --test generate -- --ignored --nocapture --test-threads=1
+      cargo test --release --test mtp      -- --ignored --nocapture --test-threads=1
+
+  The MTP references also need MTPLX on the path:
+  `PYTHONPATH=../../vendor/mlx-lm:../../vendor/MTPLX python3 dump_mtp.py`.
+  So do the vision ones, and there MTPLX is the *only* reference -- mlx-lm has
+  no vision path:
+
+      python3 dump_resample.py                 # Pillow only, no model
+      PYTHONPATH=../../vendor/mlx-lm:../../vendor/MTPLX python3 dump_vision.py
+      PYTHONPATH=../../vendor/mlx-lm:../../vendor/MTPLX python3 dump_vision_generate.py
+
+  `dump_vision.py` writes its three test images into `refs/vision/` and
+  `dump_vision_generate.py` writes a `sips`-converted photograph into
+  `refs/vision_generate/`, so both runtimes read the same bytes and neither
+  decodes anything. Run `dump_vision.py` first: the generate case copies one of
+  its images.
+
+      cargo test --release --test vision_generate -- --ignored --nocapture --test-threads=1
+- `tools/gen_unicode.py` regenerates `src/tokenizer/tables.rs`. It is checked
+  in; only re-run it when the Python that produced it moves to a new Unicode
+  version, and re-run `tests/tokenizer.rs` afterwards.
+- When a composed test fails and its parts pass, suspect the plumbing between
+  them — and write a narrower dump rather than reasoning about it. Both the
+  buffer-pool race and the dispatch-grid overrun were found that way.
+- Reference shapes must cover every dispatch branch. T = 1, 7 and 512 all
+  passed while T = 24 was broken, because only 24 hits sorted + `gather_qmv`.
+- The same lesson bit the sampler: after top-k and top-p the model's own
+  distribution is peaked enough that every draw lands on the same token, so
+  `dump_sampler.py` also draws from a flat synthetic distribution where the
+  random number actually decides.
+- Only one model fits in memory at a time. Two `ornith` processes, or two
+  `--ignored` tests in parallel, thrash 64 GB and look like a hang. With the
+  vision tower it is 26.4 GB rather than 25.5.
+- A bfloat16 expression in Metal is not a chain of bfloat16 arrays. `T c = a *
+  b + d;` lets the compiler keep `a * b` at float precision, while mlx writes
+  `a * b` to a bfloat16 array and reads it back. Give every intermediate its
+  own `T` variable; `gelu_pytorch_tanh` disagreed on 9 of 65536 inputs until it
+  did.
+- `zsh` does not word-split an unquoted `$flags`, so a benchmark loop that
+  passes `"--mtp-depth 1"` through a variable hands the binary one argument and
+  it panics on an unknown flag. Use `${=flags}` or write the runs out.
