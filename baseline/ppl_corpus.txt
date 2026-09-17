@@ -1,0 +1,498 @@
+# ornith-rs — state of the port
+
+A from-scratch Rust + Metal port of the MLX inference path for
+`~/.mtplx/models/Shiftedx--ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx`.
+
+The point of the exercise is to **understand how the model works**, so the port
+stays 1:1 with the sources in `../vendor/` (mlx, mlx-lm, MTPLX), keeps every
+optimization those take, and is verified against MLX numerically rather than by
+reading the generated text.
+
+**That 1:1 state is pinned at `261fe0c`, and is no longer a requirement past
+it.** Everything up to that commit does what mlx does; from there a departure
+is an ordinary engineering decision, taken when it pays and written down here
+with what it bought. What does *not* move is the verification: `max_abs ==
+0.0` against MLX is how every one of these changes is shown to be a
+rearrangement and not a new model. A reordering that changes a number is a
+bug, not a trade-off.
+
+**The model talks, and it looks.** `cargo run --release` opens a chat; greedy
+decoding and sampled decoding both reproduce `mlx_lm.generate` token for token
+and character for character. `--mtp` adds speculative decoding off the native
+MTP head. `--image` runs the vision tower and reproduces MTPLX's description of
+the same picture, likewise token for token.
+
+---
+
+## The model
+
+Qwen3.5-MoE (`qwen3_5_moe`), 35B total / ~3B active:
+
+| | |
+|---|---|
+| Layers | 40: 30 `linear_attention` (GatedDeltaNet) + 10 `full_attention`, every 4th is full |
+| Hidden | 2048, head_dim 256, 16 query heads, 2 kv heads (GQA factor 8) |
+| Attention | partial RoPE over the first 64 of 256 channels, theta 1e7, plus a sigmoid output gate (`attn_output_gate`) |
+| Linear attention | conv kernel 4, 16 key heads x 128, 32 value heads x 128, float32 recurrent state |
+| MoE | 256 experts, top-8, `moe_intermediate_size` 512, plus a shared expert (512) with its own sigmoid gate |
+| Quantization | 4-bit/group 32 by default; 8-bit/group 64 for attention, `linear_attn` projections, both router gates, `embed_tokens`, `lm_head`, and the experts + shared experts of 8 of the 40 layers. Per-module, read from `config.json`'s `quantization` block |
+| BF16 (unquantized) | `conv1d.weight`, `A_log`, `dt_bias`, `in_proj_a/b`, every norm, the whole MTP head (1.7 GB) and the whole vision tower (0.9 GB) |
+| MTP | one appended NextN predictor: `pre_fc_norm_embedding`, `pre_fc_norm_hidden`, `fc` (2H -> H), one full-attention decoder layer with its own 256-expert MoE, `norm`; lm_head is shared with the trunk. Sidecar `mtp/weights.safetensors` |
+| Vision | 27-block ViT, hidden 1152, 16 heads of 72, intermediate 4304, 3D patch embed (2x16x16x3), interpolated 48x48 position embedding, 2D RoPE, LayerNorm, two GELUs, spatial merge 2, out 2048. Every linear carries a bias, which nothing else in this model does |
+| Tokenizer | BPE, 248044 entries + 33 added tokens, NFC, the GPT-4 split regex, ByteLevel |
+
+Artifact quirks that matter:
+
+- The checkpoint is **already sanitized**: `conv1d.weight` is `[D, K, 1]`, so
+  mlx-lm's `TextModel.sanitize` does **not** add 1.0 to the norm weights. Doing
+  it anyway is the "double shift" MTPLX's `qwen3_5_mtp_patch.py` warns about.
+- `rope_parameters.type` is `"default"`, so despite the `mrope_section` next to
+  it the text path takes plain rotary, not mrope. MTPLX agrees from the other
+  side: `openai.py` builds an M-RoPE table only when
+  `spec.model_type == "qwen4_exp"`, and this artifact says `qwen3_5_moe`. So
+  image tokens are roped sequentially, like any other token.
+- Tensor offsets in the safetensors are **not** aligned (odd byte offsets), so
+  weights must be copied into device buffers; zero-copy is impossible.
+- **The tokenizer has two behaviours and they disagree.** See below.
+
+## This machine
+
+`applegpu_g16s` (M4 Max, 64 GB). Two consequences, both asserted in code so a
+different Mac fails loudly instead of silently diverging:
+
+- `metal::is_nax_available()` is false (needs gen >= 17), so none of mlx's
+  Metal 4 / `mpp::tensor_ops` kernels run. They are not ported.
+- `GEMM_TPARAM_MACRO` classes this as a "medium device", so the steel gemm tile
+  is always 64x64x16 / wm=wn=2. Only that tile is instantiated.
+
+### Metal 4.1, fp8/fp4, and what changes on an M5
+
+`M5.md` is the working sheet for the move, with mlx's routing conditions
+quoted line by line. Its headline is worth having here: **every route into the
+`*_nax` kernels is guarded by a width a decode step does not have**, so they
+are a prefill lever. This section is the other half, the low-precision
+formats.
+
+Metal 4.1 does expose fp8 (E4M3), fp4 and block-scaled MXFP4 -- in the tensor
+path, the MPP `matmul2d` operation over `cooperative_tensor` fragments. Two
+gates keep it off this machine, and both are worth knowing before the move:
+
+- **The toolchain.** `xcrun metal -std=metal4.1` answers `invalid value
+  'metal4.1'` under the Xcode 26.5 SDK; `build.rs` compiles at
+  `-std=metal4.0`, and the 4.1 low-precision formats are absent under the 4.0
+  toolchain.
+- **The OS.** Metal 4.1 needs Xcode 27 *and* macOS 27.0, not the "Xcode 26.1+"
+  the specification claims, and a 4.1 binary refuses to load below that. This
+  machine runs macOS 26.6.2.
+
+And on an M4 the formats are **emulated rather than accelerated**: fp8
+`matmul2d` sustains 0.94x the throughput of fp16 while reading half the
+operand bytes, `matmul2d` executes on the GPU shader cores through the legacy
+`simdgroup_matrix` path with no dedicated matrix datapath and no sign of ANE
+routing, and it accumulates in at least fp32. Those are measurements on this
+exact part -- M4 Max, 40 GPU cores, 64 GB -- from *Rigel: Reverse-Engineering
+the Metal 4.1 Tensor Compute Path on the Apple M4 Max GPU* (arXiv 2606.12765),
+run on macOS 27.0.
+
+**The inversion to remember.** "A memory-footprint feature, not a performance
+feature" is a verdict from compute-bound GEMM. A decode step here is the
+opposite: 95-96% GPU busy, waiting on 2.83 GB of weight reads at ~272 GB/s of
+a possible 546. Halving operand bytes for 6% of the arithmetic is, at batch 1,
+close to a win proportional to the bytes saved. Footprint *is* performance
+here, which is exactly why the paper's dismissal does not transfer.
+
+The same paper's optimization study is the other way round and confirms
+something this port measured independently: a hand-fused GEMM+bias+GELU beats
+the decomposed path by 6.5-12.9% in the cache-resident regime, the win decays
+as the O(n^3) compute dominates, and it "does not extend to operations that
+forgo the matrix units". Decode forgoes them entirely -- see the reverted
+router fusion below, which bought half a percent.
+
+**None of that is needed for the byte win, though.** mlx already carries
+`fp_quantized.metal` for `Mxfp4` / `Mxfp8` / `Nvfp4` (uint8 E8M0 scales, no
+biases, group size fixed at 32, or 16 for nvfp4) as a software path whose own
+source note reads "fp benefits on every gen"; `fp_quantized_nax.metal` is the
+Metal 4 tensor variant. Per weight: affine int4 g32 costs 5.00 bits, MXFP4
+4.25, nvfp4 g16 4.50, affine int8 g64 8.50, MXFP8 8.25. Against this model's
+mix that is ~5% fewer bytes a token -- worth little on its own, and worth a
+lot only if MXFP4 holds quality at 4 bits where affine int4 did not, since
+that is what would let the 8-bit half of the artifact drop to 4 and take ~35%
+of the traffic with it. This port carries only the `affine_*` family, so going
+there means porting `fp_*` whole.
+
+**The checklist for the M5, in order.**
+
+1. `nax_available()` flips true (gen >= 17, or >= 18 on a 'p' part) and three
+   asserts fire first, by design: the gemm and the gather gemm in
+   `src/ops/quantized.rs`, and `dispatch_choices_for_this_model`. That is the
+   signal that mlx would now pick kernels this port does not carry -- porting
+   the `*_nax` family becomes a decision rather than an accident.
+2. The steel gemm tile. `GEMM_TPARAM_MACRO` keys off the last letter of the
+   architecture name; if an M5 classes differently from "medium", a new tile
+   has to be instantiated in `kernels/steel_gemm_inst.metal`.
+3. `qmv_batch_limit` already carries the gen-17 branch (33/25/13 where gen 16
+   gives 13/15/13). `tests/quantized.rs::dispatch_choices_for_this_model`
+   skips itself off gen 16 and says so -- re-pin those numbers there.
+4. The two-pass SDPA routing and `sdpa_blocks` both key off the architecture's
+   last letter, so a different device class changes when attention splits.
+5. Re-measure everything in "Where a decode step goes". The Rigel numbers are
+   M4 numbers; the M4 predates the Neural Accelerators that arrived with the
+   A19 and M5, so the emulation verdict in particular has to be re-measured on
+   the new part rather than carried over.
+
+---
+
+## Layout
+
+```
+kernels/mlx/...            mlx's Metal sources, verbatim, original paths kept
+kernels/*.metal            our instantiation lists + the kernels mlx JITs
+src/metal/                 device, pipeline cache, buffer pool, encoding
+src/{json,safetensors,array,weights}.rs   loading
+src/ops/                   kernel dispatch, one module per mlx primitive family
+src/model/                 config, caches, layers, the MTP head
+src/vision/                the tower, its preprocessing (incl. Pillow's
+                           bicubic resampler) and the prompt splice
+src/tokenizer/             NFC, the split regex, BPE, the added vocabulary
+src/chat.rs                chat_template.jinja, hand-compiled
+src/sample.rs              make_sampler: top-p, top-k, categorical
+src/generate.rs            generate_step: prefill chunking and the decode loop
+src/mtp_generate.rs        the MTP draft/verify loop
+src/frspec.rs              the pruned draft head (FR-Spec)
+src/main.rs                the console chat
+src/refs.rs                golden-reference reader
+tools/dump_*.py            golden-reference writers (run against MLX)
+tools/epoch_schedule.py    how few barrier epochs a step's dependencies allow
+M5.md                      what changes on a GPU where nax_available() is true
+REBUILD.md                 rebuilding the artifact from its bf16 parent
+tools/gen_unicode.py       the Unicode tables the tokenizer needs
+refs/<case>/               the references themselves (not in git)
+tests/                     one test file per reference case
+```
+
+`build.rs` compiles every `.metal` under `kernels/` into one metallib with
+mlx's own flags plus `-fmetal-math-mode=safe`, and `src/metal/mod.rs` embeds it
+with `include_bytes!`.
+
+---
+
+## Running it
+
+```
+cargo run --release                          # chat, temp 0.6 / top_p 0.95 / top_k 20
+cargo run --release -- --greedy              # temperature 0
+cargo run --release -- -p "..." -m 200       # one shot
+cargo run --release -- --raw -p "..."        # no chat template
+cargo run --release -- --tokenizer-json ...  # tokenizer.json's split regex
+cargo run --release -- --mtp                 # speculative decoding, depth 3
+cargo run --release -- --mtp --mtp-depth 1 --frspec   # the fast pairing
+cargo run --release -- --mtp-depth 1         # shallower draft, see the table below
+cargo run --release -- --image p.bmp -p "..." # one image (repeat for more)
+cargo run --release -- --image p.rgb --image-size 768x448
+```
+
+There is no image *decoder* in Rust, on purpose: `--image` takes a binary PPM,
+an uncompressed BMP, or raw RGB. macOS ships the decoder:
+
+```
+sips -s format bmp photo.heic --out photo.bmp
+```
+
+Any size is fine -- `smart_resize` and Pillow's bicubic resampler are both
+ported, so the picture is resized exactly as MTPLX would have resized it.
+
+Loading is ~16 s warm (mmap + per-tensor copy into Metal buffers), ~70 s cold.
+Decode runs at ~92 tok/s, greedy and sampled alike -- the sampler's two
+248320-wide argsorts cost about a percent, which is well inside the noise.
+
+---
+
+## What is done and verified
+
+All tests assert **`max_abs == 0.0`** against MLX -- bit-exact, not a
+tolerance. Both sides run the same kernels, so any difference means the
+dispatch diverged.
+
+| Test | Covers |
+|---|---|
+| `quantized.rs` | `quantized_mat
+
+//! The sparse mixture-of-experts block.
+//!
+//! Port of `Qwen3NextSparseMoeBlock` and `SwitchGLU`
+//! (vendor/mlx-lm/mlx_lm/models/qwen3_next.py and switch_layers.py) with the
+//! kernel dispatch from `GatherQMM::eval_gpu`.
+//!
+//! The Python is short, and every line of it is a decision that shows up in the
+//! numbers:
+//!
+//! ```text
+//!     gates = self.gate(x)
+//!     gates = mx.softmax(gates, axis=-1, precise=True)
+//!     inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+//!     scores = mx.take_along_axis(gates, inds, axis=-1)
+//!     scores = scores / scores.sum(axis=-1, keepdims=True)      # norm_topk_prob
+//!     y = self.switch_mlp(x, inds)
+//!     y = (y * scores[..., None]).sum(axis=-2)
+//!     shared_y = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+//!     y = y + shared_y
+//! ```
+
+use crate::array::{Array, Dtype};
+use crate::metal::Context;
+
+use super::quantized::{QuantMatrix, gather_qmm_rows, quantized_matmul};
+use super::reduce::{sum_last_axis, sum_second_last_axis};
+
+fn tname(d: Dtype) -> &'static str {
+    match d {
+        Dtype::BF16 => "bfloat16",
+        Dtype::F32 => "float32",
+        Dtype::U32 => "uint32",
+        d => panic!("no moe kernel for {}", d.name()),
+    }
+}
+
+/// Launch geometry for a flat one-thread-per-element kernel.
+///
+/// The grid is the exact element count, never rounded up to a multiple of the
+/// threadgroup: `dispatchThreads:` handles a non-uniform last threadgroup, and
+/// rounding up instead would run threads past the end of the buffer. None of
+/// these kernels bounds-check, because with an exact grid they do not have to
+/// -- and a rounded grid corrupted memory in a way that only showed up at
+/// sequence lengths whose element count was not a multiple of 256.
+fn flat(n: usize) -> ((usize, usize, usize), (usize, usize, usize)) {
+    let tg = 256.min(n.next_power_of_two()).max(1);
+    ((n, 1, 1), (tg, 1, 1))
+}
+
+/// `mx.argsort(x, axis=-1)` for a row-contiguous 2-D `x`.
+///
+/// Port of `single_block_sort`. mlx routes `argpartition` here too, so the
+/// router's top-k comes out of a full ascending sort.
+pub fn argsort_last_axis(ctx: &Context, x: &Array) -> Array {
+    let n = x.dim(-1);
+    let n_rows = x.numel() / n;
+    let out = Array::empty(ctx, &x.shape, Dtype::U32);
+
+    // `gpu_merge_sort`: tn is always 4, and bn is the first bucket that fits.
+    let tn = 4usize;
+    let potential_bn = n.div_ceil(tn);
+    let mut bn = if potential_bn > 256 {
+        512
+    } else if potential_bn > 128 {
+        256
+    } else if potential_bn > 64 {
+        128
+    } else if potential_bn > 32 {
+        64
+    } else {
+        32
+    };
+    if bn == 512 && x.dtype.size() > 4 {
+        bn = 256;
+    }
+    let n_blocks = n.div_ceil(bn * tn);
+    assert_eq!(
+        n_blocks, 1,
+        "a {n}-wide sort needs mlx's multi_block_sort, which this port does not carry"
+    );
+
+    let name = format!("carg_block_sort_{}_uint32_bn{bn}_tn{tn}", tname(x.dtype));
+    ctx.kernel(&name)
+        .arr(x)
+        .out(&out)
+        .bytes(&(n as i32)) // size_sorted_axis
+        .bytes(&1i32) // in_stride_sorted_axis
+        .bytes(&1i32) // out_stride_sorted_axis
+        .bytes(&(n as i32)) // in_stride_segment_axis
+        .bytes(&(n as i32)) // out_stride_segment_axis
+        .groups((1, n_rows, 1), (bn, 1, 1));
+    out
+}
+
+/// `argpartition(x, kth=-k)[..., -k:]` plus the gathered scores, i.e. the
+/// router's expert selection.
+pub fn top_k(ctx: &Context, gates: &Array, k: usize) -> (Array, Array) {
+    let n = gates.dim(-1);
+    let rows = gates.numel() / n;
+    let order = argsort_last_axis(ctx, gates);
+
+    let inds = Array::empty(ctx, &[rows, k], Dtype::U32);
+    let (grid, tg) = flat(rows * k);
+    ctx.kernel("slice_tail_uint32")
+        .arr(&order)
+        .out(&inds)
+        .bytes(&(n as u32))
+        .bytes(&(k as u32))
+        .threads(grid, tg);
+
+    let scores = Array::empty(ctx, &[rows, k], gates.dtype);
+    ctx.kernel(&format!("take_along_last_{}", tname(gates.dtype)))
+        .arr(gates)
+        .arr(&inds)
+        .out(&scores)
+        .bytes(&(n as u32))
+        .bytes(&(k as u32))
+        .threads(grid, tg);
+
+    (inds, scores)
+}
+
+/// `scores / scores.sum(axis=-1, keepdims=True)`.
+pub fn normalize_scores(ctx: &Context, scores: &Array) -> Array {
+    let k = scores.dim(-1);
+    let rows = scores.numel() / k;
+    let denom = Array::empty(ctx, &[rows, 1], scores.dtype);
+    sum_last_axis(ctx, scores, &denom);
+
+    let out = Array::empty(ctx, &scores.shape, scores.dtype);
+    let (grid, tg) = flat(scores.numel());
+    ctx.kernel(&format!("div_by_row_{}", tname(scores.dtype)))
+        .arr(scores)
+        .arr(&denom)
+        .out(&out)
+        .bytes(&(k as u32))
+        .threads(grid, tg);
+    out
+}
+
+/// `SwitchGLU.__call__`: route each token to its `k` experts.
+///
+/// `x` is `[tokens, dim]`, `inds` is `[tokens, k]`. Returns `[tokens, k, dim]`.
+pub fn switch_glu(
+    ctx: &Context,
+    x: &Array,
+    inds: &Array,
+    gate_proj: &QuantMatrix,
+    up_proj: &QuantMatrix,
+    down_proj: &QuantMatrix,
+) -> Array {
+    switch_glu_sorted(ctx, x, inds, gate_proj, up_proj, down_proj, None)
+}
+
+/// `force_sort` overrides mlx-lm's threshold; sorting is a permutation, so it
+/// must not change the result, which makes this a useful cross-check.
+pub fn switch_glu_sorted(
+    ctx: &Context,
+    x: &Array,
+    inds: &Array,
+    gate_proj: &QuantMatrix,
+    up_proj: &QuantMatrix,
+    down_proj: &QuantMatrix,
+    force_sort: Option<bool>,
+) -> Array {
+    let tokens = x.shape[0];
+    let dim = x.shape[1];
+    let k = inds.shape[1];
+    let rows = tokens * k;
+
+    // mlx-lm sorts once the batch is big enough for the weight reads to
+    // dominate: `do_sort = indices.size >= 64`.
+    let do_sort = force_sort.unwrap_or(rows >= 64);
+
+    let (xs, idx, inv_order) = if do_sort {
+        let (order, inv_order) = counting_sort(ctx, inds, gate_proj.num_experts());
+        let xs = Array::empty(ctx, &[rows, dim], x.dtype);
+        let (grid, tg) = flat(rows * dim);
+        ctx.kernel(&format!("gather_rows_div_{}", tname(x.dtype)))
+            .arr(x)
+            .arr(&order)
+            .out(&xs)
+            .bytes(&(dim as u32))
+            .bytes(&(k as u32))
+            .threads(grid, tg);
+
+        let idx = Array::empty(ctx, &[rows], Dtype::U32);
+        let (g2, t2) = flat(rows);
+        ctx.kernel("gather_u32").arr(inds).arr(&order).out(&idx).threads(g2, t2);
+        (xs, idx, Some(inv_order))
+    } else {
+        // Unsorted: each token's row is reused for all k experts, which the
+        // kernel expresses through `lhs_indices`.
+        (x.clone(), inds.reshape(&[rows]), None)
+    };
+
+    // lhs_indices: which row of `xs` each output row reads. Sorted rows are
+    // already one-to-one; unsorted ones repeat each token k times.
+    let lhs: Vec<u32> = if do_sort {
+        (0..rows as u32).collect()
+    } else {
+        (0..rows as u32).map(|i| i / k as u32).collect()
+    };
+    let lhs_indices = Array::from_slice(ctx, &lhs, &[rows], Dtype::U32);
+
+    let x_up = gather_qmm_rows(ctx, &xs, up_proj, &lhs_indices, &idx, do_sort);
+    let x_gate = gather_qmm_rows(ctx, &xs, gate_proj, &lhs_indices, &idx, do_sort);
+    let act = super::elementwise::swiglu(ctx, &x_gate, &x_up);
+    // down_proj consumes the activation row-for-row, so its lhs indices are
+    // the identity regardless of sorting.
+    let identity: Vec<u32> = (0..rows as u32).collect();
+    let lhs_down = Array::from_slice(ctx, &identity, &[rows], Dtype::U32);
+    let y = gather_qmm_rows(ctx, &act, down_proj, &lhs_down, &idx, do_sort);
+
+    match inv_order {
+        Some(inv) => {
+            let out = Array::empty(ctx, &[rows, dim], y.dtype);
+            let (grid, tg) = flat(rows * dim);
+            ctx.kernel(&format!("unsort_rows_{}", tname(y.dtype)))
+                .arr(&y)
+                .arr(&inv)
+                .out(&out)
+                .bytes(&(dim as u32))
+                .threads(grid, tg);
+            out.reshape(&[tokens, k, dim])
+
+---
+library_name: mlx
+license: mit
+license_link: https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B/blob/main/LICENSE
+pipeline_tag: image-text-to-text
+base_model: ornith-ai/Ornith-1.5-35B-A3B
+tags:
+  - mlx
+  - mtplx
+  - vision
+  - mtp
+---
+
+# Ornith 1.5 35B-A3B — MLX Vision + Native MTP
+
+Hybrid MLX quant of `ornith-ai/Ornith-1.5-35B-A3B`, pinned to revision `10fbf86fed7ecee4a061f8b499a618f46001cac1`.
+
+## Artifact
+
+- 4-bit affine expert body with 8-bit attention, routing, embeddings, LM head, and late-layer projections
+- 60 recurrent tensors retained in BF16
+- 333 native BF16 vision tensors
+- 785 native BF16 MTP tensors in `mtp/weights.safetensors`
+- Recommended runtime: MTPLX 2.9.1, MLX 0.32.1, MLX-LM 0.31.3
+- Recommended speculative depth: D3
+
+## Run
+
+```bash
+mtplx serve \
+  --model Shiftedx/ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx \
+  --profile sustained \
+  --depth 3 \
+  --mtp \
+  --reasoning off
+```
+
+## Local qualification
+
+Tested on an M4 Max with 64 GB unified memory.
+
+| Gate | Result |
+|---|---:|
+| Executable Python tasks | 8/8 |
+| Text exact-output smoke | pass |
+| Vision smoke | pass |
+| MTP tensor gate | 785/785 exact |
+
+The final three-prompt, 512-token MTPLX sweep selected D3 at 109.0 decode tok/s. D1, D2, and D3 all passed the quality gate. Fans remained on automatic, so treat the speed as a host-specific measurement rather than a universal benchmark.
+
+## Notes
+
+Vision requires a compatible MLX-VLM or MTPLX runtime. Review generated code and tool calls before execution. The parent model and this derivative use the upstream MIT license; see the 

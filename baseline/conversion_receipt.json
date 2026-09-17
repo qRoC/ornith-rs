@@ -1,0 +1,96 @@
+{
+  "status": "pass",
+  "adapter_id": "qwen35-moe-attention8-bf16recurrence-v1",
+  "recipe_id": "attention8-bf16-recurrence",
+  "source": "ornith-ai/Ornith-1.5-35B-A3B@10fbf86fed7ecee4a061f8b499a618f46001cac1",
+  "output": "attention8-bf16-recurrence",
+  "validated_source": {
+    "architecture": {
+      "model_type": "qwen3_5_moe",
+      "text_model_type": "qwen3_5_moe_text",
+      "layers": 40,
+      "layer_types": [
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention"
+      ],
+      "linear_attention_layers": 30,
+      "full_attention_layers": 10
+    },
+    "source": {
+      "indexed_tensors": 1811,
+      "vision_tensors": 333,
+      "mtp_tensors": 785,
+      "recurrent_a_weights": 30,
+      "recurrent_b_weights": 30
+    }
+  },
+  "expected": {
+    "quantized_modules": 452,
+    "float_exclusions": 60,
+    "q8_modules": 260,
+    "q4_modules": 192
+  },
+  "observed": {
+    "quantized_modules": 452,
+    "float_exclusions": 60,
+    "q8_modules": 260,
+    "q4_modules": 192,
+    "packed_precision_counts": {
+      "4": 192,
+      "8": 260
+    },
+    "packed_layout_mismatches": [],
+    "float_exclusions_with_scales": 0,
+    "float_exclusion_dtypes": {
+      "BF16": 60
+    },
+    "vision_tensors_in_text_body": 0,
+    "mtp_tensors_in_text_body": 0
+  },
+  "hashes": {
+    "source_config_sha256": "af198ccbe6c17dd973da98bbf6c92ce1c3ec7261c2e2fbc4c4f5150018418ea8",
+    "source_index_sha256": "0ad9fbfbb1a7514773ed881d3c9403019bd7ae9ff4c6af3cfc65ca7da784d78f",
+    "source_chat_template_sha256": "182e77dd83bd8e9ca818b240b82e28f243762cd5dda32e6eef327df7b1cd107e",
+    "recipe_sha256": "33e3271dffa77dd63ba3e35812eb70f4b8b00e2ff0bf86712845798e7e90b430",
+    "converter_sha256": "3ec4d2c198ea22a7fcbb25569a3c6fe5e2bae03cda8d4e7ebf8db0a70dc5c145"
+  },
+  "failures": []
+}

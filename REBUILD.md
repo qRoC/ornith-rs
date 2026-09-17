@@ -135,10 +135,26 @@ about the vision tower, or about quantization. No guidance exists upstream on
 which modules tolerate 4 bits -- which is precisely the question Phase 4 sets
 out to answer experimentally, because there is nobody to ask.
 
-## Phase 0 -- before anything is deleted
+## Phase 0 -- before anything is deleted -- **DONE**
 
-Everything here is unrecoverable once the artifact is gone. It is small and
-quick; do all of it.
+Captured and committed under `baseline/`; see `baseline/README.md`. It is out
+of `refs/` on purpose: everything in `refs/` regenerates from a
+`tools/dump_*.py`, and nothing here does.
+
+| | |
+|---|---|
+| metadata | 13 files, including `BUILD_RECIPE.json` (the rebuild's input) and `.mtplx-source.json` (per-file sha256) |
+| perplexity | **6.3327** over 6620 tokens of `baseline/ppl_corpus.txt`, mean NLL 1.845725 |
+| logprobs | float32 `[8, 248320]`, full next-token distributions for 8 fixed contexts |
+| anchors | 4 prompts x 96 greedy tokens, ids and text |
+| MTP acceptance | 4 prompts at depth 1 and 3 |
+
+`tools/dump_artifact_baseline.py` is the writer, and it is the one writer in
+this repository that **cannot be re-run** -- its input is the artifact about
+to be deleted. Point it at the rebuild to get the other side of the
+comparison.
+
+The original checklist, for the record:
 
 1. **Copy the artifact's own metadata out.** These are the *inputs* to the
    rebuild, not just records:
