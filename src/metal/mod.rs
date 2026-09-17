@@ -210,6 +210,22 @@ pub struct Prof {
     pub syncs: usize,
     /// Summed `GPUEndTime - GPUStartTime` over committed command buffers.
     pub gpu_s: f64,
+    /// The other half of that: summed `GPUStartTime` of each buffer against
+    /// `GPUEndTime` of the one before, i.e. where the GPU had nothing to do.
+    /// The queue is serial, so consecutive buffers really are consecutive.
+    pub gap_s: f64,
+    /// Of which, gaps that follow a host round trip -- the CPU was reading a
+    /// result and deciding what to encode next.
+    pub gap_after_sync_s: f64,
+    /// Gap time charged to the first kernel of the buffer that ended it:
+    /// what the GPU was waiting to be handed.
+    gap_by_kernel: HashMap<Rc<str>, (f64, usize)>,
+    /// `GPUEndTime` of the last harvested buffer, to measure the next gap
+    /// against. Negative until there is one.
+    last_end: f64,
+    /// Whether a host round trip has happened since the last commit, so the
+    /// next buffer's gap can be charged to it.
+    sync_pending: bool,
     /// Time blocked in `waitUntilCompleted`.
     pub wait_s: f64,
     pub by_kernel: HashMap<String, usize>,
@@ -223,8 +239,9 @@ pub struct Prof {
     cb_names: Vec<String>,
     /// Committed but not yet harvested; their timestamps are only readable
     /// once the GPU is done with them. Carries the one kernel name when the
-    /// buffer holds exactly one dispatch.
-    pending: Vec<(CommandBuffer, Option<String>)>,
+    /// buffer holds exactly one dispatch, the first kernel in it either way,
+    /// and whether a host round trip came just before it.
+    pending: Vec<(CommandBuffer, Option<String>, Rc<str>, bool)>,
 }
 
 /// Lines `ORNITH_TRACE` records before it stops. One decode step is ~1669
@@ -776,6 +793,12 @@ impl Context {
         // The queue is serial, so everything committed before that buffer has
         // completed too and the timestamps are readable now.
         self.prof_harvest();
+        {
+            let mut p = self.prof.borrow_mut();
+            if p.on {
+                p.sync_pending = true;
+            }
+        }
     }
 
     /// Keep a buffer alive until the current batch completes.
@@ -927,7 +950,9 @@ impl Context {
         p.commits += 1;
         let names = std::mem::take(&mut p.cb_names);
         let one = (names.len() == 1).then(|| names[0].clone());
-        p.pending.push((cb.clone(), one));
+        let first: Rc<str> = names.first().map(|n| Rc::from(n.as_str())).unwrap_or_else(|| Rc::from(""));
+        let after_sync = std::mem::take(&mut p.sync_pending);
+        p.pending.push((cb.clone(), one, first, after_sync));
     }
 
     /// Sum the GPU busy time of every command buffer that has completed.
@@ -936,8 +961,20 @@ impl Context {
         if !p.on {
             return;
         }
-        for (cb, name) in std::mem::take(&mut p.pending) {
-            let dt = cb.GPUEndTime() - cb.GPUStartTime();
+        for (cb, name, first, after_sync) in std::mem::take(&mut p.pending) {
+            let (start, end) = (cb.GPUStartTime(), cb.GPUEndTime());
+            if p.last_end > 0.0 && start > p.last_end {
+                let gap = start - p.last_end;
+                p.gap_s += gap;
+                if after_sync {
+                    p.gap_after_sync_s += gap;
+                }
+                let e = p.gap_by_kernel.entry(first).or_default();
+                e.0 += gap;
+                e.1 += 1;
+            }
+            p.last_end = end;
+            let dt = end - start;
             p.gpu_s += dt;
             match name {
                 Some(n) => *p.gpu_by_kernel.entry(n).or_default() += dt,
@@ -955,6 +992,21 @@ impl Context {
     /// Host round trips since the last reset.
     pub fn prof_syncs(&self) -> usize {
         self.prof.borrow().syncs
+    }
+
+    /// `(total idle between command buffers, of which after a round trip)`.
+    pub fn prof_gaps(&self) -> (f64, f64) {
+        let p = self.prof.borrow();
+        (p.gap_s, p.gap_after_sync_s)
+    }
+
+    /// `(kernel the GPU was waiting for, seconds, times)`, longest first.
+    pub fn prof_gap_by_kernel(&self) -> Vec<(String, f64, usize)> {
+        let p = self.prof.borrow();
+        let mut v: Vec<(String, f64, usize)> =
+            p.gap_by_kernel.iter().map(|(k, (s, n))| (k.to_string(), *s, *n)).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        v
     }
 
     /// Barriers inserted since the last reset.
@@ -1066,6 +1118,11 @@ impl Context {
         p.dispatches = 0;
         p.gpu_s = 0.0;
         p.wait_s = 0.0;
+        p.gap_s = 0.0;
+        p.gap_after_sync_s = 0.0;
+        p.gap_by_kernel.clear();
+        p.last_end = -1.0;
+        p.sync_pending = false;
         p.by_kernel.clear();
         p.gpu_by_kernel.clear();
         p.gpu_mixed = 0.0;

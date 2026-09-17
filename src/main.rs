@@ -218,6 +218,7 @@ fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
         commits as f64 / n,
         ctx.prof_syncs() as f64 / n,
     );
+    report_gaps(ctx, n, gen_time);
     let (live, peak) = ctx.pool_stats();
     eprintln!(
         "[prof: pooled intermediates {:.1} MB live, {:.1} MB peak]",
@@ -250,6 +251,37 @@ fn report_prof(ctx: &Context, steps: usize, gen_time: f64) {
             g * 1e3 / n,
             100.0 * g / total.max(1e-12),
             *c as f64 / n,
+            k
+        );
+    }
+}
+
+/// Where the GPU had nothing to do.
+///
+/// `gpu` above is summed `GPUEndTime - GPUStartTime`, so it measures only
+/// where the GPU works. This is the other half: the queue is serial, so the
+/// stretch between one command buffer ending and the next starting is idle,
+/// and it is charged to the first kernel of the buffer that ended it -- what
+/// the GPU was waiting to be handed. A gap that follows a host round trip is
+/// counted separately, since there the CPU was reading a result back and
+/// deciding what to encode next rather than merely encoding slowly.
+fn report_gaps(ctx: &Context, n: f64, gen_time: f64) {
+    let (gap, after_sync) = ctx.prof_gaps();
+    if gap <= 0.0 {
+        return;
+    }
+    eprintln!(
+        "[prof: {:.2} ms/token idle between command buffers ({:.0}% of wall), \
+         {:.2} of it after a round trip]",
+        gap * 1e3 / n,
+        100.0 * gap / gen_time.max(1e-9),
+        after_sync * 1e3 / n,
+    );
+    for (k, s, times) in ctx.prof_gap_by_kernel().iter().take(8) {
+        eprintln!(
+            "  {:>7.3} ms  x{:<6.1} waiting to be handed {}",
+            s * 1e3 / n,
+            *times as f64 / n,
             k
         );
     }

@@ -415,12 +415,43 @@ Depth 2 gained ~5% of wall, depths 1 and 3 nothing, and the GPU busy share is
 still ~80% against autoregression's 96%.
 
 So the stall is real, it is worth ~9% at depth 1, and it is *not* the number
-of round trips. What is left to explain is the gap between command buffers,
-which the profiler cannot see: it sums `GPUEndTime - GPUStartTime` and so
-measures only where the GPU works, never where it waits. Measuring the gaps --
-`GPUStartTime` of each buffer against `GPUEndTime` of the one before, charged
-to whatever was encoded into it -- is the instrument this needs, and it does
-not exist yet.
+of round trips.
+
+**The gap profiler now says where it is**, if not yet what it is. `ORNITH_PROF`
+measures `GPUStartTime` of each buffer against `GPUEndTime` of the one before
+-- the queue is serial, so that stretch is idle -- and charges it to the first
+kernel of the buffer that ended it, which is what the GPU was waiting to be
+handed. Autoregression reads cleanly: 0.46 ms a token, 4% of wall, and
+essentially all of it is one gap of 0.43 ms once a token, waiting for
+`gather_rows_by_id` -- the embedding that starts the next forward, after the
+sampler's round trip. That is the price of the one unavoidable round trip and
+nothing else is wrong.
+
+MTP at depth 1 idles 2.0-2.5 ms a token, ~20% of wall, and it is the *same*
+gap: waiting for `gather_rows_by_id`, ~0.7 times a token, at **~2.0 ms each
+against autoregression's 0.43**. One event, 4.6x the price. Four explanations
+have been tried and measured away:
+
+- **The number of round trips.** Halved (above); the idle did not move.
+- **The `Committed` history policy**, which encodes a `head.hidden` between
+  the round trip and the next draft. Real but small: `--mtp-cycle` is ~7% of
+  wall faster at identical GPU busy, so the policy costs ~0.4 ms a token. It
+  buys the head an authoritative history, and that is the trade.
+- **The commit threshold**, on the theory that a short draft phase never
+  reaches 128 dispatches so the GPU waits for the verify's encoding to push it
+  over. `ORNITH_COMMIT_EVERY` of 64 and 32 both made the idle slightly
+  *worse*, and the draft is ~250-500 dispatches anyway.
+- **Host work in the loop.** Timed per phase: the CPU spends ~108 us a cycle
+  encoding the draft, ~3.6 ms encoding the verify, 4 us rewinding, 62 us on
+  `head.hidden` and 15 us emitting. Everything else is blocking on the GPU.
+  There is no 2 ms of host work to find.
+
+So what is left is the shape of the restart itself: after a full drain, MTP
+takes 2 ms to get the GPU going again where autoregression takes 0.43, and
+none of the obvious differences account for it. The next tool is not another
+counter on this side -- it is a Metal system trace, which can see submission
+and scheduling latency that `GPUStartTime` already includes by the time we
+read it.
 
 Only after that is it worth making the draft cheaper, and there the number is:
 a draft step is ~2.4 ms of GPU, about half of which is the `lm_head` below.
