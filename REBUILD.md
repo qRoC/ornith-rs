@@ -767,18 +767,28 @@ and no ordering of the experiments makes it the right thing to try.
 
 ### What the experiments measured -- **DONE**
 
-Three artifacts, built from the same verified parent by the same toolchain,
+Four artifacts, built from the same verified parent by the same toolchain,
 measured against `baseline/` on the same corpus and the same eight contexts.
 
 Named for what each one puts at 4 bits, not for the tier the publisher sold
 it as -- `int8-everywhere` is the artifact this port was built on, and the
-other two are what the experiment moves.
+rest are what the experiment moves.
 
-| what is at 4 bits | 8-bit left | ppl | vs control | max KL | GB/token | AR tok/s | D1 tok/s |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **`int8-everywhere`** -- the control | 260 | 6.3327 | -- | 0 | 2.737 | 63.7 | 88.3 |
-| **`int4-head-linattn`** -- `lm_head` and the three `linear_attn` projections | 169 | 6.5022 | +2.7% | **0.048** | 2.074 (-24.2%) | 75.1 (+17.9%) | 112.6 |
-| **`int4-except-gates`** -- everything but the 80 router gates | 80 | 6.6422 | +4.9% | **0.323** | 1.855 (-32.2%) | 79.4 (+24.6%) | 117.6 |
+| what is at 4 bits | 8-bit left | ppl | vs control | max KL | GB/token | GPU busy |
+|---|---:|---:|---:|---:|---:|---:|
+| **`int8-everywhere`** -- the control | 260 | 6.3327 | -- | 0 | 2.739 | 10.40 ms |
+| **`int4-head-linattn`** -- `lm_head` and the three `linear_attn` projections | 169 | 6.5022 | +2.7% | **0.048** | 2.076 (-24.2%) | 9.17 ms (-11.8%) |
+| `nvfp4-head-linattn` -- the same four families, in nvfp4 g16 | 169 | 6.6010 | +4.2% | **0.429** | 1.925 (-29.7%) | 8.55 ms (-17.8%) |
+| **`int4-except-gates`** -- everything but the 80 router gates | 80 | 6.6422 | +4.9% | **0.323** | 1.858 (-32.2%) | 8.29 ms (-20.3%) |
+
+The GB/token column is now `tools/step_bytes.py` reading the safetensors
+headers rather than arithmetic off the module inventory; it moves the three
+older absolutes by <= 0.2% and leaves their deltas unchanged. GPU busy is
+`ORNITH_PROF=1`, greedy, 256 tokens, a 27-token prompt, two runs each and
+within 1% of each other -- the wall clock is not reported because this machine
+was carrying a 12-17 GB swap file throughout and `HANDOFF.md` has the reason
+that number cannot be trusted. The earlier AR / D1 tok/s columns were MTPLX's
+own verification figures and are in the forge logs.
 
 **The answer to Phase 4's question is yes, and `int4-head-linattn` is where
 to stop.** These
@@ -792,6 +802,13 @@ scale:
 **Seventeen times the distribution cost per point of traffic past
 `int4-head-linattn`.** The last eight points are paid for at a rate the first
 twenty-four were not, and they buy 4.3% of decode. That is the knee.
+
+**And the knee held when a fourth variant went looking for a way round it.**
+`nvfp4-head-linattn` buys its extra points with a format rather than with
+more modules, and pays 0.0693 a point -- twice `int4-except-gates`'s rate, at
+*fewer* points. Two different ways past `int4-head-linattn`, one changing
+coverage and one changing precision, and both land on the wrong side of the
+same knee. See "nvfp4, built and measured" below.
 
 **Perplexity would have hidden this, exactly as the plan warned.** It moves
 +2.7% -> +4.9%, a factor of 1.8, while the KL moves 0.048 -> 0.323, a factor
@@ -868,6 +885,124 @@ it is a bytes-only follow-up: roughly three more points of traffic at that
 variant's quality, not `int4-except-gates`'s. That is now the only remaining rung worth building, and it needs the
 `fp_quantized` port. Whether three points justifies a new kernel family is a
 separate decision from the one this phase settled.
+
+*That prediction was wrong, and the section below is what it cost.* It was
+right about the bytes to the decimal and wrong about the quality by a factor
+of nine, because it priced the format on synthetic draws.
+
+### nvfp4, built and measured -- and it does not pay
+
+The rung named above is built: `recipes/nvfp4-head-linattn.json` is
+`int4-head-linattn` with `body_mode` nvfp4 and `body_group_size` 16, which
+moves all 283 four-bit modules to nvfp4 g16 and leaves the 169 eight-bit ones
+on affine. The kernels are in the port (`kernels/fp_quantized_inst.metal`,
+`src/ops/quantized.rs`), and the whole language model runs on them at
+`max_abs == 0.0` against MLX -- see below. The prize and the price:
+
+| against `int4-head-linattn` | |
+|---|---|
+| bytes a decode step | 2.076 -> 1.925 GB, **-7.3%**, exactly the predicted figure |
+| GPU busy a token | 9.17 -> 8.55 ms, **-6.7%** |
+| perplexity | 6.5022 -> 6.6010, +1.5% |
+| max KL against the control | 0.048 -> **0.429 nats**, a factor of **8.9** |
+
+**The bytes arrived and the quality did not.** The float-pair table below
+priced this at "9.4% -> 9.5% weight error, which is nothing"; the measured
+distribution cost is nine times `int4-head-linattn`'s.
+
+**It is strictly dominated by a variant already rejected.** Against
+`int4-except-gates`, which Phase 4 turned down for being past the knee, nvfp4
+is worse on every axis that matters:
+
+| | GB/token | GPU busy | max KL | ppl |
+|---|---:|---:|---:|---:|
+| `nvfp4-head-linattn` | 1.925 | 8.55 ms | 0.429 | 6.6010 |
+| `int4-except-gates` | **1.858** | **8.29 ms** | **0.323** | 6.6422 |
+
+More bytes, more GPU time, *and* a third more KL. The one column it wins is
+perplexity -- and **that is the same trap this phase already documented,
+firing a second time and pointing the other way.** Phase 4 warned that
+perplexity would make `int4-except-gates` look reasonable; here it makes
+nvfp4 look like the better of the two, and the KL says it is the worse. A
+format comparison is no safer on perplexity than a coverage comparison was.
+
+Cost per point of the control's traffic, on the same ladder as above:
+
+    control -> head-linattn      24.2 points for 0.048 nats   0.0020 a point
+    head-linattn -> except-gates  8.0 points for 0.275 nats   0.0344 a point
+    head-linattn -> nvfp4         5.5 points for 0.381 nats   0.0693 a point
+
+**Twice the rate of the rung that was already too expensive.**
+
+#### Why the prediction missed: synthetic weights are not these weights
+
+`tools/quant_error.py` prices a format on a million gaussian, laplace and
+student-t draws. `tools/weight_error.py` is new and asks the same question of
+the model: dequantize a module out of each artifact and compare it to the
+same module in the bf16 parent. The parent cannot be *loaded* on this host,
+but `mx.load` is lazy and one tensor is at most 1.0 GiB, so one module at a
+time is free -- this is the one thing the missing bf16 row can still give.
+
+Relative RMS weight error against the parent:
+
+| module | affine int8 g64 | affine int4 g32 | nvfp4 g16 |
+|---|---:|---:|---:|
+| `lm_head` | 0.75% | 8.33% | **10.39%** |
+| `linear_attn.in_proj_qkv` | 0.72% | 8.11% | **10.87%** |
+| `linear_attn.in_proj_z` | 0.73% | 8.17% | **10.64%** |
+| `linear_attn.out_proj` | 0.78% | 8.52% | **10.80%** |
+| `switch_mlp.gate_proj` | -- | 8.21% | **13.11%** |
+| `mlp.gate` (the router) | 0.86% | -- | -- |
+| *predicted, gaussian / laplace / t(4)* | *0.54 / 0.67 / 0.70* | *7.82 / 9.18 / 9.37* | *9.51 / 9.28 / 9.18* |
+
+**affine int4's prediction transferred and nvfp4's did not.** Affine lands at
+8.1-8.5%, between its gaussian and laplace figures, which is what a
+heavier-tailed real weight should do. nvfp4 lands at 10.4-10.9% on the dense
+projections -- above *all three* of its predicted numbers -- and at 13.11% on
+the expert slabs, 40% above the worst of them. So nvfp4 is not "equal error
+half a bit cheaper" on these weights; it is 1.3x the error on the dense
+projections and 1.6x on the experts.
+
+`weight_error.py --decompose` splits nvfp4's share of that in two, by
+reconstructing fp4 by hand over the same parent tensors with the shared scale
+at three precisions. The affine column below is mlx's own, from the table
+above; the E4M3-round-to-nearest column is the hand reconstruction, and it
+reproduces **mlx's nvfp4 to the last digit on all five modules** -- that
+agreement is what says the exact-scale column is measuring the E2M1 grid and
+not a reimplementation of the format.
+
+| | affine int4 g32 (mlx) | fp4 g16, exact scale | nvfp4 g16, E4M3 rn | clipped | E4M3 rounded up |
+|---|---:|---:|---:|---:|---:|
+| `lm_head` | 8.33% | 9.34% | 10.39% | 4.2% | 11.61% |
+| `in_proj_qkv` | 8.11% | 9.41% | 10.87% | 4.6% | 11.47% |
+| `in_proj_z` | 8.17% | 9.39% | 10.64% | 4.4% | 11.62% |
+| `out_proj` | 8.52% | 9.33% | 10.80% | 4.5% | 11.62% |
+| `switch_mlp.gate_proj` | 8.21% | 9.38% | **13.11%** | 4.2% | **11.29%** |
+
+- **The E2M1 grid is the bigger half everywhere except the experts.** Even
+  with a perfect scale and half the group size it is 9.3-9.4% against
+  affine's 8.1-8.5% -- 12-16% more error before the scale is quantized at
+  all. A non-uniform grid suits weights in principle; four exponent levels
+  and one mantissa bit is not enough of one, and the missing zero point costs
+  on top.
+- **The E4M3 scale is what wrecks the experts, and clipping is the
+  mechanism.** Three mantissa bits on the shared scale, rounded to nearest,
+  can round it *down*, and then the group's own maximum lands past the E2M1
+  clip at 6.0 -- a hard error, where affine's min/max scale cannot clip by
+  construction. 4.2-4.6% of elements clip, and that fraction is **the same
+  for every module**; what differs is what it costs. Rounding the scale up
+  instead removes the clipping entirely (0.0% throughout) and takes the
+  experts from 13.11% to 11.29%, while costing every other module 0.7-1.2
+  points. So the experts are not clipping more often, they are clipping
+  harder -- and the fix is a trade whose sign flips per tensor, which a
+  format with one scale rule cannot make.
+
+**The lesson for `IDEAS.md`.** That file's format table is the same synthetic
+study, and its two leading ideas -- an fp8 scale at g16, and a Lloyd-Max
+codebook at g16 with an fp8 scale -- both spend their budget exactly where
+nvfp4 just lost it: a coarser shared scale to pay for a smaller group. The
+ranking there is now unsafe until `weight_error.py` re-runs it on real
+weights. See the note added at the top of that section.
 
 ### The float pair, asked and priced
 

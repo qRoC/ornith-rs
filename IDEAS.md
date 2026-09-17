@@ -8,6 +8,19 @@ marked unmeasured.
 
 ## The ceiling on formats, measured
 
+> **Read the caveat before the table.** Every number below is
+> `tools/quant_error.py` on synthetic draws, and one row of it has since been
+> checked against the model's own weights and found badly optimistic: nvfp4
+> g16 is predicted at 9.18-9.51% and measures **10.4-10.9%** on the dense
+> projections and **13.1%** on the expert slabs
+> (`REBUILD.md`, "Why the prediction missed"). The affine rows transferred;
+> the one row that spends its budget on a coarser shared scale to pay for a
+> smaller group did not -- and **that is exactly what the two leading ideas
+> below do.** An fp8 scale has three mantissa bits, the same three that put
+> 4% of nvfp4's elements past its clip. Treat the ranking as a hypothesis and
+> settle it with `tools/weight_error.py` on real weights before building
+> anything on it.
+
 Relative RMS weight error against the rate-distortion floor for a Gaussian
 source, which is the best any code can do at that rate:
 
@@ -25,7 +38,7 @@ a gaussian and the ranking moves with it.
 | affine g32, fp8 scale+bias | 4.50 | 8.14% | 9.51% | 9.72% | 4.42% |
 | affine g16, fp8 scale, no zero-point | 4.50 | 8.35% | 9.97% | 10.43% | 4.42% |
 | affine g64, bf16 scale+bias | 4.50 | 8.97% | 11.13% | 11.74% | 4.42% |
-| nvfp4 g16 | 4.50 | 9.51% | 9.28% | 9.18% | 4.42% |
+| nvfp4 g16 -- **built; real weights 10.4-13.1%** | 4.50 | 9.51% | 9.28% | 9.18% | 4.42% |
 | mxfp4 g32 | 4.25 | 20.32% | 21.19% | 22.00% | 5.26% |
 | VQ dim 2, 256 codes, g32 | 4.50 | 8.54% | -- | -- | 4.42% |
 | VQ dim 4, 4096 codes, g32 | 3.50 | 14.97% | -- | -- | 8.84% |

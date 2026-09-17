@@ -109,16 +109,33 @@ forgo the matrix units". Decode forgoes them entirely -- see the reverted
 router fusion below, which bought half a percent.
 
 **None of that is needed for the byte win, though.** mlx already carries
-`fp_quantized.metal` for `Mxfp4` / `Mxfp8` / `Nvfp4` (uint8 E8M0 scales, no
-biases, group size fixed at 32, or 16 for nvfp4) as a software path whose own
-source note reads "fp benefits on every gen"; `fp_quantized_nax.metal` is the
-Metal 4 tensor variant. Per weight: affine int4 g32 costs 5.00 bits, MXFP4
-4.25, nvfp4 g16 4.50, affine int8 g64 8.50, MXFP8 8.25. Against this model's
-mix that is ~5% fewer bytes a token -- worth little on its own, and worth a
-lot only if MXFP4 holds quality at 4 bits where affine int4 did not, since
-that is what would let the 8-bit half of the artifact drop to 4 and take ~35%
-of the traffic with it. This port carries only the `affine_*` family, so going
-there means porting `fp_*` whole.
+`fp_quantized.metal` for `Mxfp4` / `Mxfp8` / `Nvfp4` (uint8 scales -- E8M0 for
+the mx pair, E4M3 for nvfp4 -- no biases, group size fixed at 32, or 16 for
+nvfp4) as a software path whose own source note reads "fp benefits on every
+gen"; `fp_quantized_nax.metal` is the Metal 4 tensor variant. Per weight:
+affine int4 g32 costs 5.00 bits, MXFP4 4.25, nvfp4 g16 4.50, affine int8 g64
+8.50, MXFP8 8.25.
+
+**The nvfp4 half of that is now ported, run and measured, and the answer is
+no.** `kernels/fp_quantized_inst.metal` instantiates nvfp4 g16 for bf16 and
+f32; `src/ops/quantized.rs` carries both halves of mlx's dispatcher behind a
+`QuantMode`; `tests/quantized_nvfp4.rs` pins every branch at `max_abs == 0.0`
+and `tests/model.rs` runs the whole 40-layer model on an nvfp4 artifact at the
+same bar. It delivers its bytes -- 2.076 -> 1.925 GB a token against
+`int4-head-linattn`, and 9.17 -> 8.55 ms of GPU busy, which is the byte saving
+converting almost one for one, as a memory-bound step should. It does not
+deliver its quality: the max KL goes 0.048 -> 0.429 nats, which leaves it
+**strictly dominated by `int4-except-gates`** on bytes, GPU busy *and* KL. The
+measured reason is that nvfp4's error on this model's own weights is
+10.4-13.1%, not the 9.2-9.5% a synthetic study predicted. `REBUILD.md`,
+"nvfp4, built and measured", has the whole thing; `recipes/README.md` has the
+table.
+
+mxfp4 and mxfp8 are **not** ported and the instantiation file says why: mxfp4
+measures 20-22% weight error against affine int4's 8-9%, and mxfp8 buys 0.8%
+of a step's bytes for 4.6x the error of the affine int8 it would replace.
+`QuantMode::from_config` names them rather than failing on a missing kernel,
+so an artifact forged in either mode says so instead of crashing.
 
 **The checklist for the M5, in order.**
 
@@ -167,6 +184,10 @@ M5.md                      what changes on a GPU where nax_available() is true
 REBUILD.md                 rebuilding the artifact from its bf16 parent
 IDEAS.md                   what designing the artifact buys, with the arithmetic
 tools/quant_error.py       every quantization number in those two, reproducible
+tools/weight_error.py      what a variant's format actually cost, against the
+                           bf16 parent, one module at a time
+tools/step_bytes.py        bytes one decode step reads, from the safetensors
+                           headers rather than by hand
 tools/gen_unicode.py       the Unicode tables the tokenizer needs
 refs/<case>/               the references themselves (not in git)
 tests/                     one test file per reference case
@@ -217,7 +238,8 @@ dispatch diverged.
 
 | Test | Covers |
 |---|---|
-| `quantized.rs` | `quantized_matmul` on real weights, 4-bit/g32 and 8-bit/g64, M = 1/2/4/8/16/64/256 (qmv_fast, qmv_wide, qmm_t_splitk + reduce) |
+| `quantized.rs` | `quantized_matmul` on real weights, **affine** 4-bit/g32 and 8-bit/g64, M = 1/2/4/8/16/64/256 (qmv_fast, qmv_wide, qmm_t_splitk + reduce) |
+| `quantized_nvfp4.rs` | the same, in **nvfp4 g16**, plus both gathered branches and `dequantize`. Carries its own weights -- the control artifact's, recut -- so it runs whatever model is on disk and could check the kernels before a build was spent on them |
 | `ops.rs` | rms_norm (weighted, weightless, head_dim), rope (decode + prefill, offsets), fused elementwise |
 | `activations.rs` | silu / swiglu / precise_swiglu / sigmoid over **every** bfloat16 input |
 | `attn.rs` | matmul (incl. broadcast batch), softmax, attention at 6 shapes across all three SDPA branches |
@@ -1311,25 +1333,38 @@ In order:
      kernel in the step, and taking it means reordering across block and layer
      boundaries, which needs a deferred op layer rather than another dozen
      lines. Worth doing only if something else wants that layer anyway.
-   - **Then bytes, which is the only lever left at batch 1.** `REBUILD.md`
-     is the plan and `IDEAS.md` is what the freedom to design the artifact
-     buys -- measured, not asserted: the grid has about one bit a weight left
-     in it and vector quantization does not collect it, the cheap win is in
-     the group metadata, and the one structural idea is a two-stage `lm_head`
-     worth 14% of a step and exact for greedy decoding.
-3. **Rebuild the artifact from its parent**, which is what unblocks the byte
-   lever above. `REBUILD.md` is the plan: the artifact records the recipe that
-   forged it, the parent is `ornith-ai/Ornith-1.5-35B-A3B@10fbf86f` and its
-   tensor inventory has been checked against that recipe remotely, and
-   `body_mode` is one word in the recipe -- mlx quantizes in `affine`,
-   `mxfp4`, `nvfp4` or `mxfp8`. The prize is the 260 modules held at 8 bits:
-   if a better 4-bit format holds quality where affine int4 did not, they drop
-   to 4 and take ~35% of a step's traffic with them.
+   - **Then bytes, which is the only lever left at batch 1 -- and mlx's own
+     formats are now spent.** `REBUILD.md` Phase 4 is done: four artifacts
+     built from the verified parent, judged on perplexity, KL, bytes and GPU
+     busy, and the answer is `int4-head-linattn` -- 24.2% of a step's traffic
+     and 11.8% of its GPU busy for 0.048 nats. Both ways past it have been
+     tried and both fail on the same knee: more modules
+     (`int4-except-gates`, 0.0344 nats a point) and a cheaper format
+     (`nvfp4-head-linattn`, 0.0693 a point, and strictly dominated by the
+     first). mlx has exactly four modes and mxfp4 and mxfp8 were priced out
+     without building. So the next byte is not a mode string any more.
+
+     What is left is `IDEAS.md`, with the caveat now written at the top of
+     it: the grid has about one bit a weight in it and vector quantization
+     does not collect it; the cheap win looked like the group metadata; and
+     the one structural idea is a two-stage `lm_head` worth 14% of a step and
+     exact for greedy decoding. **The two metadata ideas are the ones nvfp4
+     just failed at** -- spending a coarser shared scale to pay for a smaller
+     group -- and they were ranked on the same synthetic study that
+     mispriced it, so settle them with `tools/weight_error.py` on real
+     weights before building. The `lm_head` idea does not share that risk:
+     it is exact, not approximate.
+3. **Rebuild the artifact from its parent -- DONE**, Phases 0 through 4, and
+   it is what unblocked the byte lever above. `REBUILD.md` is the record. The
+   parent is `ornith-ai/Ornith-1.5-35B-A3B@10fbf86f`, it is kept on disk
+   because deleting it would mean a 70 GB download per variant, and
+   `body_mode` turned out to be exactly the one word in the recipe the plan
+   said it was.
 
    Read Phase 0 before deleting anything. Every test here compares against MLX
    on the same artifact, which validates the port and not the artifact, so a
-   bad rebuild passes the whole suite -- and the material for the only check
-   that would catch it exists only while the current artifact does.
+   bad rebuild passes the whole suite -- and `baseline/` holds the only
+   material that would catch it.
 4. **The MTP stall**, which is now the only thing between speculative
    decoding and a wall-clock win. FR-Spec is done and `--mtp-depth 1
    --frspec` does 14% less GPU work a token than autoregression; what it
@@ -1375,6 +1410,18 @@ taps (this `vision_config` ships none), and mlx's graph-level fusion engine
 (the fused forms it produces are written out by hand instead, in
 `kernels/ornith_elementwise.metal`, `kernels/sampler_ops.metal` and
 `kernels/vision_ops.metal`).
+
+Three more on the quantized side, each with its reason in
+`kernels/fp_quantized_inst.metal`: the **mxfp4 and mxfp8** modes (priced and
+rejected in `REBUILD.md` Phase 4 rather than measured on hardware -- 20-22%
+and 2.94% weight error respectively), the **`_hgs` global-scale**
+specialisations of the fp kernels (only `mx.quantize(global_scale=...)` and
+`nn.quantize(quantize_input=True)` produce one, and `mlx_lm.convert` calls
+neither, so `WeightStore::quant_matrix` rejects an artifact that carries one),
+and **`_r_2`**, the narrow-output `fp_qmv_fast` mlx picks only at
+`architecture_gen() == 17` on an 's' part in nvfp4. That last one is on the
+M5 checklist above: it is the one nvfp4 kernel this machine cannot run and so
+the one number the nvfp4 verdict does not cover.
 
 ### The Neural Engine, and why it is not a lever here
 
@@ -1565,6 +1612,31 @@ reads much more invitingly than it should.
   its images.
 
       cargo test --release --test vision_generate -- --ignored --nocapture --test-threads=1
+- **`ORNITH_MODEL` points both sides at a variant**, `tools/ref.py` and
+  `src/refs.rs` alike, which is how a non-default artifact gets checked. The
+  references are anchored on one artifact at a time, so verifying the port on
+  another one is: move the case out, regenerate it under `ORNITH_MODEL`, run
+  the test under the same `ORNITH_MODEL`, move the original back. That is how
+  the nvfp4 build was shown to run at `max_abs == 0.0` through all 40 layers
+  without re-anchoring the whole tree onto a variant that was then rejected:
+
+      mv refs/model /tmp/refs-model-control
+      cd tools && ORNITH_MODEL=~/.mtplx/models/<variant> \
+        PYTHONPATH=../../vendor/mlx-lm python3 dump_model.py
+      cd .. && ORNITH_MODEL=~/.mtplx/models/<variant> \
+        cargo test --release --test model -- --ignored --nocapture
+      rm -rf refs/model && mv /tmp/refs-model-control refs/model
+
+  Move rather than overwrite, for the reason Phase 3 gives: a writer that
+  fails silently leaves a gap that way, instead of a test comparing the new
+  artifact against the old one's tensors and passing.
+- **Two measurements need no model load at all**, which makes them the cheap
+  first look at a fresh build: `python3 tools/step_bytes.py <artifact>` reads
+  the safetensors headers and reports what a decode step reads by family, and
+  `PYTHONPATH=../vendor/mlx-lm python3 tools/weight_error.py` dequantizes a
+  module out of each variant and compares it to the bf16 parent. The second
+  is the only thing the parent can still be asked on this host -- `mx.load`
+  is lazy, so one tensor is 1.0 GiB where the model is 67.
 - `cargo run --release --bin bandwidth` measures what this machine sustains:
   a read-only kernel at several sizes, then `quantized_matmul` at M = 1 on real
   weights. Run it before believing any "% of peak" claim.
