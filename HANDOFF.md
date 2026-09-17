@@ -375,13 +375,17 @@ Three things about the wiring are not what the file names suggest:
   against the 0.78 / 0.35 / 0.13 the artifact records. `committed` is the
   default here.
 
-  **Those numbers are the deleted artifact's head, and the rebuild's head is
-  not the same head.** The trunk is bit-identical -- `baseline/logprobs.bin`
-  reproduces to the last bit -- but the rebuilt MTP sidecar drafts measurably
-  better, and deterministically so. `REBUILD.md` Phase 2 has the evidence and
-  what is and is not still comparable; the short version is that every
-  acceptance figure in this section was measured on the old head and will read
-  higher on the new one. Seeding the head's cache over the prompt -- what
+  **Those numbers are the deleted artifact's head, and it had a bug.** Its
+  sidecar carried six of its seven RMSNorm gains shifted to the absolute
+  convention and left `post_attention_layernorm` delta-encoded, a full 1.0
+  below where it belonged -- the build rule that made it decided per tensor,
+  and that gain's mean sits on the wrong side of the threshold. Reproducing
+  exactly that on the rebuild reproduces the Phase 0 acceptance profile on all
+  eight runs, to the cycle. The rebuilt sidecar shifts all seven and drafts
+  better at every depth. The trunk is unaffected and bit-identical.
+  `REBUILD.md` Phase 2, "The MTP sidecar", has the table; the short version is
+  that every acceptance figure in this section was measured on the broken head
+  and reads higher on the fixed one. Seeding the head's cache over the prompt -- what
   `_append_mtp_history(..., phase="prefill")` does -- measurably does not
   help, which is convenient: it is the only thing that would have needed
   mlx's steel *gather* gemm, since a prompt-length append crosses

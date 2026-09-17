@@ -422,20 +422,49 @@ whenever the checkpoint still has `mtp.*` weights or a torch-layout `conv1d`
 direction. Two quantities that are both wrong by the same 1.0 agree with each
 other perfectly; the only reference that settles it is the model running.
 
-**So why is the head different?** The remaining explanation is that 2.9.1
-shifted a different set. 2.11.3's own comment beside the suffix lists reads
-like the fix for it -- "the convention is decided per sidecar from the two
-separable families and then applied to all seven norms, never per tensor, and
-never *always*" -- and a per-tensor gate with those thresholds
-(`LOW_DELTA_MEAN_MAX = 0.5`, `QK_DELTA_MEAN_MAX = 1.25`) would have skipped
-`post_attention_layernorm`, whose parent mean is 0.869. A partially shifted
-head is degraded but not dead, which is exactly what the Phase 0 numbers look
-like next to these -- and the depth table below is the strongest thing
-pointing that way, because a small weight error is precisely what compounds
-when the same layer is applied three times in a row. **2.9.1 is not on this
-machine, so this is inference, not proof** -- what is proved is that the two
-heads differ, that the difference is in the sidecar, and that the rebuild's
-drafts better.
+**Why the head is different, and this part is measured rather than argued.**
+The search is finite: 778 of the 785 tensors are the parent's, the recipe is
+`same-parent-bf16-sidecar`, so the published sidecar's 778 are the same 778
+and the only thing that can differ is which of the seven gains were shifted.
+That is at most 128 configurations, and the port will evaluate any of them --
+patch the sidecar, run the prompt, read the acceptance off `--mtp`.
+
+Three of them, and the third is the answer:
+
+| excluded from the shift | prompt 1, depth 1 |
+|---|---|
+| nothing -- the 2.11.3 rebuild | 49 cycles, 47 accepted, 0.96 |
+| `mtp.norm` | 49, 47, 0.96 -- **no effect at all** |
+| **`post_attention_layernorm`** | **51, 45, 0.88 -- Phase 0, to the cycle** |
+| `pre_fc_norm_embedding` + `pre_fc_norm_hidden` | 95, 0, **dead** |
+| all seven -- the parent's bytes | 95, 0, **dead** |
+
+Leaving `post_attention_layernorm` at the parent's value and shifting the
+other six reproduces the Phase 0 profile on **all eight runs** -- four prompts
+at depth 1 and four at depth 3, exact on cycles, on accepted drafts, and on
+every per-level rate including 0.87 / 0.53 / 0.47 and 0.52 / 0.48 / 0.23.
+Eight independent numbers landing on eight targets is not a coincidence.
+
+**So the published artifact was built by a rule that decided per tensor, and
+got one of the seven wrong.** All seven parent gains are delta-encoded, but
+their means differ, and `post_attention_layernorm` is the only one of the low
+set whose mean (0.869) is above `LOW_DELTA_MEAN_MAX = 0.5`. A per-tensor gate
+reads that as "already absolute" and skips it. Six norms got their +1.0 and
+the seventh stayed a delta, so the head ran on one layer whose gains were a
+full 1.0 low. 2.11.3's comment beside the suffix lists is the fix, and it says
+so outright: the convention is decided per sidecar "and then applied to all
+seven norms -- **never per tensor**, and never *always*".
+
+Two things that fell out of the search and were not expected. `mtp.norm` --
+the final norm feeding the shared `lm_head` -- is **inert**: shifting it or
+not changes no draft decision in 96 tokens. And `pre_fc_norm_embedding` and
+`pre_fc_norm_hidden` are not merely important but load-bearing; leaving those
+two unshifted does not degrade the head, it kills it, 0 accepted out of 95.
+So the seven are in three regimes, not on a spectrum. The guess going in --
+that the compounding-with-depth signature pointed at the norms in the
+recursion path -- was wrong: `mtp.norm` is in that path and means nothing.
+The depth signature has a duller explanation. One layer's gains are wrong, and
+that layer runs three times per cycle at depth 3.
 
 Depth 3 says it louder, and says something more:
 
@@ -449,10 +478,8 @@ Depth 3 says it louder, and says something more:
 **The gap widens with depth.** At level 1 the two heads are close enough to
 argue about -- on the primes prompt the old head is even a hair ahead, 0.94 to
 0.93. By level 3 there is nothing to argue about: 0.23 becomes 0.74, 0.38
-becomes 0.70. The old head fell off a cliff as the draft chain got longer and
-the new one barely notices, which is the signature of a head whose norms are
-slightly wrong rather than one that is simply worse -- a small error
-compounding through three recursive applications of the same layer.
+becomes 0.70. That is one decoder layer carrying gains a full 1.0 too low and
+being run three times per cycle instead of once.
 
 Worth noting for its own sake: these were captured at 10 - 32 tok/s against
 the 70 tok/s the same prompts decode at depth 1, on a machine at 15 GB of
@@ -475,7 +502,10 @@ wall clock is, which is why the counts are what this table records.
 - `check_rebuild.py` gained an invariant for it: the seven gains must *not*
   equal the parent's. A sidecar left delta-encoded gives a head that drafts
   nothing while every golden test stays green, because MLX reads the same
-  file. That is a fourth member of the blind family.
+  file. That is a fourth member of the blind family. Note it would **not**
+  have caught the published artifact, whose six-of-seven sidecar is neither
+  the parent's nor correct; catching that needs the acceptance profile, which
+  is the argument for keeping one per variant.
 
 ## Phase 3 -- re-anchoring the port
 

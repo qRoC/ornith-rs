@@ -49,11 +49,14 @@ whole suite green. These are the measurements that would notice.
   together. Without a before, a format regression is indistinguishable from
   noise.
 
-  **This one is retired.** The Phase 2 rebuild's MTP head is not the head this
-  profile measured -- forge's norm-gain handling changed between the MTPLX
-  that built the published artifact (2.9.1, per its own `config.json`) and the
-  one on this machine, and the rebuilt head drafts measurably and
-  deterministically better. The trunk is bit-identical, so perplexity, the
-  logprobs and the anchors above are all still valid; this table is not, and
-  a profile taken from the rebuild replaces it as Phase 4's control.
-  `REBUILD.md` Phase 2, "The MTP sidecar", has the evidence.
+  **This one is retired, and it is the capture that earned its keep.** It is
+  the only thing here that could see the MTP head at all, and it caught a bug
+  in the published artifact: six of the sidecar's seven RMSNorm gains had been
+  shifted to the absolute convention and `post_attention_layernorm` had not,
+  leaving one decoder layer a full 1.0 low. Reproducing exactly that on the
+  rebuild reproduces this table on all eight runs, to the cycle -- which is
+  how the bug was identified. The rebuild shifts all seven and drafts better
+  at every depth, so these numbers are no longer a valid before; the profile
+  in `refs/artifact/new/mtp_profile.json` replaces them as Phase 4's control.
+  The trunk is bit-identical, so everything above is still valid.
+  `REBUILD.md` Phase 2, "The MTP sidecar", has the table.
