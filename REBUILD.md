@@ -770,30 +770,62 @@ and no ordering of the experiments makes it the right thing to try.
 Three artifacts, built from the same verified parent by the same toolchain,
 measured against `baseline/` on the same corpus and the same eight contexts.
 
-| | 8-bit | ppl | vs A | max KL | GB/token | AR tok/s | D1 tok/s |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **A** Flagship, the control | 260 | 6.3327 | -- | 0 | 2.737 | 63.7 | 88.3 |
-| **B** four byte-heavy families | 169 | 6.5022 | +2.7% | **0.048** | 2.074 (-24.2%) | 75.1 (+17.9%) | 112.6 |
-| **R** Balanced, the publisher's | 80 | 6.6422 | +4.9% | **0.323** | 1.855 (-32.2%) | 79.4 (+24.6%) | 117.6 |
+Named for what each one puts at 4 bits, not for the tier the publisher sold
+it as -- `int8-everywhere` is the artifact this port was built on, and the
+other two are what the experiment moves.
 
-**The answer to Phase 4's question is yes, and B is where to stop.** These
-modules do tolerate 4 bits: B costs 2.7% of perplexity and 0.048 nats of KL
+| what is at 4 bits | 8-bit left | ppl | vs control | max KL | GB/token | AR tok/s | D1 tok/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **`int8-everywhere`** -- the control | 260 | 6.3327 | -- | 0 | 2.737 | 63.7 | 88.3 |
+| **`int4-head-linattn`** -- `lm_head` and the three `linear_attn` projections | 169 | 6.5022 | +2.7% | **0.048** | 2.074 (-24.2%) | 75.1 (+17.9%) | 112.6 |
+| **`int4-except-gates`** -- everything but the 80 router gates | 80 | 6.6422 | +4.9% | **0.323** | 1.855 (-32.2%) | 79.4 (+24.6%) | 117.6 |
+
+**The answer to Phase 4's question is yes, and `int4-head-linattn` is where
+to stop.** These
+modules do tolerate 4 bits: it costs 2.7% of perplexity and 0.048 nats of KL
 for a quarter of the bytes and 18% of the decode rate. Going further does not
 scale:
 
-    A -> B    24.2 points of traffic for 0.048 nats   0.0020 nats per point
-    B -> R     8.0 points of traffic for 0.275 nats   0.0344 nats per point
+    control -> head-linattn    24.2 points of traffic for 0.048 nats   0.0020 a point
+    head-linattn -> all-but-gates 8.0 points of traffic for 0.275 nats   0.0344 a point
 
-**Seventeen times the distribution cost per point of traffic past B.** The
-last eight points are paid for at a rate the first twenty-four were not, and
-they buy 4.3% of decode. B is the knee.
+**Seventeen times the distribution cost per point of traffic past
+`int4-head-linattn`.** The last eight points are paid for at a rate the first
+twenty-four were not, and they buy 4.3% of decode. That is the knee.
 
 **Perplexity would have hidden this, exactly as the plan warned.** It moves
 +2.7% -> +4.9%, a factor of 1.8, while the KL moves 0.048 -> 0.323, a factor
 of 6.7. Averaging 6620 tokens flattens a distribution that has moved much
 further in places; the eight full 248320-wide distributions do not. Judging
-these two variants on perplexity alone would have made R look like a
+these two on perplexity alone would have made `int4-except-gates` look like a
 reasonable next step. It is not.
+
+### The row that is missing, and why it cannot be filled here
+
+The honest reference for all of this is the bf16 parent: not "how far did a
+variant move from the control" but "how far is each from the model the control
+was cut from". Nobody has that number -- the publisher's own card says "Full
+BF16 parent parity was not run" -- and it cannot be taken on this host either.
+
+    parent weights on disk              67.0 GiB
+    max_recommended_working_set_size    51.8 GiB
+    max_buffer_length                   38.9 GiB
+    memory_size                         64.0 GiB
+
+`mlx_lm.load` ends in `mx.eval(model.parameters())`, which asks for all 67.0
+GiB resident at once against a 51.8 GiB working set. It went through once, by
+luck, and answered a five-token prompt correctly in 170 s; the next attempt
+died in the loader with `[METAL] Command buffer execution failed: Caused GPU
+Timeout Error`. Unified memory means the weights need not all be resident,
+but the GPU working set is not the whole 64 GiB, and 15 GiB over is not a
+margin luck closes twice.
+
+`load(..., lazy=True)` skips that eval and would page through layer by layer,
+which is the one avenue left. At ~170 s a forward and 26 chunks of 256 tokens
+for the perplexity alone -- where a 256-token chunk touches nearly all 256
+experts per layer, not the 40 a 5-token prompt reaches -- it is over an hour
+with no guarantee the long chunk does not hit the same timeout. It is a
+measurement to take on a bigger host, not to grind out here.
 
 ### The publisher shipped this experiment already, and it sharpens the result
 
@@ -807,7 +839,8 @@ The artifact this port runs on is one of a matrix -- the sibling recipes carry
 | `affine4-router8-bf16recurrence-vision` | "Balanced" | 80 | 60 |
 | `affine4-router8-vision` | "Most Compact" | 80 | 0 |
 
-So variant R above *is* their Balanced, rebuilt here from their own recipe,
+So `int4-except-gates` above *is* their "Balanced", rebuilt here from their
+own recipe,
 and they independently landed on the plan's rule that the router gates never
 move. Two things their cards do not give, and this measurement does.
 
@@ -829,10 +862,10 @@ bf16 deliberately. Near-zero prize against real risk, the same shape as the
 argument for leaving the 80 gates alone. Seconds of arithmetic, one build and
 one qualification run saved.
 
-**What this leaves for C.** nvfp4 g16 measures the same weight error as affine
-int4 g32 at half a bit less, so applied to B's four families it is a
-bytes-only follow-up: roughly three more points of traffic at B's quality, not
-R's. That is now the only remaining rung worth building, and it needs the
+**What this leaves for nvfp4.** It measures the same weight error as affine
+int4 g32 at half a bit less, so applied to `int4-head-linattn`'s four families
+it is a bytes-only follow-up: roughly three more points of traffic at that
+variant's quality, not `int4-except-gates`'s. That is now the only remaining rung worth building, and it needs the
 `fp_quantized` port. Whether three points justifies a new kernel family is a
 separate decision from the one this phase settled.
 
