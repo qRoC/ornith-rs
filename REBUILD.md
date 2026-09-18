@@ -2466,11 +2466,33 @@ Phase 4's whole verdict. Drop it and `q4k-all`'s mean falls from 0.1476 to
 0.0761 and its max to 1.8749, which is `code/metal-kernel`, a probe
 `q4k-imatrix` already pays 1.65 on.
 
-So the tail is **one probe, not a pattern**, and it is the probe most likely to
-show one. What it is not is explained: the experts' own weight error is in line
-with everything else, and the routed kernel is pinned at exactly zero on a
-one-hot. Worth a bisection -- which layer's experts, and whether the router's
-top-k selection moves -- before the artifact is called finished.
+So the tail is **one probe, not a pattern** -- and it is explained, by the
+probe rather than by the kernel. `arith/ru-7x8` is `Семью восемь равно`, the
+parent's own entropy on it is **4.53 nats**, and across the fifteen artifacts
+this rebuild has captured its KL runs from 0.0949 to 4.7839, a **50x spread**
+on one context. The distribution is not a gradient but a **cliff**, and which
+side an artifact lands on is visible in one token:
+
+    capture              KL      top-1 (p)
+    int4-head-linattn  0.1570    'бе'   0.344     the arithmetic continues
+    q4k-imatrix        0.2470    'бе'   0.133     still there, already wobbling
+    gptq-head-linattn  1.0122    'бе'   0.820
+    q4k (91, plain)    1.9555    ' '    0.126     half off
+    **q4k-all**        **4.6466** '\n\n' 0.260    over
+    nvfp4-head-linattn 4.7839    '\n\n' 0.240    over, and rejected in Phase 4
+
+**`q4k-all` lands exactly where nvfp4 landed** -- same token, same magnitude,
+the paragraph break Phase 5 recorded as nvfp4's signature failure on this
+context. That is a known cliff being fallen off, not a kernel reading the
+wrong bytes: the routed gather is pinned at exactly zero on a one-hot, the
+experts' weight error is in line with every other module, and all 187 modules
+agree with ggml digest for digest.
+
+What it costs is real all the same -- a top-1 that changes from an arithmetic
+continuation to a line break is a behaviour change, not a distribution wobble,
+which is the distinction Phase 5 drew when nvfp4 did it. It is one probe of
+64, `q4k-all` still moves the fewest top-1 tokens of any variant (6), and the
+probe is the one this rebuild has watched break four formats.
 
 ### What is left
 
