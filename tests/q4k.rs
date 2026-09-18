@@ -23,7 +23,8 @@
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
 use ornith_rs::ops::q4k::{Q4kMatrix, dequantize, qmv};
-use ornith_rs::refs::{RefCase, compare};
+use ornith_rs::refs::{RefCase, compare, refs_root};
+use ornith_rs::weights::WeightStore;
 
 /// The kernel accumulates in float32 over `K` terms and the reference is
 /// float64, so the two differ by rounding alone. `K = 2048` terms of
@@ -128,4 +129,36 @@ fn matvec_matches_a_float64_reference() {
             d.max_rel
         );
     }
+}
+
+/// The three-tensor layout, read back through the loader that will read the
+/// artifact.
+///
+/// `dump_q4k.py` writes a one-module artifact beside the reference -- the same
+/// three tensors, in safetensors, with a `config.json` whose quantization
+/// block says `q4k`. Storage is a decision until something writes it down and
+/// something else reads it back; this is the something else, and it fails if
+/// the names, the dtypes or the per-row shapes drift.
+#[test]
+fn the_loader_reads_the_three_tensors() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    let dir = refs_root().join("q4k/artifact");
+    if !dir.exists() {
+        eprintln!("skipping: no {}; rerun tools/dump_q4k.py", dir.display());
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    let mut ws = WeightStore::open(&dir, &[]).unwrap();
+    let module = "language_model.model.layers.0.linear_attn.out_proj";
+    let w = ws.q4k_matrix(&ctx, module);
+    assert_eq!(
+        (w.out_dims(), w.in_dims()),
+        (case.meta_usize("head_rows"), case.meta_usize("head_cols"))
+    );
+
+    // The loaded matrix has to be the same matrix, not merely a well-shaped
+    // one: run it through the dequantizer and compare with ggml's own output.
+    let got = dequantize(&ctx, &w, Dtype::F32);
+    let d = compare(&got.to_vec_f32(&ctx), &case.f32("head_deq"));
+    assert_eq!(d.max_abs, 0.0, "loaded q4k module: {d}");
 }

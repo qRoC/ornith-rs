@@ -46,6 +46,10 @@ use crate::metal::{Context, Dispatch};
 pub enum QuantMode {
     Affine,
     Nvfp4,
+    /// ggml's Q4_K. Not an mlx mode -- see [`crate::ops::q4k`] -- so it names
+    /// none of the kernels below and is carried here only because
+    /// `config.json` has to say it somewhere.
+    Q4k,
 }
 
 impl QuantMode {
@@ -55,6 +59,7 @@ impl QuantMode {
         match s {
             "affine" => QuantMode::Affine,
             "nvfp4" => QuantMode::Nvfp4,
+            "q4k" => QuantMode::Q4k,
             // mxfp4 and mxfp8 are real mlx modes with real kernels; this port
             // does not instantiate them, so say so rather than fall through to
             // a kernel name that will not resolve.
@@ -70,6 +75,13 @@ impl QuantMode {
         match self {
             QuantMode::Affine => "affine",
             QuantMode::Nvfp4 => "nvfp4",
+            // Every name built from this prefix is one of mlx's, and mlx has
+            // no k-quant. A q4k module goes through `ops::q4k` instead, and
+            // reaching here means a caller routed it to the wrong family.
+            QuantMode::Q4k => panic!(
+                "q4k is not an mlx mode; route it through ops::q4k, not \
+                 quantized_matmul"
+            ),
         }
     }
 }
@@ -225,6 +237,7 @@ fn qmv_wide_k_lanes(mode: QuantMode) -> usize {
     match mode {
         QuantMode::Affine => 8,
         QuantMode::Nvfp4 => 16,
+        QuantMode::Q4k => panic!("q4k has no qmv_wide; ops::q4k is M = 1 only"),
     }
 }
 

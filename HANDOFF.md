@@ -174,6 +174,8 @@ so an artifact forged in either mode says so instead of crashing.
 ```
 kernels/mlx/...            mlx's Metal sources, verbatim, original paths kept
 kernels/*.metal            our instantiation lists + the kernels mlx JITs
+kernels/q4k.metal          ggml's Q4_K, ported from llama.cpp rather than mlx
+src/ops/q4k.rs             its dispatch; the only mode here mlx does not have
 src/metal/                 device, pipeline cache, buffer pool, encoding
 src/{json,safetensors,array,weights}.rs   loading
 src/ops/                   kernel dispatch, one module per mlx primitive family
@@ -258,6 +260,7 @@ dispatch diverged.
 | Test | Covers |
 |---|---|
 | `quantized.rs` | `quantized_matmul` on real weights, **affine** 4-bit/g32 and 8-bit/g64, M = 1/2/4/8/16/64/256 (qmv_fast, qmv_wide, qmm_t_splitk + reduce) |
+| `q4k.rs` | ggml's **Q4_K**, the one case with no MLX behind it: `q4k_dequantize` against ggml's own `dequantize_row_q4_K` at `max_abs == 0.0`, the M = 1 matvec against a float64 reference and against a one-hot activation, and the three-tensor loader against a forged one-module artifact |
 | `quantized_nvfp4.rs` | the same, in **nvfp4 g16**, plus both gathered branches and `dequantize`. Carries its own weights -- the control artifact's, recut -- so it runs whatever model is on disk and could check the kernels before a build was spent on them |
 | `ops.rs` | rms_norm (weighted, weightless, head_dim), rope (decode + prefill, offsets), fused elementwise |
 | `activations.rs` | silu / swiglu / precise_swiglu / sigmoid over **every** bfloat16 input |

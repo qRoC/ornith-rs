@@ -97,6 +97,9 @@ pub fn dequantize(
     let name = match mode {
         QuantMode::Affine => format!("affine_dequantize_{tname}_gs_{group_size}_b_{bits}"),
         QuantMode::Nvfp4 => format!("nvfp4_dequantize_{tname}_gs_{group_size}_b_{bits}_hgs_false"),
+        // `ops::q4k::dequantize` is the k-quant's, and it takes three tensors
+        // rather than a `QuantMatrix`.
+        QuantMode::Q4k => panic!("q4k dequantize goes through ops::q4k"),
     };
     // `packs_per_int` values come out of each byte-pack; one thread per pack.
     let packs_per_int = match bits {

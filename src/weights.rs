@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
+use crate::ops::q4k::Q4kMatrix;
 use crate::ops::quantized::{QuantMatrix, QuantMode};
 use crate::safetensors::{SafeTensors, TensorInfo, shards_from_index};
 
@@ -141,6 +142,10 @@ impl WeightStore {
                 "{path} is nvfp4 but the artifact has a {biases_name}; nvfp4 \
                  has no zero point, so this is not the layout mlx produces"
             ),
+            QuantMode::Q4k => panic!(
+                "{path} is q4k, which has no mlx kernel -- load it with \
+                 `q4k_matrix` instead of `quant_matrix`"
+            ),
         }
         // The optional global scale is the other way a quantized module can
         // carry a third tensor, and the fp kernels take it in the slot the
@@ -162,6 +167,50 @@ impl WeightStore {
             group_size: spec.group_size,
             bits: spec.bits,
         }
+    }
+
+    /// Load `<path>.weight` / `.scales` / `.dm` as one Q4_K matrix.
+    ///
+    /// The three-tensor split is `Q4K.md`'s storage decision: ggml keeps one
+    /// packed 144-byte `block_q4_K`, and an artifact that did the same would
+    /// carry a module whose only tensor is an opaque blob -- `check_rebuild.py`
+    /// counts a module as quantized when it has more than one tensor, and the
+    /// loader would need a shape it has never seen. Splitting keeps both, at
+    /// no cost to the kernel: the bytes inside each tensor are ggml's own.
+    ///
+    /// The names deliberately reuse `.weight` and `.scales`, which every other
+    /// mode here also has; `.dm` is the one new name, and `.biases` must be
+    /// absent because Q4_K's minimum lives in the packed 6-bit fields rather
+    /// than in a zero-point tensor.
+    pub fn q4k_matrix(&mut self, ctx: &Context, path: &str) -> Q4kMatrix {
+        let spec = self.quant_config(path);
+        assert_eq!(
+            spec.mode,
+            QuantMode::Q4k,
+            "{path} is not q4k in config.json's quantization block"
+        );
+        assert_eq!(
+            spec.group_size,
+            crate::ops::q4k::QK_K,
+            "{path}: q4k's super-block is {} weights, not {}",
+            crate::ops::q4k::QK_K,
+            spec.group_size
+        );
+        for absent in [format!("{path}.biases"), format!("{path}.global_scale")] {
+            assert!(
+                !self.has(&absent),
+                "{path} is q4k but the artifact has a {absent}; the minimum is \
+                 one of the packed 6-bit fields, not a separate tensor"
+            );
+        }
+        // `Q4kMatrix::new` checks the three against each other -- dtypes,
+        // block counts, row widths -- so a mismatched set fails at load rather
+        // than being read as garbage once per dispatch.
+        Q4kMatrix::new(
+            self.tensor(ctx, &format!("{path}.weight")),
+            self.tensor(ctx, &format!("{path}.scales")),
+            self.tensor(ctx, &format!("{path}.dm")),
+        )
     }
 
     /// Stack `<prefix>.<e>.<suffix>` for `e` in `0..experts` into one
@@ -291,6 +340,9 @@ mod tests {
                     assert_eq!(q.scales.dtype, Dtype::U8, "{path} nvfp4 scales are E4M3 bytes");
                     assert_eq!((q.group_size, q.bits), (16, 4), "{path}");
                 }
+                // `quant_matrix` refuses a q4k module, so this walk cannot
+                // produce one; `tests/q4k.rs` checks that layout instead.
+                QuantMode::Q4k => unreachable!("quant_matrix rejects q4k"),
             }
         }
     }

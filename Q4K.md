@@ -176,17 +176,38 @@ two-tensor modules.
    vendored; `tools/q4k_oracle.c` carries its own cmake line. `llama-quantize`
    turned out to be unnecessary: `quantize_q4_K` is exported from
    `libggml-base` and `tools/q4k_ggml.py` calls it through ctypes, so reference
-   bytes come from three lines of Python. `tests/q4k.rs` still has to compare
-   the Metal kernel against those bytes at `max_abs == 0.0`; that part is not
-   written.
-3. **`kernels/q4k.metal` -- ported, not invented.** ggml already ships
-   `kernel_mul_mv_q4_K_f32_impl` for Metal, MIT, in production for years. Start
-   from that rather than from the format description; the same relationship the
-   port already has with mlx's kernels. Start with the **M = 1 path only** --
-   `affine_qmv_fast` is 38% of a step, and that one kernel is enough to measure
-   GB/token and GPU busy for real. Add `q4k_dequantize` for the tests.
-4. **`q4k_gather_qmv_fast`** for the routed experts, if the first cut pays.
-5. **Prefill** (`q4k_qmm_t`) last, and only if the whole thing is kept.
+   bytes come from three lines of Python. `tools/dump_q4k.py` now writes
+   `refs/q4k/` from it -- the only reference case here whose oracle is not MLX.
+3. **`kernels/q4k.metal` -- DONE, ported not invented.**
+   `kernel_mul_mv_q4_K_f32_impl` and `dequantize_row_q4_K`, read off ggml's
+   working code rather than re-derived from the format, and addressed for the
+   three tensors instead of the packed block. **M = 1 only**, as planned.
+   `src/ops/q4k.rs` is the dispatch side.
+4. **The loader -- DONE.** `WeightStore::q4k_matrix` reads `.weight` /
+   `.scales` / `.dm` and refuses a `.biases` or a `.global_scale`;
+   `QuantMode::Q4k` exists so `config.json` can say the mode, and it names no
+   mlx kernel -- every path that would have built one panics rather than
+   resolving a name that does not exist. `dump_q4k.py` forges a one-module
+   artifact so the loader is exercised rather than merely written.
+5. **`tests/q4k.rs` -- DONE, four tests.** `q4k_dequantize` against ggml's own
+   `dequantize_row_q4_K` at **`max_abs == 0.0`**, which is the contract this
+   file was written to get. The matvec cannot have that contract -- its
+   summation order is the kernel's, so no differently-computed reference can
+   be bit-identical to it -- so it is checked against a float64 reference
+   (measured `max_rel` 1.1e-7, bound 1e-5) and against a one-hot activation,
+   where one term survives per output and an addressing error cannot hide
+   inside a tolerance. That one measures exactly zero over 768 outputs. The
+   fourth loads the forged artifact and dequantizes it back to the same bytes.
+
+**Still to write**, and both were always conditional:
+
+6. **`q4k_gather_qmv_fast`** for the routed experts, if the first cut pays.
+7. **Prefill** (`q4k_qmm_t`) last, and only if the whole thing is kept.
+
+And between them and a verdict: a forge (`quantize_q4_K` over the 91 modules,
+with the imatrix, writing the three tensors), the model wiring that routes a
+q4k module through `ops::q4k::qmv`, and a probe capture. The instrument for
+that capture exists and is checked -- `src/bin/probes.rs`, above.
 
 Scope the first cut to the **91 modules** `int4-head-linattn` moves to 4 bits.
 They are 57% of a decode step's traffic, they are what every number since

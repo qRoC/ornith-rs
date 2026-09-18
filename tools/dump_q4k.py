@@ -111,8 +111,41 @@ def main():
         del w, deq
 
     meta["cases"] = [c[0] for c in CASES]
+    meta["module"] = MODULE
     case.note(**meta)
     case.write()
+    write_artifact(mx, case.dir)
+
+
+# A one-module artifact in the layout `WeightStore` reads, so the loader has
+# something to open. `Q4K.md`'s three-tensor storage is only a decision until
+# something writes it down and something else reads it back.
+MODULE = "language_model.model.layers.0.linear_attn.out_proj"
+
+
+def write_artifact(mx, case_dir):
+    import shutil
+
+    d = pathlib.Path(case_dir) / "artifact"
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True)
+    # Re-read what the case just wrote, so the artifact and the reference can
+    # never drift apart.
+    tensors = {}
+    man = json.loads((pathlib.Path(case_dir) / "manifest.json").read_text())
+    dt = {"uint32": np.uint32, "uint8": np.uint8, "float16": np.float16}
+    for suffix, name in (("weight", "head_qs"), ("scales", "head_scales"), ("dm", "head_dm")):
+        info = man["tensors"][name]
+        a = np.fromfile(pathlib.Path(case_dir) / info["file"], dtype=dt[info["dtype"]])
+        tensors[f"{MODULE}.{suffix}"] = mx.array(a.reshape(info["shape"]))
+    mx.save_safetensors(str(d / "model.safetensors"), tensors)
+    (d / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {k: "model.safetensors" for k in tensors}}, indent=1))
+    (d / "config.json").write_text(json.dumps({
+        "quantization": {"group_size": q4k.QK_K, "bits": 4, "mode": "q4k"},
+    }, indent=1))
+    print(f"artifact: {len(tensors)} tensors -> {d}", file=sys.stderr)
 
 
 if __name__ == "__main__":
