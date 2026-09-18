@@ -3679,6 +3679,82 @@ is the first time that rule caught something rather than merely being obeyed.
 
 ---
 
+## Phase 26 -- FR-Spec on a k-quant head, and the depth knee moves to 1 -- **DONE**
+
+Measuring where the port stood after Phase 25 turned up something no document
+carried: **`--frpec` could not run on a k-quant artifact at all.** It panicked
+in `linear.rs`, deliberately -- "this module is a k-quant; the caller wants
+mlx's three-tensor affine layout" -- because pruning `lm_head` is a row gather
+and nobody had written one for three tensors.
+
+So the two largest wins in this project were mutually exclusive. `q6k-full`
+buys -13.1% of a decode step; FR-Spec bought -27% of one on the affine
+artifact; and no artifact could have both.
+
+### The gather is a row copy, and the layout makes it exact
+
+A Q4_K row at this model's 2048-wide head is **eight whole super-blocks**, so
+the pruning never has to understand the 12-byte scale packing or the nibble
+interleave -- they are inside the blocks being copied. Three row gathers, of
+which the port already had two:
+
+    affine    weight + scales + biases
+    nvfp4     weight + scales (uint8 E4M3, no zero point)
+    k-quant   qs (uint32) + scales (uint8) + dm (float16)
+
+`gather_rows_by_id_float16` is the one new instantiation. `frspec::prune`
+replaces the panic, and `tests/q4k.rs` holds it to the contract that matters:
+a pruned row's logit is **the same number** the full head gives for that token,
+not a close one. Anything else is a wrong token wearing a fast one's clothes.
+
+And the property FR-Spec rests on survives the move, measured rather than
+argued: `--mtp --greedy` prints **byte-identical** text with the pruned head
+and without it, at depth 1 and at depth 3. Every committed token is the verify
+forward's own argmax, so the draft decides how many tokens a cycle commits and
+never which.
+
+### What it bought, and the knee is not where it was
+
+`q6k-full`, 300 tokens, greedy, same prompt, GPU seconds:
+
+    config                        wall tok/s   GPU ms/token   acceptance
+    autoregressive                   108.9         8.70          --
+    `--mtp` (depth 3)                 94.5        10.08     0.69 / 0.57 / 0.53
+    `--mtp --frspec` (depth 3)       102.1         9.49     0.68 / 0.56 / 0.54
+    `--mtp-depth 2 --frspec`         114.9         8.40     0.68 / 0.55
+    **`--mtp-depth 1 --frspec`**   **127.4**     **7.51**       **0.72**
+
+**-13.7% of a decode step's GPU work and +17% on the wall against
+autoregression**, reproducible to 0.4% across draws. Without the gather the
+best available on this artifact was autoregression itself, and every
+speculative configuration lost.
+
+### Why the knee moved from 3 to 1, which is the finding
+
+On the affine artifact Phase 19's numbers put the knee at depth 3
+(`--mtp-depth 3 --frspec`, 8.55 GPU ms/token against autoregression's 10.49).
+Here depth 3 is the *worst* speculative configuration and depth 1 is the best.
+
+The mechanism is arithmetic. **The trunk got 13.1% cheaper and the draft did
+not.** The MTP sidecar is 1.7 GB of bfloat16 and no phase of this rebuild has
+ever quantized a byte of it -- Phase 4's coverage map does not include it, and
+`q6k-full` converts the trunk alone. So every draft level costs what it always
+cost while the thing it is amortised against shrank, and the depth at which one
+more level stops paying comes down with it.
+
+Which names the next lever without any searching: **the MTP head is the only
+part of this artifact still at bfloat16 that a decode step reads every cycle.**
+
+### The correction this phase makes to `HANDOFF.md`
+
+That file's speculative-decoding section is written against the affine
+artifact and says depth 3 is the knee. It is, there. On the artifact this
+project actually ships it is depth 1, and the two disagree for a reason that
+belongs in the file rather than in a table: quantizing the trunk changes what
+the draft is worth.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

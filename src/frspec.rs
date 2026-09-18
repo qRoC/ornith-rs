@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
 use crate::ops::embedding::gather_rows;
+use crate::ops::kquant::KMatrix;
 use crate::ops::linear::Linear;
 use crate::ops::quantized::QuantMatrix;
 
@@ -42,6 +43,53 @@ pub struct FrSpec {
     pub head: Linear,
     pub n: usize,
     pub vocab: usize,
+}
+
+/// `lm_head[ids]`, in whichever family the head belongs to.
+///
+/// **Pruning is a row gather and nothing else** -- `mx.take(..., axis=0)` on
+/// each tensor the module holds, which is what `install_frspec_draft_head`
+/// does. What differs between the families is only how many tensors that is
+/// and what they hold, and a row is a whole number of each in all of them:
+///
+///   affine  `weight` + `scales` + `biases`
+///   nvfp4   `weight` + `scales`, uint8 E4M3, no zero point
+///   k-quant `qs` + `scales` + `dm`, and a row is `I / 256` whole super-blocks
+///           -- 8 of them at this model's 2048-wide head -- so the 12-byte
+///           scale packing and the nibble interleave are inside the blocks
+///           being copied and never have to be understood here.
+///
+/// This file used to refuse the last one (`as_mlx` panicked on it), which made
+/// FR-Spec unavailable on exactly the artifacts that most want it: a k-quant
+/// decode step is 13.1% cheaper, so the draft chain's fixed cost is
+/// proportionally larger, and `--mtp` measured *worse* than autoregression on
+/// `q6k-full` for want of this gather.
+pub fn prune(ctx: &Context, lm_head: &Linear, ids: &Array, n: usize) -> Linear {
+    match lm_head {
+        Linear::Mlx(q) => Linear::Mlx(QuantMatrix {
+            w: gather_rows(ctx, &q.w, ids, q.w.shape[1]),
+            scales: gather_rows(ctx, &q.scales, ids, q.scales.shape[1]),
+            // nvfp4 has no zero point, so there is a third row gather in
+            // affine mode and not in nvfp4 -- the pruning is per row and
+            // indifferent to what a row holds.
+            biases: q.biases.as_ref().map(|b| gather_rows(ctx, b, ids, b.shape[1])),
+            mode: q.mode,
+            group_size: q.group_size,
+            bits: q.bits,
+        }),
+        Linear::K(q) => {
+            // `scales` and `dm` are `[O, blocks, fields]`; the gather takes a
+            // whole row of each and the block axis is put back by shape.
+            let (sb, db) = (q.scales.shape[1], q.dm.shape[1]);
+            let (sf, df) = (q.scales.shape[2], q.dm.shape[2]);
+            Linear::K(KMatrix::new(
+                q.kind,
+                gather_rows(ctx, &q.qs, ids, q.qs.shape[1]),
+                gather_rows(ctx, &q.scales, ids, sb * sf).reshape(&[n, sb, sf]),
+                gather_rows(ctx, &q.dm, ids, db * df).reshape(&[n, db, df]),
+            ))
+        }
+    }
 }
 
 impl FrSpec {
@@ -70,10 +118,6 @@ impl FrSpec {
 
         // The same checks MTPLX makes, because a bad list here is a wrong
         // token rather than a slow one.
-        // Pruning is a row gather, and a Q4_K row is three tensors with a
-        // 12-byte packing rather than a slice; `as_mlx` says so rather than
-        // gathering the wrong thing.
-        let lm_head = lm_head.as_mlx();
         let vocab = lm_head.out_dims();
         if n == 0 || n >= vocab {
             return Err(format!("{n} ids is not a pruning of {vocab}"));
@@ -87,21 +131,7 @@ impl FrSpec {
         }
 
         let ids = Array::from_slice(ctx, &ids, &[n], Dtype::U32);
-        let head = QuantMatrix {
-            w: gather_rows(ctx, &lm_head.w, &ids, lm_head.w.shape[1]),
-            scales: gather_rows(ctx, &lm_head.scales, &ids, lm_head.scales.shape[1]),
-            // nvfp4 has no zero point, so there is a third row gather in
-            // affine mode and not in nvfp4 -- the pruning is per row and
-            // indifferent to what a row holds.
-            biases: lm_head
-                .biases
-                .as_ref()
-                .map(|b| gather_rows(ctx, b, &ids, b.shape[1])),
-            mode: lm_head.mode,
-            group_size: lm_head.group_size,
-            bits: lm_head.bits,
-        };
-        Ok(FrSpec { ids, head: Linear::Mlx(head), n, vocab })
+        Ok(FrSpec { ids: ids.clone(), head: prune(ctx, lm_head, &ids, n), n, vocab })
     }
 
     /// Turn one index into the pruned head's rows into the token id it stands

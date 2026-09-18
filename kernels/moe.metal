@@ -169,3 +169,6 @@ instantiate_kernel("gather_rows_by_id_float32", gather_rows_by_id, float)
 // nvfp4 stores its scales as uint8 E4M3 rather than in the activation dtype,
 // so pruning `lm_head` for FR-Spec gathers a byte row rather than a bf16 one.
 instantiate_kernel("gather_rows_by_id_uint8", gather_rows_by_id, uint8_t)
+// And a k-quant's super-scales are float16: FR-Spec prunes `lm_head` by rows,
+// and a Q4_K row is three tensors rather than a slice.
+instantiate_kernel("gather_rows_by_id_float16", gather_rows_by_id, half)

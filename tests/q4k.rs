@@ -31,6 +31,7 @@ use ornith_rs::ops::kquant::{
     KMatrix, KQuant, dequantize, gather_qmm_t, gather_qmv, qmm_t, qmv, set_mm_rows,
 };
 use ornith_rs::refs::{RefCase, compare, refs_root};
+use ornith_rs::ops::linear::Linear;
 use ornith_rs::weights::WeightStore;
 
 /// The kernel accumulates in float32 over `K` terms and the reference is
@@ -616,5 +617,42 @@ fn the_tile_widths_agree() {
             );
         }
         set_mm_rows(32);
+    }
+}
+
+/// A pruned row is the row it came from, bit for bit.
+///
+/// FR-Spec drafts through `lm_head[ids]`, so the contract is not "close": the
+/// gathered row holds the same whole super-blocks the original did, and the
+/// same kernel reduces them in the same order, so the logit for a kept token
+/// has to be the *same number* it would have been over the full vocabulary.
+/// Anything else is a wrong token wearing a fast one's clothes.
+#[test]
+fn a_pruned_k_quant_row_is_the_row_it_came_from() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    let ctx = Context::new().unwrap();
+    let w = matrix(&ctx, &case, "head");
+    let (o, k) = (w.out_dims(), w.in_dims());
+    assert!(o >= 64, "need rows to prune from");
+
+    // A scattered subset, including the first and last rows.
+    let ids: Vec<u32> = (0..o).step_by(7).map(|i| i as u32).chain([o as u32 - 1]).collect();
+    let n = ids.len();
+    let idx = Array::from_slice(&ctx, &ids, &[n], Dtype::U32);
+
+    let host: Vec<f32> = (0..k).map(|i| ((i * 31 % 71) as f32 - 35.0) / 67.0).collect();
+    let x = Array::from_f32_as_bf16(&ctx, &host, &[1, k]);
+
+    let full = qmv(&ctx, &x, &w).to_vec_f32(&ctx);
+    let pruned_head = ornith_rs::frspec::prune(&ctx, &Linear::K(w), &idx, n);
+    let pruned = pruned_head.matmul(&ctx, &x).to_vec_f32(&ctx);
+
+    assert_eq!(pruned.len(), n);
+    for (i, &id) in ids.iter().enumerate() {
+        assert_eq!(
+            pruned[i], full[id as usize],
+            "row {i} (vocabulary id {id}) came back {} where the full head has {}",
+            pruned[i], full[id as usize]
+        );
     }
 }

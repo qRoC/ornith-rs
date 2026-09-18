@@ -57,8 +57,10 @@ pub fn gather_rows(ctx: &Context, table: &Array, ids: &Array, row: usize) -> Arr
         Dtype::BF16 => "gather_rows_by_id_bfloat16",
         Dtype::F32 => "gather_rows_by_id_float32",
         // nvfp4's scales are uint8 E4M3, which FR-Spec's pruning of `lm_head`
-        // has to gather alongside the weight.
+        // has to gather alongside the weight -- and a k-quant's are uint8 too,
+        // with float16 super-scales beside them.
         Dtype::U8 => "gather_rows_by_id_uint8",
+        Dtype::F16 => "gather_rows_by_id_float16",
         d => panic!("no gather for {}", d.name()),
     };
     ctx.kernel(name)

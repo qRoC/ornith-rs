@@ -917,6 +917,30 @@ The two structural costs, which are why deeper is worse:
 A dense model would win here; a 3B-active MoE with an unpruned draft head does
 not. FR-Spec is the fix for the first of those, and it is in -- see below.
 
+### On a k-quant artifact the knee is depth 1, not depth 3
+
+Everything in this section was measured on the affine artifact. `REBUILD.md`
+Phase 26 re-measured it on `q6k-full`, and the ordering is not the same --
+because FR-Spec could not run there at all until that phase wrote the row
+gather a k-quant `lm_head` needs, and because quantizing the trunk changes what
+a draft is worth.
+
+| `q6k-full`, 300 tokens, greedy | wall tok/s | GPU ms/token | acceptance |
+|---|---:|---:|---|
+| autoregressive | 108.9 | 8.70 | -- |
+| `--mtp` (depth 3) | 94.5 | 10.08 | 0.69 / 0.57 / 0.53 |
+| `--mtp --frspec` | 102.1 | 9.49 | 0.68 / 0.56 / 0.54 |
+| `--mtp-depth 2 --frspec` | 114.9 | 8.40 | 0.68 / 0.55 |
+| **`--mtp-depth 1 --frspec`** | **127.4** | **7.51** | **0.72** |
+
+**-13.7% of a decode step and +17% on the wall**, reproducible to 0.4%. The
+mechanism is that **the trunk got 13.1% cheaper and the draft did not**: the
+MTP sidecar is 1.7 GB of bfloat16 that no phase of the rebuild has quantized,
+so each draft level costs what it always cost while the thing it is amortised
+against shrank. That also names the largest remaining lever in this file -- the
+MTP head is the only part of the artifact still at bfloat16 that a decode step
+reads every cycle.
+
 ### How exact it is: exactly, under `ORNITH_INVARIANT=1`
 
 The acceptance rule and the rewind were always exact. The output was not, and
