@@ -504,18 +504,18 @@ across M = 1..32 means the fixed per-block cost is 32-60% of the total, so the
 tile wanted to be wider. ggml's `half` tile scalar, which this port declined
 for exactness, is priced in the same phase at 0-4%: the exactness was free.
 
-**What Phase 23 did not spend, and it is the lever that is about *this*
-model.** The tile still takes `K`, `O` and `M` as `constant int&`, so it is
-compiled for an unknown shape: the K loop cannot unroll, and the tail clamps
-on `nr0`/`nr1`/`lr0`/`lr1` are evaluated on every block although this
-artifact's six k-quant shapes -- `[8192, 2048]`, `[2048, 4096]`,
-`[2048, 2048]`, `[248320, 2048]` dense and `[512, 2048]`, `[2048, 512]` routed
--- all satisfy `O % 64 == 0` and `K % 32 == 0`. Function constants under those
-shapes is what `vendor/accelerated-qwen-3.8` does to ggml's mat-vec and what
-mlx does to its own gemm (`alN_{aligned}`, constants 200/201/202), and the
-port already lives that way in `affine_qmv_fast` against `qmv_wide`. Phase 23's
-own 12-23x unroll cliff is the argument that codegen is a live lever in this
-kernel rather than a micro-optimisation. In GPU seconds, which is the number to read on this machine:
+**And Phase 25 spent the lever Phase 23 named, with nothing to show.** The
+tile takes `K`, `O` and `M` as `constant int&`, and all 13 of this artifact's
+k-quant shapes satisfy `O % 64 == 0` and `K % 256 == 0`, so function constants
+can tell it both. Built, held bit-identical, and measured in one process
+alternating the arms: **0.96 to 1.05, scattered around 1.00.** Reverted.
+
+The reason is in the code rather than in the hardware: the tail clamps are
+computed *once per tile*, before the K loop, not once per K step, and the K
+loop's bound test is one compare against a body carrying two
+`threadgroup_barrier`s. Phase 23's 12-23x unroll cliff was real and was about
+the **innermost** loop, whose operands are registers. A codegen fact is worth
+what the thing it applies to costs. In GPU seconds, which is the number to read on this machine:
 
     prompt tokens        affine    q4k-all              q6k-full
                          int4      mat-vec    tile      mat-vec    tile

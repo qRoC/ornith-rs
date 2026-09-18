@@ -3527,6 +3527,11 @@ wide tile. A kernel whose time moves by that much on a codegen decision is a
 kernel where telling the compiler what it is compiling is not a micro-
 optimisation.
 
+**Built in Phase 25, and that reasoning was wrong.** The lever is spent and it
+buys nothing; the paragraph above is left as written because the argument was
+the best available before the measurement, and because the shape of its error
+is the phase's finding.
+
 ---
 
 ## Phase 24 -- the per-expert importance vector, built and not adopted -- **DONE**
@@ -3619,6 +3624,58 @@ not a verdict.
 `ornith-1.5-35b-a3b-q6k-perexpert` stays on disk (296 GB free) and
 `refs/artifact/q6k-perexpert` is its capture. **`q6k-full` remains the
 artifact.**
+
+---
+
+## Phase 25 -- the tile told its own shape, and it changes nothing -- **DONE**
+
+Phase 23's open item, built. `K`, `O` and `M` reach the tile as `constant int&`,
+so it is compiled for a shape it does not know; all 13 of this artifact's
+k-quant shapes satisfy `O % 64 == 0` and `K % 256 == 0`, and `K` takes three
+values. Three function constants say so: `kq_aligned_o`, `kq_aligned_m` and
+`kq_k`, with `kq_k == 0` meaning "read it from the buffer" so that the
+specialisation has a control.
+
+Bit-identical, as a claim about dead code must be -- a test held the two arms
+to `max_abs == 0.0` at seven row counts. And then, in one process, alternating:
+
+    unshaped / shaped        M = 64   128    256
+    in_proj_qkv [8192, 2048]   1.01  1.02   1.03
+    out_proj    [2048, 4096]   0.99  1.01   0.99
+    q_proj      [2048, 2048]   1.00    --   0.96
+    down_proj   [2048,  512]   1.01    --   1.05
+
+**Scattered around 1.00.** Reverted.
+
+### Why it was never going to pay, which the code says if you read it for cost
+
+Two things were claimed and only one of them is true.
+
+  - "The tail clamps run on every block" -- true, and **they run once per
+    block, not once per K step.** `nr0`, `nr1`, `lr0` and `lr1` are all
+    computed *before* the K loop; the loop body never re-evaluates them. A
+    handful of instructions against a tile that runs `K / 32` iterations of a
+    body carrying two `threadgroup_barrier`s.
+  - "The K loop cannot be unrolled" -- true and worthless. The bound test is
+    one compare against that same body. Unrolling across a barrier buys
+    nothing, which is why the compiler's refusal costs nothing here and its
+    refusal to unroll **the accumulator loop** cost 12-23x: that one is inside
+    the innermost loop and its operands are registers.
+
+The general shape: **a codegen fact is only worth what the thing it applies to
+costs.** Phase 23's 20x cliff made codegen look like the live lever in this
+kernel, and it is -- in the innermost loop, not at the tile's edges.
+
+### And the measurement corrected itself, which is the other finding
+
+The first reading of this said **1 to 5%**, and it was taken by comparing a
+run against numbers recorded an hour earlier. In one process, alternating the
+two arms, the same shapes give 0.96 to 1.05. Across-run deltas of a few percent
+on this machine are the machine -- which is exactly why every flag this
+rebuild has added is a *runtime* switch rather than a build one, and this phase
+is the first time that rule caught something rather than merely being obeyed.
+
+`HANDOFF.md` carried this as an open item; it does not any more.
 
 ---
 
