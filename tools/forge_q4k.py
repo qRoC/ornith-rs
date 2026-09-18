@@ -5,6 +5,7 @@
       --imatrix          feed the quantizer diag(H) as its importance vector
       --experts          also convert the 96 routed-expert modules
       --q6k              convert the *8-bit* side to Q6_K instead
+      --resume           keep an existing output directory and its copies
       --from <name>      base artifact to build on (default int4-head-linattn)
       --out <name>       output artifact name
 
@@ -177,9 +178,12 @@ def hessian_for(mod):
     return h
 
 
+RESUME = "--resume" in sys.argv
+
+
 def main():
-    if OUT.exists():
-        sys.exit(f"{OUT} exists; remove it or pick another name")
+    if OUT.exists() and not RESUME:
+        sys.exit(f"{OUT} exists; remove it, pick another name, or pass --resume")
     lib = q4k_ggml.load()
     acfg = json.loads((BASE / "config.json").read_text())
     aidx = json.loads((BASE / "model.safetensors.index.json").read_text())["weight_map"]
@@ -213,11 +217,19 @@ def main():
     print(f"{len(mods)} quantized modules, converting {len(convert)} "
           f"({SRC_BITS}-bit) to {KIND}" + (" with diag(H)" if IMATRIX else ""))
 
-    OUT.mkdir(parents=True)
+    OUT.mkdir(parents=True, exist_ok=True)
     touched = {aidx[m + ".weight"] for m in convert}
+    # The untouched files are ~20 GB and copying them takes longer than the
+    # quantization does on a busy disk, so a re-run skips what is already
+    # there byte count for byte count. Restarting a forge is otherwise the
+    # most expensive way to change one line.
     for f in sorted(BASE.iterdir()):
-        if f.is_file() and f.name not in touched:
-            shutil.copy2(f, OUT / f.name)
+        if not f.is_file() or f.name in touched:
+            continue
+        dst = OUT / f.name
+        if dst.exists() and dst.stat().st_size == f.stat().st_size:
+            continue
+        shutil.copy2(f, dst)
     print(f"copied {len(list(OUT.iterdir()))} files unchanged; "
           f"rewriting {len(touched)} shards")
 
@@ -231,6 +243,7 @@ def main():
     for shard in sorted(touched):
         tensors = dict(mx.load(str(BASE / shard)))
         for mod in by_shard[shard]:
+            tm = [time.time()]
             pname, half = parent_of(mod)
             t = mx.load(str(PARENT / pidx[pname]))[pname]
             if half:
@@ -242,6 +255,7 @@ def main():
             # A routed module is [E, O, I]; `quantize_q4_K` takes rows of `I`
             # and the importance vector is per input column, so all E * O rows
             # go in one call and the vector serves every expert.
+            tm.append(time.time())
             experts = w.shape[0] if w.ndim == 3 else 1
             w = w.reshape(-1, w.shape[-1])
             rows, cols = w.shape
@@ -251,8 +265,12 @@ def main():
 
             h = hessian_for(mod) if IMATRIX else None
             with_h += h is not None
-            qs, scales, dm = q4k.split(
-                q4k_ggml.quantize(lib, w, imatrix=h, kind=KIND), rows, nb, KIND)
+            tm.append(time.time())
+            blocks = q4k_ggml.quantize(lib, w, imatrix=h, kind=KIND)
+            tm.append(time.time())
+            qs, scales, dm = q4k.split(blocks, rows, nb, KIND)
+            del blocks
+            tm.append(time.time())
             if experts > 1:
                 qs = qs.reshape(experts, rows // experts, -1)
                 scales = scales.reshape(experts, rows // experts, nb, scales.shape[-1])
@@ -266,10 +284,21 @@ def main():
             tensors[f"{mod}.weight"] = mx.array(qs)
             tensors[f"{mod}.scales"] = mx.array(scales)
             tensors[f"{mod}.dm"] = mx.array(dm)
+            tm.append(time.time())
             del w, qs, scales, dm
+            # No `mx.clear_cache()` here, and that is a measured decision
+            # rather than an omission: adding one took the loop from 13 s a
+            # module to over twelve minutes. The per-module timings below stay
+            # flat while the wall clock does not, which is what says the cost
+            # is outside the work -- releasing ~1 GB of device buffers and
+            # re-acquiring them, on a machine whose swap is full, is page
+            # faults rather than housekeeping.
             done += 1
+            d = [tm[i + 1] - tm[i] for i in range(len(tm) - 1)]
             print(f"  [{done:3d}/{len(convert)}] {mod}"
-                  + ("  +imatrix" if h is not None else ""), flush=True)
+                  + ("  +imatrix" if h is not None else "")
+                  + f"  [load {d[0]:.1f} hess {d[1]:.1f} quant {d[2]:.1f} "
+                    f"split {d[3]:.1f} to-mx {d[4]:.1f}]", flush=True)
         mx.eval(*tensors.values())
         mx.save_safetensors(str(OUT / shard), tensors, metadata={"format": "mlx"})
         del tensors
