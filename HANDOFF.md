@@ -436,10 +436,20 @@ Regenerating the pieces, none of which are in git:
 and `vendor/ggml` must be built first -- see the header of `tools/q4k_oracle.c`
 for the cmake line. `tools/forge_q4k.py --help` is its own docstring.
 
-**The debt is prefill.** M > 1 goes through ggml's token axis, a mat-vec per
-token, so the weights are re-read once each. It changes no verdict and it is
-why a probe capture takes minutes; `qmm_t` is the kernel that would fix it and
-it is not written.
+**The debt is prefill, and it has a number.** M > 1 goes through ggml's token
+axis -- a mat-vec per token, so the weights are re-read once each instead of
+being tiled. What that costs depends on whether the matrix fits in cache, so
+it is invisible on a short prompt and not on a long one:
+
+    prompt tokens      int4 (affine)   q4k-all   q6k-full
+    600                    184.1        188.2       --
+    3060                   397.7        366.5      313.6   tok/s
+
+Level at 600 -- the L2 absorbs a 9 MB matrix read 599 times -- and **-8% and
+-21%** at 3060, growing with the k-quantized share. `qmm_t` is the kernel that
+would fix it (ggml's `kernel_mul_mm_q4_K_f32` and `kernel_mul_mm_id_q4_K_f32`
+in `vendor/ggml/src/ggml-metal/kernels/mul_mm.metal`) and it is not written.
+It changes no verdict: every number above was measured through the mat-vec.
 
 ---
 
