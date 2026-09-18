@@ -175,7 +175,10 @@ so an artifact forged in either mode says so instead of crashing.
 kernels/mlx/...            mlx's Metal sources, verbatim, original paths kept
 kernels/*.metal            our instantiation lists + the kernels mlx JITs
 kernels/q4k.metal          ggml's Q4_K, ported from llama.cpp rather than mlx
-src/ops/q4k.rs             its dispatch; the only mode here mlx does not have
+kernels/q6k.metal          ggml's Q6_K, for the 8-bit side
+src/ops/kquant.rs          both k-quants' dispatch; the only modes here mlx
+                           does not have, with ggml as the oracle in its place
+src/ops/linear.rs          one quantized linear, mlx's family or ggml's
 src/metal/                 device, pipeline cache, buffer pool, encoding
 src/{json,safetensors,array,weights}.rs   loading
 src/ops/                   kernel dispatch, one module per mlx primitive family
@@ -260,7 +263,8 @@ dispatch diverged.
 | Test | Covers |
 |---|---|
 | `quantized.rs` | `quantized_matmul` on real weights, **affine** 4-bit/g32 and 8-bit/g64, M = 1/2/4/8/16/64/256 (qmv_fast, qmv_wide, qmm_t_splitk + reduce) |
-| `q4k.rs` | ggml's **Q4_K**, the one case with no MLX behind it: `q4k_dequantize` against ggml's own `dequantize_row_q4_K` at `max_abs == 0.0`, the M = 1 matvec against a float64 reference and against a one-hot activation, and the three-tensor loader against a forged one-module artifact |
+| `q4k.rs` | ggml's **Q4_K**, one of two cases with no MLX behind it: `q4k_dequantize` against ggml's own `dequantize_row_q4_K` at `max_abs == 0.0`, the matvec against a float64 reference and against a one-hot activation, the routed gather over four experts, the three-tensor loader against a forged one-module artifact, and (`--ignored`) every module of a real artifact against ggml digest for digest |
+| `q6k.rs` | the same four checks for **Q6_K**, whose traps are its own: a *signed* sub-block scale and a code biased by 32, so `w = d*sc*(q - 32)` with no minimum |
 | `quantized_nvfp4.rs` | the same, in **nvfp4 g16**, plus both gathered branches and `dequantize`. Carries its own weights -- the control artifact's, recut -- so it runs whatever model is on disk and could check the kernels before a build was spent on them |
 | `ops.rs` | rms_norm (weighted, weightless, head_dim), rope (decode + prefill, offsets), fused elementwise |
 | `activations.rs` | silu / swiglu / precise_swiglu / sigmoid over **every** bfloat16 input |
@@ -396,6 +400,46 @@ capture writes raw logits and leaves `lp = logits - mx.logsumexp(logits)` to
 mlx, so the one arithmetic step outside the model is the same code on both
 sides. With a second argument the last step also reports `max_abs` against an
 mlx capture, which is how the paragraph above was measured.
+
+---
+
+## The k-quant artifacts, and what they cost
+
+Five artifacts built on ggml's k-quants, all of them unreadable by `mlx_lm`
+and all measured by `src/bin/probes.rs`. `REBUILD.md` Phases 15-18 have the
+method; this is the table.
+
+    artifact              modules          bytes/token   median KL over 64 probes
+    int4-head-linattn     the baseline      2.0761 GB          0.0350
+    gptq-head-linattn     ships today       2.0761 GB          0.0273
+    q4k-imatrix           91 Q4_K           1.9814 GB          0.0260
+    q4k-all               187 Q4_K          1.9311 GB          0.0237
+    q6k-all               + 128 Q6_K        1.8051 GB          0.0342
+    q6k-full              same, all weighted 1.8051 GB         0.0244
+
+**-13.1% of a decode step at no quality difference this instrument can see.**
+Every pairwise sign test over the 64 probes is a coin flip except one, and
+that one -- `q6k-all`, 22 of 64 -- was 48 modules quantized without an
+importance vector rather than a property of the format. Decode runs 110-124
+tok/s against the baseline's 102.6, best of four, and two artifacts with
+identical traffic measured 110.4 and 124.2, so read that range as the
+machine's spread.
+
+Regenerating the pieces, none of which are in git:
+
+    cd tools && python3 export_probes.py                   # the probe list
+    ORNITH_GGML_BUILD=../../.ggml-build python3 dump_q4k.py # refs/q4k
+    ...                                       python3 dump_q6k.py # refs/q6k
+    ORNITH_GPTQ_FAMILIES=attn ORNITH_GPTQ_OUT=../refs/gptq-attn \
+      python3 dump_gptq_stats.py <artifact>   # the 8-bit side's Hessians, 218 s
+
+and `vendor/ggml` must be built first -- see the header of `tools/q4k_oracle.c`
+for the cmake line. `tools/forge_q4k.py --help` is its own docstring.
+
+**The debt is prefill.** M > 1 goes through ggml's token axis, a mat-vec per
+token, so the weights are re-read once each. It changes no verdict and it is
+why a probe capture takes minutes; `qmm_t` is the kernel that would fix it and
+it is not written.
 
 ---
 
