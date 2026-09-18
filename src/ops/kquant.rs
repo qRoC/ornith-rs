@@ -337,6 +337,20 @@ pub fn dequantize(ctx: &Context, w: &KMatrix, dtype: Dtype) -> Array {
 /// re-read once per token. At M = 1, the decode step, that costs nothing; at
 /// prefill it is the price of not having written `qmm_t` yet, and it is paid
 /// in time rather than in correctness.
+///
+/// **At a speculative verify window it is neither free nor prefill, and that
+/// is now the largest lever this port has left.** `REBUILD.md` Phase 27: a
+/// verify forward over `depth + 1` rows costs 3.4 ms a row on `q6k-full`,
+/// 41% of which is this kernel reading the same matrix once per row -- 91
+/// dispatches at both widths, 2.8x the time at four rows. Neither existing
+/// kernel is the answer at that width ([`qmm_t`] reads the matrix once but
+/// its floor is 7.5x a mat-vec, so it only crosses over at
+/// [`MM_ROW_LIMIT`]), and the grid axis order is not it either -- swapping
+/// the rows onto x, which is where mlx's affine `qmv` puts them, measured
+/// 1.00 and was reverted. What would pay is an M axis *inside* this kernel:
+/// the `ib` loop reads a block once and accumulates it into M row
+/// accumulators, leaving each row's order exactly as it is here, so the
+/// window mode's contract holds by construction.
 pub fn qmv(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
     let (o, k) = (w.out_dims(), w.in_dims());
     assert_eq!(x.shape[x.ndim() - 1], k, "{} qmv: x is {k}-wide?", w.kind.name());
@@ -382,6 +396,13 @@ pub fn qmv(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
 /// batch this model decodes -- 8 rows a token -- that path is unreachable
 /// anyway, and at prefill it would be the difference between a mat-vec and a
 /// gemm, which is the same debt `qmv` already owes at M > 1.
+///
+/// A verify window is where that costs: four tokens send 32 rows through
+/// here, of which `tools/router_stats.py` measures ~21 distinct, and the
+/// kernel pays for all 32 -- 30% of what a window row costs (`REBUILD.md`
+/// Phase 27). The routed tile is worse rather than better at that shape,
+/// since it runs its K loop once per run of one expert and a window's runs
+/// are one row long.
 pub fn gather_qmv(
     ctx: &Context,
     x: &Array,
@@ -524,6 +545,11 @@ pub fn gather_qmm_t(
 /// on the narrow ones. 16 is where the tile wins on all four, which is the
 /// same conservative rule the old 8 was picked by, and it still leaves the
 /// speculative verify window (`depth + 1` = 4 rows) on the mat-vec.
+///
+/// That last clause reads like a happy accident and is the right call for the
+/// wrong reason: Phase 27 measured the tile at 2x the mat-vec at four rows,
+/// so the window belongs here -- but the mat-vec is itself paying 4 reads of
+/// the matrix, and what the window wants is a kernel neither of these is.
 const MM_ROW_LIMIT: usize = 16;
 
 /// `ORNITH_KQUANT_GEMM=0` sends every shape back through the mat-vec.

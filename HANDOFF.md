@@ -199,6 +199,13 @@ src/bin/probes.rs          the 64 probe contexts, captured from the port --
                            the instrument for artifacts mlx cannot load
 src/bin/invariance.rs      a window against the same tokens one at a time,
                            from the same cache state, and which layer moved
+src/bin/draft_cost.rs      a speculative cycle's two halves measured apart --
+                           a draft level alone and a verify at each window
+                           width, which is what Phase 26's subtraction could
+                           not see
+src/bin/window_mv.rs       what a window of rows costs one module: the
+                           mat-vec as dispatched against the tile, and
+                           against mlx's own choice on an affine module
 tools/dump_*.py            golden-reference writers (run against MLX)
 tools/export_probes.py     probe_set.py -> refs/probe_set.json, for the port
 tools/probes_from_logits.py  the port's logits -> probes.bin, and the
@@ -881,6 +888,9 @@ clock.**
 
 Only after that is it worth making the draft cheaper, and there the number is:
 a draft step is ~2.4 ms of GPU, about half of which is the `lm_head` below.
+(On `q6k-full` with FR-Spec, Phase 27 measures a draft level at **0.587 ms**
+directly -- `src/bin/draft_cost.rs`. Making the draft cheaper is not where
+this goes.)
 
 The two structural costs, which are why deeper is worse:
 
@@ -916,6 +926,12 @@ The two structural costs, which are why deeper is worse:
    "forbidden because it would stop matching mlx-lm"; it is simply not
    available.
 
+   **Phase 27 sizes it against everything else the window costs**, which is
+   what this item never had: the expert gather is **30%** of what a verify
+   pays per extra row on `q6k-full`. The larger share, 41%, is the dense
+   k-quant mat-vecs reading the same weights once per row -- a re-read, not
+   new traffic, and the one part of a window that can be taken back exactly.
+
 A dense model would win here; a 3B-active MoE with an unpruned draft head does
 not. FR-Spec is the fix for the first of those, and it is in -- see below.
 
@@ -941,16 +957,47 @@ MTP sidecar is 1.7 GB of bfloat16 that no phase of the rebuild has quantized,
 so each draft level costs what it always cost while the thing it is amortised
 against shrank.
 
-**And the draft's cost is not its bytes**, which is the correction Phase 26
-carries: the cycle decomposes into a 4.31 ms draft and an 8.64 ms verify (the
-verify against autoregression's 8.70 is the check), while a draft reads only
-129 MB of the sidecar -- top-8 of 256 experts plus 78.7 MB that is not experts
--- and 75.5 MB of pruned `lm_head`. **11.3% of a decode step's bytes for 50% of
-its time, 4.4x its byte budget.** Quantizing the head is therefore worth at
-most 0.45 ms of the 4.31. The lever is wherever the other 3.9 ms goes, and the
-per-kernel attribution shows it spread thin across ~82 dispatches rather than
-concentrated -- a 256-expert MoE routing one token is the worst shape this
-model has, and a draft runs one per level.
+**Phase 26 then decomposed the cycle by differencing those two depths, and
+that decomposition was wrong.** It read a 4.31 ms draft and an 8.64 ms verify
+out of `(cycle(3) - cycle(1)) / 2`, which charges the whole difference to the
+draft levels -- right only if a verify costs the same over a four-token window
+as over a two-token one. **Phase 27 measured each half on its own and it does
+not.** `src/bin/draft_cost.rs`, one process, GPU seconds:
+
+| | GPU ms | four-run spread |
+|---|---:|---|
+| one draft level, depth 1, with FR-Spec | **0.587** | 0.53 - 0.61 |
+| an autoregressive decode step | 8.342 | 7.93 - 8.34 |
+| a verify forward, window of 1 / 2 / 3 / 4 | 8.217 / 11.368 / 14.733 / 18.149 | |
+| each extra window row | 3.15 - 3.42 | 3.0 - 3.9 |
+| Phase 26's subtraction, on these numbers | 3.977 | 3.98 - 4.03 |
+
+So a draft level is **0.587 ms, not 4.31**, and the missing 3.4 ms is the
+verify forward, paid **per row of the window**. Written out, the subtraction
+is `draft + (row3 + row4) / 2`, and Phase 26 read all of it as the draft.
+Three consequences, all of which replace something this file used to say:
+
+- **The draft is inside its byte budget, not 4.4x over it.** 204 MB in 0.587
+  ms is 347 GB/s against a decode step's 219. Quantizing the MTP head saves
+  93 MB, i.e. ~0.27 ms of a 12.0 ms cycle -- 2%, not the 0.45 of 4.31 that
+  was written here.
+- **The draft's 256-expert MoE is 0.167 ms**, 1.4% of a cycle. It is the worst
+  shape this model has and it is not a lever; making it free would not be
+  measurable in a run.
+- **What scales with the window is the trunk re-reading its weights.** 41% of
+  the width cost is dense k-quant mat-vecs -- same dispatch count, same
+  weights, read once per row, because ggml's mat-vec carries the token axis on
+  the grid; 30% is the expert gather paying for 32 rows where ~23 are distinct
+  experts; 29% is `forward_capture` stepping the gated-delta recurrence one
+  token at a time. `REBUILD.md` Phase 27 has the per-kernel table, the three
+  fixes that are *not* it (the grid axis order, the tile, `qmv_wide` -- all
+  three built or measured and all three refuted), and the one that is: a
+  multi-row k-quant mat-vec that reads each weight block once and keeps every
+  row's accumulation order, which is worth **-21% a token at depth 1 against
+  -12% today** and stops depth 3 losing. (Those two are on Phase 27's own
+  44-token prompt, where autoregression measures 8.56 GPU ms a token and
+  `--mtp-depth 1 --frspec` 7.53 -- the same -12 to -14% this table's -13.7%
+  records on its own prompt.)
 
 ### How exact it is: exactly, and it is the default
 
@@ -1873,6 +1920,26 @@ In order:
    the wall, and the eighth explanation still needs a machine that is not
    swapping. Fixing it is worth another ~13 tok/s on top, not the whole win.
 
+5. **A multi-row k-quant mat-vec, which is the largest measured lever left.**
+   `REBUILD.md` Phase 27: a verify forward costs **3.4 ms per row of the
+   window** on `q6k-full`, against a draft level's 0.587, and 41% of that is
+   the dense k-quant mat-vecs reading the same weight matrix once per row --
+   ggml's kernel carries the token axis on the grid, so an M-row call is M
+   independent mat-vecs. Neither existing kernel fixes it at a window's width:
+   the tile reads the matrix once but its floor is 7.5x a mat-vec, so it only
+   crosses over at 16 rows, and mlx's `qmv_wide` recovers 43% and still pays
+   2.6x at four rows. What does is a mat-vec with an M axis *inside* it --
+   read each weight block once, accumulate into M row accumulators, leave the
+   `ib` loop, the lane split and the `simd_sum` exactly as they are, so every
+   row keeps the arithmetic it would have had alone and the window mode's
+   contract survives by construction. Priced by subtracting it from the
+   measured cycles: `--mtp-depth 1 --frspec` goes from -12% to **-21%** of a
+   token against autoregression and depth 3 from +13% to -8%. Taking the
+   other two thirds as far as they go -- the expert gather charging for the
+   ~23 distinct experts a four-token window names rather than its 32 rows,
+   and one recurrence dispatch writing all `T` snapshots instead of one per
+   token -- gives **-27% at depth 1 and -20% at depth 3**.
+
 Smaller gaps, each with an assert or a comment where it bites:
 
 - The chat template's `tools` system block and the assistant `tool_calls`
@@ -2139,6 +2206,14 @@ reads much more invitingly than it should.
 - `cargo run --release --bin bandwidth` measures what this machine sustains:
   a read-only kernel at several sizes, then `quantized_matmul` at M = 1 on real
   weights. Run it before believing any "% of peak" claim.
+- **`--bin draft_cost` and `--bin window_mv` are the speculative pair**, both
+  `ORNITH_PROF=1` and both in GPU seconds. The first runs a draft level and a
+  verify forward apart from each other, at every window width, and reports
+  per-kernel growth under `ORNITH_COMMIT_EVERY=1`; the second asks the same
+  question of one module, against the tile and against mlx's own choice.
+  `window_mv` repeats one module sixteen times, so its weights stay resident
+  and its ratios are the optimistic end of `draft_cost`'s -- when the two
+  disagree, `draft_cost` is the one that is measuring a forward.
 - `ORNITH_PROF=1` also attributes each barrier to the pair of dispatches that
   forced it, counts host round trips, and prints the epoch histogram and the
   pool's peak; `ORNITH_RECYCLE=1` lets the pool hand back a buffer the current
@@ -2200,6 +2275,15 @@ reads much more invitingly than it should.
   compute how the quantity being optimized is distributed across them** -- in
   this project that is usually `config.json`, the per-kernel table, or
   `--bin bandwidth`.
+- **A quantity obtained by differencing two configurations measures every
+  difference between them, not the one in its name.** `REBUILD.md` Phase 26
+  read "a draft level costs 4.31 ms" out of `(cycle(3) - cycle(1)) / 2` and
+  spent the next paragraph hunting for where 3.9 ms of it went. Depth 3 and
+  depth 1 differ by two draft levels *and* by two verify rows, and the rows
+  cost 5.8x the levels: a draft level is 0.587 ms. What settled it was
+  running each half on its own in one process -- `src/bin/draft_cost.rs`,
+  four command-line minutes -- which is always available and was never done
+  because the subtraction looked like a measurement.
 - When a composed test fails and its parts pass, suspect the plumbing between
   them — and write a narrower dump rather than reasoning about it. Both the
   buffer-pool race and the dispatch-grid overrun were found that way.

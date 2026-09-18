@@ -3831,6 +3831,225 @@ the draft is worth.
 
 ---
 
+## Phase 27 -- the 3.9 ms was never in the draft -- **DONE**
+
+Phase 26 decomposed a speculative cycle by differencing two depths:
+
+    cycle at depth 3   21.57 ms = 3 drafts + one verify
+    cycle at depth 1   12.95 ms = 1 draft  + one verify
+    => one draft        4.31 ms
+
+and then priced the draft's bytes at 204 MB against a decode step's 1805 --
+11.3% of the bytes for 50% of the time -- and wrote down that the lever was
+"wherever the other 3.9 ms goes", with a 256-expert MoE routing one token as
+the suspect.
+
+**That subtraction charges the whole difference to the draft levels, and it is
+only right if a verify costs the same over a four-token window as over a
+two-token one.** Nothing had measured that, and nothing could: `ORNITH_PROF`
+attributes GPU time per kernel over a whole run, and a speculative run is a
+draft *and* a verify sharing every kernel name they use.
+
+`src/bin/draft_cost.rs` runs each half on its own, in one process, on one set
+of weights. `q6k-full`, 44-token prompt, eight committed tokens first, GPU
+seconds. One run, and the four-run spread beside it -- the machine moves the
+level of all of these together by a few percent between sittings and moves
+none of the ratios:
+
+    one draft level (depth 1, with FR-Spec)      0.587 ms   0.53 - 0.61
+    an autoregressive decode step                8.342 ms   7.93 - 8.34
+
+    a verify forward, by window width                      dispatches
+      width 1                                    8.217 ms       1756
+      width 2                                   11.368 ms       2156
+      width 3                                   14.733 ms       2426
+      width 4                                   18.149 ms       2696
+    each extra row                             3.15 - 3.42      3.0 - 3.9
+
+    Phase 26's subtraction, on these numbers:
+      (cycle(3) - cycle(1)) / 2 = 3.977 ms (3.98 - 4.03 over four runs),
+      against a draft level of 0.587 measured directly
+
+**So the arithmetic reproduces -- Phase 26 read 4.31 and this reads 3.98-4.03
+-- and the attribution was wrong by about sevenfold.** A draft level is
+0.587 ms. The other 3.4 ms is the verify forward, and it is paid *per row of
+the window*.
+
+The reason the subtraction lands where it does is arithmetic once it is
+written out: `cycle(3) - cycle(1)` is two draft levels **plus the window's
+third and fourth rows**, so halving it gives `draft + (row3 + row4) / 2` --
+0.587 + 3.39 here. Phase 26 read that whole quantity as the draft.
+
+### The draft is not slow, and it is not 4.4x its byte budget
+
+Its blocks, each run on its own with the head's own weights (best of three
+passes; a block is a few hundred microseconds with a sync on each side, which
+is exactly the size this machine's interference comes in):
+
+    whole level                            0.587 ms   100%
+      head.hidden                          0.375       64%
+        prefix: embed, two norms, fc       0.029        5%
+        MoE block, 256 experts             0.167       28%
+          router gate + softmax            0.006
+          top-k: argsort 256, slice, norm  0.014
+          switch_glu: 3 gather_mv, 8 experts 0.105
+          shared expert, mix               0.011
+        attention + residuals              0.179       31%
+      lm_head, pruned to 64K rows          0.141       24%
+      (lm_head, full, for comparison       0.593)
+
+204 MB in 0.587 ms is **347 GB/s**, against the 219 GB/s a decode step
+sustains (1805 MB in 8.22) and the 465 this machine gives a long read. So the
+draft reads **11.3% of a decode step's bytes in 7.1% of its time** -- it runs
+at 1.6x the trunk's byte rate, not 4.4x under it. Phase 26's ratio divided a
+wrong numerator by a right denominator. Quantizing the MTP head would save at
+most 93 MB of 204, i.e. ~0.27 ms of 0.587 -- of a 12.0 ms cycle, **2%**.
+
+**The hypothesis this phase was opened on is refuted with it.** A 256-expert
+MoE routing one token is indeed the worst shape this model has, and it costs
+0.167 ms: 1.4% of a depth-1 cycle. Making the draft's MoE free would not be
+measurable in a run.
+
+### Where the window's rows go, per kernel
+
+`ORNITH_COMMIT_EVERY=1`, so each command buffer holds one dispatch and its
+timestamps belong to one kernel. That inflates a verify from 8.22 to 11.47 ms
+and inflates small kernels most; read the growth, not the totals.
+
+    ms per verify           width 1   width 2   width 4   dispatches/verify
+    q4k_qmv                   2.124     3.010     6.014   91, unchanged
+    q4k_gather_qmv            1.652     2.516     4.257   96, unchanged
+    q6k_qmv                   1.164     1.446     2.183   104, unchanged
+    q6k_gather_qmv            0.443     0.734     1.468   24, unchanged
+    slice_inner               0.503     1.170     1.549   140 -> 320 -> 500
+    gated_delta_packed        0.293     0.596     1.267   30 -> 60 -> 120
+    gemv (in_proj_a/b)        0.265     0.483     0.921   60 -> 120 -> 240
+    concat_time               0.117     0.242     0.417   30 -> 60 -> 120
+    compute_g                 0.107     0.243     0.380   30 -> 60 -> 120
+    whole verify             11.469    15.338    23.468
+
+The +12.0 ms splits three ways, and the first column of the split is the one
+that matters:
+
+    dense k-quant mat-vecs      +4.91   41%   same dispatch, same weights,
+                                              read once per row
+    routed expert gathers       +3.63   30%   8 rows a token -> 32; ~23 of
+                                              those 32 are distinct experts
+    gated-delta, per token      +3.43   29%   `forward_capture` steps the
+                                              recurrence one token at a time
+
+**The dense half is a pure re-read.** `q4k_qmv` is dispatched 91 times whatever
+the width, and takes 2.8x as long at four rows as at one. ggml's mat-vec
+carries the token axis on the grid, so an M-row call is M independent
+mat-vecs: the weight matrix is read M times. `src/bin/window_mv.rs` measures
+it one module at a time, and the shape is unmistakable:
+
+    module (q6k-full)          M=1     M=2     M=4     M=8    M=16
+    out_proj, 4.7 MB          1.00    1.95    2.99    7.88   15.26
+    q_proj, 13.8 MB           1.00    1.92    3.79    7.53    7.58
+    lm_head, 286 MB           1.00    1.68    3.22    6.57   10.23
+    in_proj_qkv, 9.4 MB       1.00    0.45    0.87    1.72    2.72
+
+(The last row is not monotone and is the exception that marks the instrument:
+9.4 MB stays resident across the sixteen repetitions this bin makes, so its
+extra rows are served from cache, and its M=1 point is slower than its M=2 one
+because a single row does not fill the machine. In a real forward each module
+is read once and evicted by the next, which is why the end-to-end sweep above
+is the measurement of record and this one is the optimistic end of it.)
+
+### Three things that are not the fix
+
+- **The grid axis order.** mlx's affine `qmv` dispatches `(rows, output
+  tiles)` and ggml's k-quant mat-vec dispatches `(output tiles, rows)`;
+  threadgroups are scheduled x-fastest, so the first has the rows of one tile
+  adjacent and reading the same lines, and the second sweeps the whole matrix
+  once per row. That is a two-line change -- a function constant picking which
+  of `tgpig.x`/`tgpig.y` is the row -- and it moves no arithmetic at all.
+  Built, held bit-identical (the outputs compared element for element at every
+  width), measured in one process on both instruments: **1.00 on every module,
+  and a verify of 8.217 / 11.368 ms at widths 1 and 2 against 8.273 / 11.399
+  with the rows on x.** Reverted. The order threadgroups are issued in is not
+  the order they run in at this occupancy.
+
+- **The tile.** `kquant::qmm_t` reads the matrix once whatever M is, and the
+  measurement says so exactly -- q_proj 0.173, 0.173, 0.174, 0.173 ms at M =
+  1, 2, 4, 16. But its floor is 7.5x the mat-vec's M=1, so it only crosses
+  over at 16 rows, which is where `MM_ROW_LIMIT` already puts it. At a verify
+  window it is 2x *slower* than the re-reads it would replace. The routed tile
+  is worse: it runs its K loop once per run of one expert, and a window's runs
+  are one row long.
+
+- **mlx's `qmv_wide`**, which is the kernel written for exactly this ("several
+  input vectors share one weight read") and is what the affine artifact takes
+  with `ORNITH_INVARIANT=0`. On `int4-head-linattn`'s `q_proj`, M=4 costs
+  0.051 ms against row-by-row `qmv`'s 0.089 and one row's 0.020 -- 0.57x the
+  re-reads, and still 2.6x one row. Sharing a weight read between five rows
+  is not the same as reading it once, and `qmv_wide` is also a different
+  association (eight lanes reducing K instead of thirty-two), which is why
+  the window mode turns it off in the first place.
+
+### What the lever is, and what it is worth
+
+A **multi-row k-quant mat-vec**: read each weight block once and accumulate it
+into M separate row accumulators, leaving every row's accumulation order
+exactly as the one-row kernel has it. That last clause is what makes it worth
+writing rather than reaching for the tile -- Phase 21's window mode is on by
+default precisely because a verify row must compute what it would have
+computed alone, and a tile or a `qmv_wide` breaks that. A per-block weight
+load hoisted across rows does not: the `ib` loop order, the lane split and the
+`simd_sum` are untouched, so the two agree bit for bit by construction.
+
+Priced by subtracting the dense re-read from the **measured** cycles in the
+next section, which is the honest form of this arithmetic: 41% of a row's
+3.31 ms is 1.36 ms saved per extra window row, and nothing else moves.
+
+    on this prompt, GPU ms a token      today   dense re-read taken back
+    autoregressive                       8.56       8.56
+    --mtp-depth 1 --frspec               7.53       6.73    -21% instead of -12%
+    --mtp-depth 3 --frspec               9.67       7.86     -8% instead of +13%
+
+So depth 3 stops losing and depth 1 stays the knee. Taking the other two
+thirds as far as they go -- charging the expert gather for the ~23 distinct
+experts a four-token window names rather than its 32 rows, and letting one
+recurrence dispatch write all `T` snapshots instead of one per token, call it
+half of that share -- brings the per-row cost to ~1.2 ms and gives **6.28 ms a
+token at depth 1 (-27%) and 6.84 at depth 3 (-20%)**.
+
+### The loop agrees with the decomposition
+
+The check that these two halves are the same object the runtime runs. Same
+prompt, 200 tokens, greedy, `q6k-full`:
+
+    config                     GPU ms/token   acceptance   tokens/cycle
+    autoregressive                 8.56           --            1.00
+    --mtp-depth 1 --frspec         7.53          0.69           1.695
+    --mtp-depth 3 --frspec         9.67   0.67/0.55/0.52        2.247
+
+    measured cycle = ms/token x tokens/cycle    12.76      21.73
+    draft + verify, from the decomposition      11.96      19.91
+    unaccounted                                  0.80       1.82
+
+The residual is the loop itself and grows with the window as it should: the
+sampler takes `depth + 1` rows through `log_softmax` and `argmax` over 248320,
+and the `Committed` history policy re-encodes `head.hidden` for every accepted
+row. ~0.5 ms a window row, which is worth knowing next to the verify's 3.4.
+
+### The lesson, and it is the same one twice
+
+Phase 26 named a lever from a subtraction and checked the arithmetic rather
+than the assumption inside it. The assumption -- "a verify costs the same at
+any width" -- was the whole content of the claim, and it was cheaper to
+measure than the sentence was to write: one bin, one process, four widths.
+
+`HANDOFF.md` already carries the general form of this ("price the options
+before choosing between them"), and the specific form is worth adding: **when
+a quantity is obtained by differencing two configurations, the thing it
+measures is every difference between them, not the one in the name.** Depth 3
+and depth 1 differ by two draft levels *and* by two verify rows, and the rows
+cost 5.8x what the levels do.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
