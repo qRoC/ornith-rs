@@ -2409,10 +2409,12 @@ it, for the second phase running.
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
 
-**This constraint is gone.** It was written against 84 GB free; the disk now
-has **592 GB**, which holds the parent and several variants at once. Variants
-*can* be compared side by side, so build them all and keep them until the
-numbers are in.
+**This constraint came back, 2026-09-18.** It was written against 84 GB free,
+then relaxed when the disk had **592 GB** -- and after Phases 7-15 forged six
+more artifacts at ~26 GB each there are **103 GB** left. Variants still *can*
+be compared side by side, which is what made Phase 15 possible, but building
+two more now means deleting one first. `ornith-1.5-35b-a3b-q4k-twin` is the
+cheapest to lose: it was a stand-in for a format that now exists for real.
 
 What the old table forced is still worth recording, because it is why Phase 0
 happened when it did: with 84 GB free, the order had to be captures, then
