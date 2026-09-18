@@ -212,6 +212,10 @@ tools/weight_error.py      what a variant's format actually cost, against the
                            bf16 parent, one module at a time
 tools/rotation_ceiling.py  what a QuaRot/SpinQuant rotation could buy, priced
                            against the parent before writing one
+tools/awq_expert_ceiling.py  the same for an activation-aware scale on the
+                           experts, both sides of the block
+tools/dump_awq_experts.py  per-(layer, expert, channel) saliency -- the
+                           per-expert object the Hessians could not be
 tools/step_bytes.py        bytes one decode step reads, from the safetensors
                            headers rather than by hand
 tools/aq.py                mlx's affine_quantize in numpy, bit-exact, with the
@@ -219,6 +223,8 @@ tools/aq.py                mlx's affine_quantize in numpy, bit-exact, with the
 tools/forge_fp8scale_twin.py  a 4.50-bit format's stand-in, written in the
                            5.00-bit layout so it needs no kernel to measure
 tools/gen_unicode.py       the Unicode tables the tokenizer needs
+refs/awq-experts/          that saliency, 21 MB, the first per-expert
+                           statistic this rebuild has
 refs/<case>/               the references themselves (not in git)
 tests/                     one test file per reference case
 ```

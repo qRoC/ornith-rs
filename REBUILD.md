@@ -2128,6 +2128,14 @@ considered because expert `down_proj` was never in its scope.
 
 Untested, and it is the first thing to try if this phase's KL comes back thin.
 
+**Tested in Phase 22 and rejected**, on the objective rather than on an
+artifact: 0.3% against the pooled Hessian this phase used, 6.3% against the
+per-expert saliency it could not have -- and an unconstrained oracle says 0.4%,
+so the family is not the limit, the tensor is. Phase 22 also confirms this
+phase's alternative explanation #4: pooling 256 experts hides an order of
+magnitude of per-channel structure, and for a *diagonal* statistic the pooling
+was never necessary.
+
 ---
 
 ## Phase 13 -- IDEAS #1, priced out rather than left untested -- **DONE**
@@ -3201,6 +3209,164 @@ rebuild was ever outside it.
     cost 31 s, which is the only place it is used.
   - **The MTP head is not covered and does not need to be.** Its arithmetic
     decides which drafts are proposed, not which are accepted.
+
+---
+
+## Phase 22 -- AWQ on the experts, priced on the right object and rejected -- **DONE**
+
+Phase 12 closed GPTQ on the experts and named the successor in one line:
+"`down_proj` reads `silu(gate) * up` ... the one module GPTQ cannot touch is
+one AWQ **can**. Untested, and it is the first thing to try if this phase's KL
+comes back thin." The KL came back thin. This is that test, and it is a
+pricing rather than a build -- the same shape as Phase 20.
+
+### The fold is exact, and it can only ever reach one side of the block
+
+`h_c = silu((W_gate x)_c) * ((W_up x)_c)` puts the nonlinearity on the gate
+path alone, so dividing **row `c` of `W_up`** divides `h_c` exactly, and
+`W_down diag(s)` restores the product. Phase 12 has it right.
+
+What Phase 12 did not say is that the same structure bounds what the fold can
+buy, and the bound is one-sided. **A per-channel scale can only move the
+rounding of a tensor whose quantization groups run along that channel index.**
+`W_down`'s groups are 32 consecutive input channels, so `s` varies inside a
+group and changes its rounding -- there is a lever. `W_up`'s groups run along
+its *input* axis, so scaling row `c` scales all 64 of that row's groups
+uniformly, and affine quantization is **exactly equivariant** under that:
+
+    per-row factor       codes identical    stored scale == factor * scale
+    2**-3, 2**-1, 2, 2**4      yes                    yes
+    1.37                       no                 no (max 14.5% off)
+
+Measured on `L20.up_proj`, expert 0, through `aq.quantize`. So at a power of
+two the compensation side is not merely accurate, it is a **no-op**: the same
+integer codes, the scales and biases scaled exactly, `h'_c = h_c / 2**k` bit
+for bit. At an arbitrary factor it is not a rounding effect but a discrete one
+-- the quantizer's `q0 == 0` branch flips -- which is a stronger reason for
+Phase 6's power-of-two restriction than Phase 6 had.
+
+**The consequence: the exact fold protects `down_proj` and nothing else.** The
+side of the expert that can be helped is fixed by the layout, not chosen.
+
+### On the object Phase 12 had, there is nothing to take
+
+Priced in Phase 12's own currency, `||(W - Wq) X^T||_F / ||W X^T||_F` through
+the Hessian already on disk, 8-16 experts a layer, best alpha per expert:
+
+    layer   saliency        RTN   AWQ continuous   AWQ power-of-two
+      0     pooled       0.0730     -0.3%              -0.0%
+     20     pooled       0.0813     -0.1%              +0.0%
+     39     pooled       0.0071     -0.0%              +0.0%
+
+The RTN column reproduces Phase 12's own (`L0` 0.0731, `L20` 0.0813), which is
+how this is known to be measuring the same object. The search **chooses
+`alpha = 0`** -- no scaling -- on most experts.
+
+And it is not AWQ's parametric family that is the limit. Uniformly scaling a
+group changes nothing, so the objective decomposes over groups and a
+32-coordinate descent per group is an unconstrained oracle for what *any*
+per-channel scale could do:
+
+    L0  expert 0   unconstrained per-channel scale   -0.4%
+    L20 expert 0                                     -0.1%
+
+### But that object was the wrong one, and the diagonal was never 172 GB
+
+`dump_gptq_experts.py` pools over (token, expert) pairs because the exact
+per-expert Hessian is 172 GB, and Phase 12 listed that as the honest
+alternative explanation for its own null result. **A diagonal is not 172 GB.**
+One expert's saliency is 512 numbers; the whole model's is 21 MB.
+`tools/dump_awq_experts.py` records it -- `mean|h_c|` and `E[h_c**2]` per
+(layer, expert, channel), same corpus, same streamed parent, 241 s, 4 GiB
+peak, every expert seeing at least 1432 rows.
+
+It says the pooled object had hidden an order of magnitude:
+
+    spread of mean|h_c| across channels     pooled    per expert (median)   (max)
+    layer  0                                 1.29          3.56             22.5
+    layer  5                                 1.09          2.02              6.9
+    layer 20                                 1.12          2.21             12.8
+    layer 35                                 1.52          3.80             25.6
+    layer 39                                 1.68          4.69             47.5
+
+**Pooling 256 experts does not average a shared pattern, it cancels 256
+different ones.** That is Phase 12's alternative explanation #4, measured and
+real -- and it retires a weight-side proxy this phase tried first, row norms of
+`|gate_c| * |up_c|`, which said the per-expert spread was *smaller* than the
+pooled one (1.4-1.8x). It ignores the input covariance and `silu`'s gating,
+which is exactly where the per-expert structure lives.
+
+### Re-priced on the right object, and still a reject
+
+Saliency `mean|h_c|` and scorer `E[h_c**2]`, both per expert, 16 experts a
+layer, best alpha per expert:
+
+    layer      RTN   AWQ continuous   AWQ power-of-two   best single expert
+      0     0.0713       -6.3%             -3.8%             -26.0%
+      5     0.0809       -1.6%             -0.3%              -6.2%
+     20     0.0813       -2.8%             -1.6%             -17.7%
+     35     0.0070       -0.0%             -0.7%              -0.0%
+     39     0.0072       -0.7%             -3.0%              -7.1%
+
+Per-expert granularity is worth an order of magnitude over the pooled
+statistic -- 0.3% becomes 6.3% -- and it is still not enough, because of what
+this same currency has already bought elsewhere:
+
+    intervention, same proxy                 objective   delivered on 64 probes
+    GPTQ, expert gate/up (Phase 12)          -36%/-18%   +3.5%, inside its own draw spread
+    AWQ, in_proj, power-of-two (Phase 6)     -26.2%      nothing, and `arith` 3-7x worse
+    **AWQ, expert down_proj, per-expert**    **-2%..-6%**   not built
+
+Two interventions with three to six times more of this objective both came back
+unreadable on the instrument. Phase 12's +3.5% was already smaller than the gap
+between its own two draws (0.0017 against 0.0015). An intervention a further
+level down is **below what 64 probes and a sign test can resolve**, which is
+not a prediction about AWQ -- it is a statement about the instrument.
+
+And the scorer used here is *diagonal*, which flatters AWQ: AWQ is a diagonal
+method, so scoring it diagonally ignores whatever it does in the off-diagonal
+directions. The number above is an optimistic one.
+
+### The other side of the expert, priced while the tools were out
+
+The side of the block with spread is the one `gate_proj` and `up_proj` read.
+Its Hessian is on disk too, and it is not close:
+
+    diagonal spread, max/median        layer 0   5    10   20   30   35   39
+    hidden  (gate/up input, 2048)       14.5   10.3  8.6  5.8  9.7  6.9  10.4
+    inter   (down_proj input, 512)       1.7    1.4  1.3  1.6  1.4  2.4   3.0
+
+That side folds into `post_attention_layernorm`, whose readers are exactly the
+router gate, the 256 experts' `gate`/`up` and the shared expert's -- all
+quantized, no bf16 reader but the gain itself, so the folding group is clean.
+Priced the same way, one scale for the group, gate+up of 8 experts:
+
+    layer      RTN    AWQ continuous   AWQ power-of-two
+      0     0.0467      -15.5%            -13.7%
+     20     0.0656       -4.0%             -2.7%
+     39     0.0050       -0.0%             -2.0%
+
+Better than `down_proj` and still weaker than the GPTQ attempt on the same
+tensors that delivered nothing. **Not built either**, for the same reason.
+
+### What would change this
+
+  - **An instrument that can read a 2-6% objective.** Everything here is a
+    statement about a lever being smaller than the noise floor of 64 probes.
+    More probes, or a paired design that removes between-draw variance, moves
+    the floor rather than the lever.
+  - **A saliency model that is not `mean|x|`.** Phase 6 measured that
+    `mean|x|` is substantially language-independent and that the damage it
+    misses is concentrated in rare forced continuations. That diagnosis
+    applies unchanged here; a saliency that predicted *those* channels would
+    be a different experiment, not a different alpha.
+  - **Not a bigger alpha grid, and not the continuous family.** The
+    unconstrained oracle is 0.4%, and the power-of-two restriction costs
+    little of what is there (6.3% -> 3.8%).
+
+`refs/awq-experts/` is kept: 21 MB, and it is the first per-expert statistic
+this rebuild has, which is the part of this phase most likely to be wanted
+again.
 
 ---
 
