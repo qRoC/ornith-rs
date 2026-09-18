@@ -7,6 +7,7 @@ pub mod embedding;
 pub mod gdn;
 pub mod moe;
 pub mod norm;
+pub mod q4k;
 pub mod quantized;
 pub mod rope;
 pub mod sample;
