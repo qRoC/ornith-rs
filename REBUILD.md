@@ -2536,9 +2536,11 @@ holds, and **all 315 modules agree with ggml digest for digest**.
     q4k-all     (187)    1.9311 GB   107.9 t/s   0.0237   0.1697   4.6466   6/64
     **q6k-all   (315)**  **1.8051**  **124.2**   0.0342   **0.1572** 4.8855  **5/64**
 
-**-13.1% of a decode step against the baseline and +21% of the rate** -- and
-the decode draws span 104.9 to 124.2, so read the best-of-four as a best case
-rather than a typical one.
+**-13.1% of a decode step against the baseline**, and the rate is where this
+machine stops resolving: 124.2 best-of-four here, 110.4 best-of-four for
+`q6k-full` in Phase 18 -- *identical traffic, identical kernels* -- with
+single draws as low as 79.9. So the honest reading is **+8% to +21%** against
+the baseline's 102.6, and the spread is the machine rather than the artifact.
 
     q6k-all vs q4k-all            lower on 22 of 64   p = 0.017
     q6k-all vs int4-head-linattn  lower on 36 of 64   p = 0.38
@@ -2599,6 +2601,81 @@ every artifact here (0.1572)** and the **fewest top-1 tokens moved (5 of
 
 So it is not one probe this time -- it is a broad small loss in the middle
 with one large gain, which is what a median moving against a p90 looks like.
+
+---
+
+## Phase 18 -- the same conversion, weighted, and Phase 17's loss disappears -- **DONE**
+
+Phase 17 measured the 8-bit side's conversion as the first significant quality
+cost this instrument has found: 22 of 64 probes, p = 0.017. **It was measured
+on a conversion that quantized 52% of that side blind.**
+
+`forge_q4k.py --q6k --imatrix` weighted 80 of its 128 modules. The 48 it could
+not weight were every `self_attn` projection and the shared expert's
+`down_proj`, because nothing in `refs/` saw what they see: the gated-delta
+Hessians are the *linear* layers' input, and `layerN.hidden` is the
+post-attention hidden the MoE reads. A full attention layer's projections read
+`input_layernorm`, and that tensor had never been captured.
+
+So capture it. `ORNITH_GPTQ_FAMILIES=attn dump_gptq_stats.py` adds three
+groups -- `q_proj` (2048x2048, shared with `k_proj` and `v_proj`), `o_proj`
+(4096x4096, its own) and `shared_expert.down_proj` (512x512, all 40 layers) --
+and the sharing is **asserted rather than assumed**: the first four inputs of
+each of q, k and v are compared element by element, `max_abs == 0.0` over ten
+groups. 60 Hessians, 841 MB, 218 s over the same 254028-token corpus, taken on
+`int4-head-linattn` rather than the parent because Phase 9 measured the two at
+0.58% apart.
+
+`q6k-full` is `q6k-all` with one variable changed: **128 of 128 weighted
+instead of 80**. The audit confirms the change landed where it should --
+exactly 48 modules' digests move, and their *unweighted* error rises
+(`self_attn.q_proj` 1.867% -> 1.920%, `o_proj` 1.867% -> 1.942%,
+`shared_expert.down_proj` 2.028% -> 2.260%), which is the signature of a
+weighting scheme doing its job.
+
+### The loss is gone
+
+    variant              median      p90      max     mean   top-1
+    q6k-full             0.0244   0.2042   4.5238   0.1426   5 of 64
+    q6k-all              0.0342   0.1572   4.8855   0.1454   5 of 64
+    q4k-all              0.0237   0.1697   4.6466   0.1476   6 of 64
+    int4-head-linattn    0.0350   0.1933   0.7394   0.0865   8 of 64
+    gptq-head-linattn    0.0273   0.2412   1.0122   0.0862   9 of 64
+
+    q6k-full vs q6k-all            lower on 40 of 64   p = 0.060
+    q6k-full vs q4k-all            lower on 31 of 64   p = 0.901
+    q6k-full vs int4-head-linattn  lower on 38 of 64   p = 0.169
+    q6k-full vs gptq-head-linattn  lower on 35 of 64   p = 0.532
+
+**31 of 64 against `q4k-all` is a coin flip**, where Phase 17's unweighted
+version was 22 of 64 at p = 0.017. The 8-bit side's bytes are free after all
+-- *but only weighted*. The imatrix is not a refinement here; it is what makes
+the conversion viable, and the difference between the two runs is 40 of 64 in
+its favour (p = 0.060).
+
+### What Phase 17 should have said
+
+Not "the 8-bit side's bits cost", but **"quantizing 52% of a side without an
+importance vector costs, and the vector was missing because nobody had
+captured that input"**. The per-bit correction already in Phase 17 stands --
+a grid change and a rate change are different moves -- and this is a second,
+independent reason its headline was too strong.
+
+It also puts a number on the imatrix that the 4-bit side could not: there, the
+comparison was 37 of 64 with and without (p = 0.26) on top of a conversion
+that was already free. Here it is the difference between a measured loss and a
+coin flip.
+
+### Where it helped and where it did not
+
+    helped                                    hurt
+    arith/ru-7x8      4.8855 -> 4.5238        longrange/russian-decl  0.2877 -> 0.4912
+    longrange/json-field 0.3961 -> 0.2330     arith/ar-2p2            0.0964 -> 0.2169
+    script/hi-capital 0.1220 -> 0.0617        mixed/ja-mlx-eval       0.1466 -> 0.2539
+
+p90 moves the wrong way (0.1572 -> 0.2042) while the median moves the right
+way (0.0342 -> 0.0244), so this is a redistribution and not a uniform gain --
+the same shape Phase 17 saw, pointing the other way.
 
 ---
 

@@ -1,6 +1,8 @@
 """Hessians for GPTQ: the second moment of every input the four families see.
 
     cd tools && PYTHONPATH=../../vendor/mlx-lm python3 dump_gptq_stats.py [<artifact>]
+    ORNITH_GPTQ_FAMILIES=attn ORNITH_GPTQ_OUT=../refs/gptq-attn \
+      python3 dump_gptq_stats.py <artifact>      # the 8-bit side's inputs
 
 `REBUILD.md` Phase 7. Quantization picks, for every weight, the nearest point
 of a grid. GPTQ picks a *different* point when a neighbour costs the layer's
@@ -14,6 +16,20 @@ vectors a module, which is a rank-256 sample. GPTQ inverts `H`, and at
 the compensation would run entirely on the damping term, which is RTN with
 extra steps. So the accumulation here is over every token, and nothing is
 kept but the matrix.
+
+**`ORNITH_GPTQ_FAMILIES=attn` captures the other side instead.** Phase 17
+converted the 8-bit modules to Q6_K and 48 of the 128 went in with no
+importance vector at all -- every `self_attn`, which is 52% of that side's
+traffic, plus the shared expert's `down_proj`. Nothing here covered them: the
+gated-delta Hessians are the *linear* layers' input, and `layerN.hidden` is
+the post-attention hidden the MoE reads, neither of which is what a full
+attention layer's projections see. Three groups, same pattern:
+
+  q_proj, k_proj, v_proj  all read `input_layernorm`, so one 2048x2048 a
+                          layer serves all three -- asserted the same way
+                          `in_proj_z`'s sharing is.
+  o_proj                  4096x4096, its own, one a layer.
+  shared_expert.down_proj 512x512, its own, all 40 layers.
 
 **Which modules, and the Hessian they share.** The 91 modules
 `int4-head-linattn` moved to 4 bits, in three input groups:
@@ -62,6 +78,7 @@ OWN_CALIB = ROOT / "tools/awq_calib.txt"
 SEQ = int(os.environ.get("ORNITH_GPTQ_SEQ", "1024"))
 MAX_SAMPLES = int(os.environ.get("ORNITH_GPTQ_MAX_SAMPLES", "0"))  # 0 = all
 VERIFY_CALLS = 4
+FAMILIES = os.environ.get("ORNITH_GPTQ_FAMILIES", "linattn")
 
 # id(module) -> {"H": accumulator, "n": tokens}, for the modules that own an input.
 RECORD = {}
@@ -86,27 +103,32 @@ def patch(cls):
             record(st, x)
         w = WITNESS.get(id(self))
         if w is not None:
-            seen = SEEN.setdefault(w[0], {"qkv": [], "z": []})
-            if len(seen[w[1]]) < VERIFY_CALLS:
-                seen[w[1]].append(mx.array(x.reshape(-1, x.shape[-1])[:8]))
+            seen = SEEN.setdefault(w[0], {})
+            role = seen.setdefault(w[1], [])
+            if len(role) < VERIFY_CALLS:
+                role.append(mx.array(x.reshape(-1, x.shape[-1])[:8]))
         return orig(self, x, *a, **k)
 
     cls.__call__ = patched
 
 
 def check_shared_inputs():
-    """`in_proj_qkv` and `in_proj_z` must see the same tensor, or one Hessian
-    cannot serve both. Compared bit for bit, like everything else here."""
+    """The modules sharing one Hessian must see the same tensor, or it cannot
+    serve them. Compared bit for bit, like everything else here."""
     assert SEEN, "no witnesses recorded"
     for group, seen in sorted(SEEN.items()):
-        a, b = seen["qkv"], seen["z"]
-        assert len(a) == len(b) >= 1, \
-            f"{group}: {len(a)} qkv / {len(b)} z witnesses"
-        for i, (x, y) in enumerate(zip(a, b)):
-            d = float(mx.abs(x.astype(mx.float32) - y.astype(mx.float32)).max())
-            assert d == 0.0, f"{group}: call {i} differs by {d}"
-    n = len(next(iter(SEEN.values()))["qkv"])
-    print(f"shared-input check: {len(SEEN)} layers, {n} calls each, max_abs == 0.0")
+        roles = sorted(seen)
+        assert len(roles) >= 2, f"{group}: only {roles}"
+        ref = seen[roles[0]]
+        for r in roles[1:]:
+            other = seen[r]
+            assert len(ref) == len(other) >= 1, \
+                f"{group}: {len(ref)} {roles[0]} / {len(other)} {r} witnesses"
+            for i, (x, y) in enumerate(zip(ref, other)):
+                d = float(mx.abs(x.astype(mx.float32) - y.astype(mx.float32)).max())
+                assert d == 0.0, f"{group}: {roles[0]} vs {r} call {i} differs by {d}"
+    n = len(next(iter(next(iter(SEEN.values())).values())))
+    print(f"shared-input check: {len(SEEN)} groups, {n} calls each, max_abs == 0.0")
 
 
 def build_corpus():
@@ -148,17 +170,23 @@ def main():
     for name, mod in model.named_modules():
         if not isinstance(mod, (nn.Linear, nn.QuantizedLinear)):
             continue
-        if name.endswith(("linear_attn.in_proj_qkv", "linear_attn.out_proj")) \
-                or name.endswith("lm_head"):
+        if FAMILIES == "attn":
+            owners = ("self_attn.q_proj", "self_attn.o_proj",
+                      "mlp.shared_expert.down_proj")
+            shared = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")
+        else:
+            owners = ("linear_attn.in_proj_qkv", "linear_attn.out_proj")
+            shared = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z")
+        if name.endswith(owners) or (FAMILIES != "attn" and name.endswith("lm_head")):
             dim = mod.weight.shape[1] * 32 // mod.bits \
                 if isinstance(mod, nn.QuantizedLinear) else mod.weight.shape[1]
             RECORD[id(mod)] = {"H": mx.zeros((dim, dim), mx.float32), "n": 0}
             names[id(mod)] = name
-        if name.endswith(("linear_attn.in_proj_qkv", "linear_attn.in_proj_z")):
-            WITNESS[id(mod)] = (name.rsplit(".", 1)[0],
-                                "qkv" if name.endswith("qkv") else "z")
-    assert len(names) == 61, f"expected 61 accumulators, matched {len(names)}"
-    assert len(WITNESS) == 60, f"expected 60 in_proj modules, matched {len(WITNESS)}"
+        if name.endswith(shared):
+            WITNESS[id(mod)] = (name.rsplit(".", 1)[0], name.rsplit(".", 1)[1])
+    want = (60, 30) if FAMILIES == "attn" else (61, 60)
+    assert len(names) == want[0], f"expected {want[0]} accumulators, matched {len(names)}"
+    assert len(WITNESS) == want[1], f"expected {want[1]} shared-input modules, matched {len(WITNESS)}"
     print(f"accumulating {len(names)} Hessians "
           f"({sum(st['H'].size * 4 for st in RECORD.values()) / 2**30:.2f} GB fp32)")
 

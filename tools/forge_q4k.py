@@ -96,6 +96,12 @@ OUT = MODELS / _opt(
     + ("-experts" if EXPERTS else ""),
 )
 EXPERT_HESSIANS = ROOT / "refs/gptq-experts-q0/hessians"
+# The 8-bit side's own inputs, captured by
+# `ORNITH_GPTQ_FAMILIES=attn dump_gptq_stats.py`. Phase 17 converted these
+# modules with no importance vector at all -- every `self_attn`, 52% of that
+# side's traffic -- because nothing else here sees what a full attention
+# layer's projections see.
+ATTN_HESSIANS = ROOT / "refs/gptq-attn/hessians"
 
 # `Q4K.md`'s first cut. A module is in when `int4-head-linattn` moved it to 4
 # bits, which is exactly these three suffixes plus `lm_head`.
@@ -160,6 +166,18 @@ def hessian_for(mod):
     # routed experts' two. `down_proj` reads the routed experts' intermediate,
     # which is what `layerN.inter` was captured on -- and the *shared*
     # expert's intermediate is a different tensor, so it gets none.
+    # `q_proj`, `k_proj` and `v_proj` read `input_layernorm` and the capture
+    # asserts it bit for bit, so one Hessian serves all three -- the same
+    # sharing `in_proj_z` relies on.
+    if mod.endswith(("self_attn.k_proj", "self_attn.v_proj")):
+        mod = mod.rsplit(".", 1)[0] + ".q_proj"
+    for d in (ATTN_HESSIANS,):
+        f = d / f"{mod}.npy"
+        if f.exists():
+            h = np.ascontiguousarray(np.diag(np.asarray(np.load(f), np.float32)))
+            assert (h >= 0).all(), f"{mod}: diag(H) has negative entries"
+            return h
+
     hidden_readers = (".switch_mlp.gate_proj", ".switch_mlp.up_proj", ".mlp.gate",
                       ".shared_expert.gate_proj", ".shared_expert.up_proj")
     if mod.endswith(".switch_mlp.down_proj") or mod.endswith(hidden_readers):
