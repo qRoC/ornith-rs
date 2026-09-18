@@ -1282,6 +1282,118 @@ steps.
 
 ---
 
+## Phase 5 -- a probe set with power -- **DONE**
+
+Phase 4 judged five artifacts on eight contexts and 6620 tokens of
+perplexity, and then it turned out that **one** of the eight was carrying the
+verdict: `Дважды два равно` spread the variants over a factor of ten, while
+on the other seven all four sat within 0.1 nats of the control and two within
+0.001. The conclusions were right; the instrument behind them was one sample
+wide. Phase 5 replaces the instrument and re-runs every Phase 4 judgement
+through it.
+
+`tools/probe_set.py` holds 64 contexts in eight groups, `tools/dump_probes.py`
+captures their full next-token distributions from one artifact, and
+`tools/compare_probes.py` compares captures. It is a **second** set, not a
+wider first one: `dump_artifact_baseline.py`'s `CONTEXTS` stays frozen because
+`baseline/logprobs.bin` -- the Phase 2 check that the rebuilt trunk is
+bit-identical to the deleted artifact -- is eight distributions over exactly
+those eight strings, and it cannot be regenerated. The probes live beside it
+in `probes.bin` and touch nothing.
+
+    cd tools && ORNITH_PROBES_OUT=../refs/artifact/<capture> \
+      PYTHONPATH=../../vendor/mlx-lm python3 dump_probes.py <artifact>
+    python3 tools/compare_probes.py
+
+### What the 64 say, against the four Phase 4 variants
+
+60 of 64 probes are live -- some variant moves the distribution by at least
+0.001 nats. KL(control || variant) over those, and the count of probes each
+variant is *least* damaged on:
+
+| variant | median | p90 | max | best on | worst on |
+|---|---:|---:|---:|---:|---:|
+| `int4-head-linattn` | **0.0272** | 0.1953 | 0.5029 | **28** of 60 | 6 of 60 |
+| `fp8scale-twin` | 0.0340 | 0.2612 | 0.4890 | 14 of 60 | 11 of 60 |
+| `int4-except-gates` | 0.0549 | 0.2462 | 1.5938 | 8 of 60 | 13 of 60 |
+| `nvfp4-head-linattn` | 0.0649 | 0.3172 | 6.6391 | 10 of 60 | 30 of 60 |
+
+**The Phase 4 ordering holds, and for the first time it is significant rather
+than anecdotal.** A sign test over the live probes, row lower than column:
+
+| | vs `int4-head-linattn` | vs `fp8scale-twin` | vs `int4-except-gates` |
+|---|---|---|---|
+| `int4-head-linattn` | -- | 40/60, p = 0.014 | 44/60, p = 0.0004 |
+| `fp8scale-twin` | 20/60 | -- | 31/60, p = 0.90 |
+| `nvfp4-head-linattn` | 17/60 | 22/60, p = 0.052 | 21/60, p = 0.027 |
+
+Three results change:
+
+1. **"By median `int4-except-gates` ties `int4-head-linattn`" is refuted.**
+   That was a tie over eight contexts. Over sixty it loses 44 of 60,
+   p = 0.0004, at 2.0x the median KL. The knee is where Phase 4 put it, and
+   now it is a measurement and not a maximum.
+2. **The magnitudes were badly inflated by the single context.** Phase 4 read
+   the fp8-scale twin as paying **9.2x** the KL of `int4-head-linattn`
+   (0.443 against 0.048). Over 64 probes the geometric-mean ratio is
+   **1.46x**, median 1.43x, and the twin is the *better* of the two rejected
+   4.50-bit routes rather than the worse. `int4-head-linattn` still wins, by
+   a margin an order of magnitude smaller than reported.
+3. **`nvfp4` is worse than Phase 4 could see**, not better: its max goes from
+   0.429 to **6.64 nats**, on `arith/ru-7x8`, where it abandons the
+   arithmetic continuation entirely and predicts a paragraph break. Its
+   rejection stands on much firmer ground.
+
+And one thing the old eight had no probe for at all: **two variants lose an
+in-context recall outright**. On `longrange/russian-decl` -- a name stated
+once and asked for ~350 tokens later -- `int4-except-gates` and `nvfp4` both
+answer the wrong name (` Ю` for ` Чел`), at 1.59 and 2.19 nats, while
+`int4-head-linattn` and the twin keep it. That is a behaviour change, not a
+distribution wobble, and no amount of perplexity would have shown it.
+
+### Where damage lands, and what to probe next time
+
+Median KL by group, across the four variants:
+
+| group | range | |
+|---|---|---|
+| `arith` | 0.089 - 0.288 | forced numbers, non-English -- the strongest family |
+| `morph` | 0.048 - 0.109 | agreement-driven inflection |
+| `longrange` | 0.056 - 0.081 | in-context recall; hides the worst single failures |
+| `script` | 0.027 - 0.114 | non-Latin, forced factual |
+| `code` | 0.012 - 0.086 | |
+| `rare` | 0.008 - 0.040 | |
+| `mixed` | 0.020 - 0.035 | |
+| `format` | 0.012 - 0.024 | syntax-locked and nearly free; 3 of the 4 dead probes |
+
+`Дважды два равно` was **representative, not a fluke** -- `arith` is the
+highest-damage group for three of the four variants, so the family it belongs
+to is real. What it was not is uniquely powerful: it ranks 12th of 64 by
+spread, and eleven probes separate the variants harder.
+
+### The instrument's own lesson
+
+This set was built on a theory that the captures then refuted, which is worth
+recording because the theory is the intuitive one. It assumed damage shows
+where the model is *confident by a narrow path*, so probes were chosen to be
+low-entropy. Both halves are wrong:
+
+- Entropy correlates **positively** with KL (+0.55 over the old eight). An
+  entropy gate at 2 nats -- which the first version of `compare_probes.py`
+  had -- would have dropped `Дважды два равно` itself. Against a near-delta
+  distribution there is nowhere for mass to go.
+- Entropy does not select for discrimination either. `The Rust borrow checker
+  prevents` has the highest entropy of the old eight and cannot rank the
+  variants at all; every one of them lands within 2.4x.
+
+The property that matters is **spread across variants**, and it is not
+visible in the text -- it has to be measured, which is why `compare_probes.py`
+ranks probes by it and why liveness is a floor on observed KL rather than a
+guess about the prompt. The set survived its own bad theory because breadth
+was the real requirement.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

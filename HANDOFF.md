@@ -1353,12 +1353,15 @@ In order:
      `int4-head-linattn`, 24.2% of a step's traffic and 11.8% of its GPU busy
      for 0.048 nats. **Three ways past it were tried and all three failed.**
 
-     | | GB/token | max KL | |
-     |---|---:|---:|---|
-     | `int4-head-linattn` | 2.076 | **0.048** | the answer |
-     | `nvfp4-head-linattn` | 1.925 | 0.429 | mlx's 4.50-bit mode |
-     | fp8-scale twin | 1.925 | 0.443 | the best non-mlx 4.50-bit format |
-     | `int4-except-gates` | 1.858 | 0.323 | more modules, not a cheaper format |
+     | | GB/token | max KL, 8 | median KL, 64 | |
+     |---|---:|---:|---:|---|
+     | `int4-head-linattn` | 2.076 | **0.048** | **0.027** | the answer |
+     | `nvfp4-head-linattn` | 1.925 | 0.429 | 0.065 | mlx's 4.50-bit mode |
+     | fp8-scale twin | 1.925 | 0.443 | 0.034 | the best non-mlx 4.50-bit format |
+     | `int4-except-gates` | 1.858 | 0.323 | 0.055 | more modules, not a cheaper format |
+
+     The third column is Phase 5 and is the one to read: the second is a
+     maximum over eight contexts, seven of which were asleep.
 
      mlx has exactly four modes: affine is the answer, nvfp4 was built and
      lost, mxfp4 and mxfp8 were priced out without building. The best format
@@ -1369,42 +1372,62 @@ In order:
    - **Two findings from that which outlast the formats, and both change how
      the next thing should be judged.**
 
-     **Weight error does not predict the distribution.** The fp8-scale twin
-     is +3% relative weight error from `int4-head-linattn` and pays 9.2x the
-     KL; nvfp4 is +34% and pays 8.9x. `tools/quant_error.py` and
-     `tools/weight_error.py` explain a result -- the second correctly
-     diagnosed nvfp4's subnormal group scales -- and neither can rank a
-     format. **`IDEAS.md` is entirely denominated in that currency**, and
+     **Weight error predicts the distribution weakly, and the evidence that
+     it does not at all was one context.** Phase 4 read the fp8-scale twin at
+     +3% relative weight error paying 9.2x the KL and nvfp4 at +34% paying
+     8.9x -- the same penalty for a tenfold difference in the predictor,
+     which looked decisive. Over 64 probes those become **1.46x and 2.08x**,
+     and the order is right: more weight error, more KL. What survives is the
+     narrower claim, and it is still fatal to using the tool as a chooser --
+     `int4-except-gates` has the *lower* weight error of the two (~8.2%
+     against the twin's 8.3-9.0%) and the higher median KL, because a
+     coverage change and a format change are not comparable in that currency
+     at all. `tools/quant_error.py` and `tools/weight_error.py` explain a
+     result -- the second correctly diagnosed nvfp4's subnormal group scales
+     -- and rank formats only within a fixed coverage, by order and never by
+     magnitude. **`IDEAS.md` is entirely denominated in that currency**, and
      carries the warning; its two headline ideas were both built today and
      both are dead (the two-stage exact `lm_head` prunes nothing: a 2-bit
      first pass leaves all 248320 rows alive, because Cauchy-Schwarz over
      2048 dimensions runs 49-68x loose and that looseness *is* the
      exactness).
 
-     **Every Phase 4 verdict rests on one context of eight.** `Дважды два
-     равно`, the only Russian prompt, separates the variants by a factor of
-     ten; on the other seven all four sit within 0.1 nats of the control and
-     of each other, two of them within 0.001. By *median*
-     `int4-except-gates` ties `int4-head-linattn`. It is not noise -- the
-     same context discriminates across four independently built artifacts in
-     the same order -- it is the only probe in the set with any power. The
-     conclusion stands; the confidence in it does not.
+     **Every Phase 4 verdict rested on one context of eight -- and Phase 5
+     re-ran all of them on 64.** `REBUILD.md` Phase 5 is the record;
+     `tools/probe_set.py`, `dump_probes.py` and `compare_probes.py` are the
+     instrument, and it is a second set beside the frozen eight, never a
+     replacement for them. The ordering held and is now significant instead
+     of anecdotal -- `int4-head-linattn` is the least damaged on 28 of 60
+     live probes and beats each rival by a sign test (44/60 over
+     `int4-except-gates`, p = 0.0004). Three things changed:
 
-   - **So the next thing is the probe set, before any more formats or
-     ideas.** Whatever is tried will be judged on those eight contexts and
-     6620 tokens of perplexity, and that instrument currently has about one
-     bit of discriminating power -- the corpus put the twin two parts in ten
-     thousand from a variant it is nine times worse than. It wants contexts
-     hard in the way context 6 is hard (other scripts, rare tokens,
-     long-range dependencies) and enough of them that a maximum is not a
-     single sample. Cheap: the list is a constant in
-     `tools/dump_artifact_baseline.py`, and re-running it over the four
-     artifacts on disk re-judges everything Phase 4 decided.
+     - "By median `int4-except-gates` ties `int4-head-linattn`" is **refuted**.
+       That tie was eight samples; over sixty it loses at 2.0x the median KL.
+     - The magnitudes were inflated ninefold by the single context. The twin
+       pays **1.46x**, not 9.2x.
+     - `nvfp4` is **worse** than was visible: max KL 0.429 -> **6.64 nats**,
+       on Russian arithmetic it answers with a paragraph break.
 
-     After that, the one idea not denominated in weight error is
-     **activation-aware scaling** (`IDEAS.md`): it produces an ordinary
-     affine artifact, so `max_abs == 0.0` against MLX survives untouched, and
-     it attacks *output* error, which is the axis none of this touched.
+     And a failure mode the old eight had no probe for: on a name stated once
+     and asked for 350 tokens later, `int4-except-gates` and `nvfp4` both
+     answer the *wrong name*, at 1.59 and 2.19 nats. Perplexity and the eight
+     contexts are both blind to it.
+
+     **What to probe, if the set is ever extended.** Damage lands in
+     `arith` (0.089-0.288 median), `morph` and `longrange`, and barely at all
+     in `format` (0.012-0.024, three of the four dead probes). The pattern:
+     it lands where the answer is forced by something learned narrowly --
+     non-English numerals, agreement, in-context recall -- and not where it
+     is forced by syntax. Do **not** select on entropy: it correlates
+     positively with KL, and a 2-nat gate would have dropped `Дважды два
+     равно` itself. Spread across variants is the property, and it is only
+     visible after capture.
+
+   - **So the next thing is activation-aware scaling** (`IDEAS.md`), the one
+     idea not denominated in weight error: it produces an ordinary affine
+     artifact, so `max_abs == 0.0` against MLX survives untouched, and it
+     attacks *output* error, which is the axis none of this touched. It now
+     has an instrument to be judged on.
 
 3. **Rebuild the artifact from its parent -- DONE**, Phases 0 through 4, and
    it is what unblocked the byte lever above. `REBUILD.md` is the record. The
