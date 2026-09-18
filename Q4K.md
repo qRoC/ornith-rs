@@ -108,6 +108,32 @@ changes to `gptq.py`, one extra argument. It is weighting rather than error
 compensation, so expect less than GPTQ's 27%; measure it before assuming it
 composes.
 
+**MEASURED 2026-09-18, `q4k_ggml.py --imatrix`, and it does what it should.**
+Two error columns, because only one of them is the objective -- a weighting
+scheme is *supposed* to lose on unweighted error, and reporting only that
+would be measuring the wrong object:
+
+    module                      unweighted rel RMS        H-weighted rel RMS
+                              plain +imat  change       plain +imat   change
+    lm_head                   7.121  7.223  +1.44%      6.798  6.237   -8.3%
+    layers.0.in_proj_qkv      7.144  7.238  +1.31%      6.652  5.682  -14.6%
+    layers.0.out_proj         7.547  7.942  +5.24%     21.618  4.304  -80.1%
+    layers.1.in_proj_qkv      7.360  7.635  +3.74%      8.187  5.583  -31.8%
+    layers.1.out_proj         7.427  7.687  +3.50%      8.776  7.071  -19.4%
+    layers.10.in_proj_qkv     7.595  7.875  +3.69%      8.048  5.618  -30.2%
+
+**8 to 80% off the quantity `diag(H)` says the model cares about, for 1.3 to
+5.2% of the quantity it does not, and one extra argument.** Layer 0's
+`out_proj` is the shape of the thing: its H-weighted error is 21.6% where its
+unweighted error is 7.5%, so its damage is concentrated exactly where the
+calibration says it matters, and the imatrix removes four fifths of it.
+
+Two cautions. The Hessian files hold the whole **`H`, [in, in]** -- passing
+the array as it loads hands `quantize_q4_K` H's first *row*, which has
+negative entries, and the quantizer answers with 38589% error. Take
+`np.diag`. And this is still weight error: whether ~25% of a weighted norm
+becomes KL is the kernel's question, not this one.
+
 ## The format, as ggml defines it
 
 ```c
@@ -201,10 +227,42 @@ the other end of the artifact is unpriced. The shipping artifact's traffic:
 **Q6_K is 6.5625 bits.** Moving those 169 modules off 8.50 would cut them by
 22.8%, which is **6.1% of the whole decode step** -- on top of Q4_K's 7.3%.
 Phase 4 priced `mxfp8` for this slot and rejected it (power-of-two scale, no
-zero point, 0.54% -> 2.94% error); Q6_K has neither defect. It has never been
-measured here, and `weight_error.py --schemes` can price it in minutes, the way
-Phases 13 and 14 priced their candidates. **Do that before writing the second
-kernel, not after.**
+zero point, 0.54% -> 2.94% error); Q6_K has neither defect.
+
+**MEASURED 2026-09-18, `q4k_ggml.py --q6k`**, against the bf16 parent, with
+ggml's own quantizer rather than a surrogate:
+
+    module                ggml Q6_K   affine g64   ggml Q4_K
+                            6.5625b        8.50b       4.50b
+    self_attn.q_proj          1.853%       0.743%      7.387%
+    self_attn.k_proj          1.864%       0.738%      7.432%
+    self_attn.o_proj          1.891%       0.760%      7.509%
+    mlp.gate (router)         2.139%       0.897%      8.304%
+    shared_expert.gate        1.821%       0.727%      7.243%
+    shared_expert.down        2.384%       1.024%      8.933%
+    experts.gate_up           1.830%       0.725%      7.295%
+    experts.down              1.814%       0.711%      7.250%
+    embed_tokens              1.853%       0.737%      7.366%
+
+**2.5x the error for 22.8% of the bytes**, and read on its own that sounds
+like `mxfp8`'s 5.4x. It is not, and the difference is the whole result:
+
+    step                     bits given up   error multiplier   doublings/bit
+    affine 8.50 -> Q6_K            1.9375              2.49x           0.68
+    Q6_K -> Q4_K                   2.0625              3.97x           0.96
+    affine 5.00 -> Q4_K (Ph. 14)   0.5000              0.91x          -0.27
+
+**The 8-bit side's bits are the artifact's most expensive.** Giving one up
+there costs 0.68 error-doublings; giving one up on the 4-bit side costs 0.96,
+and the artifact already pays that rate on 72.9% of its traffic. So if another
+byte has to come from somewhere, it should come from here -- which is what
+this measurement was for, and it is the opposite of `mxfp8`, which sat *off*
+the curve rather than on it.
+
+What it does not say is that Q6_K keeps the quality: this is weight error, the
+currency this rebuild has falsified twice as a selector (Phases 4 and 7).
+Turning 6.1% of a step into a KL needs the second kernel, and the first one
+has to pay first.
 
 ## What this does not need
 
