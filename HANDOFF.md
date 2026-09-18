@@ -939,9 +939,18 @@ a draft is worth.
 mechanism is that **the trunk got 13.1% cheaper and the draft did not**: the
 MTP sidecar is 1.7 GB of bfloat16 that no phase of the rebuild has quantized,
 so each draft level costs what it always cost while the thing it is amortised
-against shrank. That also names the largest remaining lever in this file -- the
-MTP head is the only part of the artifact still at bfloat16 that a decode step
-reads every cycle.
+against shrank.
+
+**And the draft's cost is not its bytes**, which is the correction Phase 26
+carries: the cycle decomposes into a 4.31 ms draft and an 8.64 ms verify (the
+verify against autoregression's 8.70 is the check), while a draft reads only
+129 MB of the sidecar -- top-8 of 256 experts plus 78.7 MB that is not experts
+-- and 75.5 MB of pruned `lm_head`. **11.3% of a decode step's bytes for 50% of
+its time, 4.4x its byte budget.** Quantizing the head is therefore worth at
+most 0.45 ms of the 4.31. The lever is wherever the other 3.9 ms goes, and the
+per-kernel attribution shows it spread thin across ~82 dispatches rather than
+concentrated -- a 256-expert MoE routing one token is the worst shape this
+model has, and a draft runs one per level.
 
 ### How exact it is: exactly, and it is the default
 

@@ -3773,8 +3773,42 @@ ever quantized a byte of it -- Phase 4's coverage map does not include it, and
 cost while the thing it is amortised against shrank, and the depth at which one
 more level stops paying comes down with it.
 
-Which names the next lever without any searching: **the MTP head is the only
-part of this artifact still at bfloat16 that a decode step reads every cycle.**
+Which looked like it named the next lever -- the MTP head is the only part of
+this artifact still at bfloat16 that a decode step reads every cycle -- and
+**that reading is wrong, measured the same day.**
+
+### The draft is 4.4x off its byte budget, so its bytes are not the lever
+
+The cycle decomposes, and the decomposition checks itself:
+
+    cycle at depth 3   21.57 ms = 3 drafts + one verify
+    cycle at depth 1   12.95 ms = 1 draft  + one verify
+    => one draft        4.31 ms
+       one verify       8.64 ms   -- against autoregression's 8.70, which is
+                                     the check: a verify reads the trunk once
+
+And a draft's bytes are small. The sidecar is 1.689 GB of which 1.611 GB is its
+256 experts, so a one-token forward reads **129 MB** of it (top-8 of 256 plus
+the 78.7 MB that is not experts), and the pruned `lm_head` adds **75.5 MB** at
+Q4_K. 204 MB against a decode step's 1805.
+
+    a draft reads   11.3% of a decode step's bytes
+    a draft costs   50%  of a decode step's time
+                    ---- 4.4x its byte budget
+
+**So the draft is not bandwidth-bound and quantizing the MTP head is worth at
+most a tenth of it**: 129 MB at 4.5 bits is 36, saving 93 MB, which at the
+trunk's own byte-to-time rate is 0.45 ms of the 4.31.
+
+The lever is wherever the other 3.9 ms goes. `ORNITH_COMMIT_EVERY=1` attributes
+GPU time per kernel and shows it **spread thin rather than concentrated** --
+the MTP head's own bf16 gemvs and its expert gather come to ~0.6 ms a token
+across 82 dispatches -- which is the signature of a forward that is latency and
+occupancy bound, not one waiting on weights. A 256-expert MoE routing a single
+token is the worst shape this model has, and the draft runs one every level.
+
+**Naming a lever from an arithmetic sketch and then measuring it the same day
+is the only reason this is a paragraph and not a phase spent building it.**
 
 ### The correction this phase makes to `HANDOFF.md`
 
