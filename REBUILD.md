@@ -3494,6 +3494,39 @@ each other, and the probe capture proves it end to end: 64 probes through
 That is the difference between tuning a shape and changing arithmetic, and it
 is the reason Phase 19's instrument question does not reappear here.
 
+### What is left, and it is the lever this phase did not spend
+
+**The tile is still compiled for an unknown shape.** `kquant_qmm_t` and
+`kquant_gather_qmm_t` take `K`, `O` and `M` as `constant int&` (buffers 5, 6
+and 7), so at compile time the kernel knows none of them. Three consequences,
+all of them paid on every tile:
+
+  - `nb = K / Q::QK` is a runtime divide, and
+    `for (loop_k = 0; loop_k < K; loop_k += KQ_NK)` cannot be unrolled at all.
+  - `nr0`, `nr1`, `lr0` and `lr1` clamp every load against the tail, on every
+    block, including the overwhelming majority that are full.
+  - the store's `i < nr0` bound is runtime.
+
+**And this model has six shapes, all known before the metallib is built**:
+`[8192, 2048]`, `[2048, 4096]`, `[2048, 2048]` and `[248320, 2048]` dense,
+`[512, 2048]` and `[2048, 512]` routed. `O % 64 == 0` on every one of them,
+and `K % 32 == 0` on every one of them, so both clamps are provably dead code
+for the shapes that exist.
+
+This is the second lever the brief for this phase named and the one it did not
+reach: `vendor/accelerated-qwen-3.8`'s `patches/metal-combination.patch` does
+exactly this to ggml's *mat-vec*, moving shape parameters into function
+constants and instantiating narrow row counts separately, and mlx does it to
+its own gemm (`alN_{aligned}` in `qmm_t`, function constants 200/201/202 in
+`gather_qmm_rhs_nt`). The port already lives that way elsewhere --
+`affine_qmv_fast` against `qmv_wide` is the same idea one level up.
+
+**The reason to expect it to pay is this phase's own 20x cliff.** An unroll
+pragma -- one line, no arithmetic touched -- was worth 12 to 23 times on the
+wide tile. A kernel whose time moves by that much on a codegen decision is a
+kernel where telling the compiler what it is compiling is not a micro-
+optimisation.
+
 ---
 
 ## Disk

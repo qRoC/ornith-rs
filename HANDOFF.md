@@ -502,7 +502,20 @@ at 3402**, and the output is *byte-identical* -- all three widths agree at
 Phase 19 left behind ("a narrower tile would help") was backwards: flat time
 across M = 1..32 means the fixed per-block cost is 32-60% of the total, so the
 tile wanted to be wider. ggml's `half` tile scalar, which this port declined
-for exactness, is priced in the same phase at 0-4%: the exactness was free. In GPU seconds, which is the number to read on this machine:
+for exactness, is priced in the same phase at 0-4%: the exactness was free.
+
+**What Phase 23 did not spend, and it is the lever that is about *this*
+model.** The tile still takes `K`, `O` and `M` as `constant int&`, so it is
+compiled for an unknown shape: the K loop cannot unroll, and the tail clamps
+on `nr0`/`nr1`/`lr0`/`lr1` are evaluated on every block although this
+artifact's six k-quant shapes -- `[8192, 2048]`, `[2048, 4096]`,
+`[2048, 2048]`, `[248320, 2048]` dense and `[512, 2048]`, `[2048, 512]` routed
+-- all satisfy `O % 64 == 0` and `K % 32 == 0`. Function constants under those
+shapes is what `vendor/accelerated-qwen-3.8` does to ggml's mat-vec and what
+mlx does to its own gemm (`alN_{aligned}`, constants 200/201/202), and the
+port already lives that way in `affine_qmv_fast` against `qmv_wide`. Phase 23's
+own 12-23x unroll cliff is the argument that codegen is a live lever in this
+kernel rather than a micro-optimisation. In GPU seconds, which is the number to read on this machine:
 
     prompt tokens        affine    q4k-all              q6k-full
                          int4      mat-vec    tile      mat-vec    tile

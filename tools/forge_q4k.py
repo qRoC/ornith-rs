@@ -80,6 +80,26 @@ def _opt(name, default=None):
 
 IMATRIX = "--imatrix" in sys.argv
 EXPERTS = "--experts" in sys.argv
+# `--per-expert`: `switch_mlp.down_proj` takes *that expert's* importance
+# vector instead of the layer's shared one.
+#
+# The sharing is right for everything else and wrong here, and this file used
+# to say so in the opposite direction: "One vector serves all 256 experts of a
+# layer, because the input distribution is the layer's and not the expert's."
+# `gate_proj` and `up_proj` do read one `post_attention_layernorm`.
+# `down_proj` reads `silu(gate) * up`, which is expert-specific by
+# construction -- and `REBUILD.md` Phase 22 measured what the pooling costs:
+# the shared statistic has 1.1-1.7x spread across channels where the
+# per-expert one has 2.0-4.7x, so pooling 256 experts cancels 256 patterns
+# rather than averaging one. `tools/imatrix_expert_ceiling.py` prices the
+# difference at 3.4-18.7% of that expert's own output error.
+PEREXPERT = "--per-expert" in sys.argv
+# `--redo`: the base is already a k-quant artifact and its modules are to be
+# converted *again*, at whatever format they already hold. That is what makes
+# a one-variable experiment affordable -- 40 modules on top of `q6k-full`
+# rather than 315 from `int4-head-linattn` twice over.
+REDO = "--redo" in sys.argv
+ONLY = _opt("--only")
 # Q6_K takes the other end of the artifact: the 169 modules held at affine
 # int8 g64 = 8.50 bits, where 6.5625 is 22.8% fewer bytes. `Q4K.md` priced it
 # at 0.68 error-doublings a bit against the 0.96 the 4-bit side already pays.
@@ -93,9 +113,12 @@ OUT = MODELS / _opt(
     "ornith-1.5-35b-a3b-"
     + MODE
     + ("-imatrix" if IMATRIX else "")
-    + ("-experts" if EXPERTS else ""),
+    + ("-experts" if EXPERTS else "")
+    + ("-perexpert" if PEREXPERT else ""),
 )
 EXPERT_HESSIANS = ROOT / "refs/gptq-experts-q0/hessians"
+# Per-(layer, expert, channel) saliency, from `dump_awq_experts.py`.
+EXPERT_SALIENCY = ROOT / "refs/awq-experts"
 # The 8-bit side's own inputs, captured by
 # `ORNITH_GPTQ_FAMILIES=attn dump_gptq_stats.py`. Phase 17 converted these
 # modules with no importance vector at all -- every `self_attn`, 52% of that
@@ -196,6 +219,23 @@ def hessian_for(mod):
     return h
 
 
+def expert_saliency(mod):
+    """`E[h_c**2]` per expert for a routed `down_proj`, `[E, I]`.
+
+    ggml's objective is a weighted least squares, so a constant factor on the
+    vector cancels; what matters is the profile. This is a mean where the
+    pooled Hessian's diagonal is a sum, and the two are therefore directly
+    interchangeable.
+    """
+    n = mod.split(".layers.")[1].split(".")[0]
+    f = EXPERT_SALIENCY / f"layer{n}.npz"
+    assert f.exists(), f"{f} missing -- run tools/dump_awq_experts.py"
+    z = np.load(f)
+    h = z["s2"] / np.maximum(z["n"], 1)[:, None]
+    assert (h >= 0).all(), f"{mod}: the per-expert saliency has negatives"
+    return np.ascontiguousarray(h.astype(np.float32))
+
+
 RESUME = "--resume" in sys.argv
 
 
@@ -217,20 +257,29 @@ def main():
         o = q.get(m)
         return (o or q).get("bits", q["bits"]) if isinstance(o, (dict, type(None))) else q["bits"]
 
-    convert = [
-        m
-        for m in mods
-        if m not in already
-        and bits_of(m) == SRC_BITS
-        and ((m == "language_model.lm_head" and not Q6K)
-             or m.split(".layers.")[-1].split(".", 1)[-1] in want)
-    ]
+    if REDO:
+        # Re-convert what the base already holds, at the format it holds it in,
+        # so that exactly one thing about the artifact changes.
+        convert = sorted(m for m in already if not ONLY or m.endswith(ONLY))
+        redo_kind = {m: acfg["quantization"][m]["mode"].replace("q4k", "q4_K")
+                     .replace("q6k", "q6_K") for m in convert}
+    else:
+        convert = [
+            m
+            for m in mods
+            if m not in already
+            and bits_of(m) == SRC_BITS
+            and ((m == "language_model.lm_head" and not Q6K)
+                 or m.split(".layers.")[-1].split(".", 1)[-1] in want)
+            and (not ONLY or m.endswith(ONLY))
+        ]
+        redo_kind = {}
     # **Only what is already 4-bit.** The eight last layers keep their experts
     # at int8 g64 because Phase 4 put the knee there, and `EXPERT_SUFFIXES`
     # matches them by name. Converting those would be a *coverage* change
     # wearing a format change's clothes, and the comparison would measure the
     # wrong thing -- it is 24 of the 120 modules the name filter alone selects.
-    if already:
+    if already and not REDO:
         print(f"{len(already)} modules are already q4k in {BASE.name}; leaving them alone")
     print(f"{len(mods)} quantized modules, converting {len(convert)} "
           f"({SRC_BITS}-bit) to {KIND}" + (" with diag(H)" if IMATRIX else ""))
@@ -281,12 +330,27 @@ def main():
             assert rows % 4 == 0, f"{mod}: {rows} rows, kernel covers 4 at a time"
             nb = cols // q4k.QK_K
 
-            h = hessian_for(mod) if IMATRIX else None
+            kind = redo_kind.get(mod, KIND)
+            per_expert = (PEREXPERT and experts > 1
+                          and mod.endswith(".switch_mlp.down_proj"))
+            h = expert_saliency(mod) if per_expert else (
+                hessian_for(mod) if IMATRIX else None)
             with_h += h is not None
             tm.append(time.time())
-            blocks = q4k_ggml.quantize(lib, w, imatrix=h, kind=KIND)
+            if per_expert:
+                # One call an expert, because the vector is the expert's. The
+                # rows stay in expert-major order, which is what the reshape
+                # below already assumes.
+                assert h.shape == (experts, cols), f"{mod}: saliency {h.shape}"
+                per = rows // experts
+                blocks = np.concatenate(
+                    [q4k_ggml.quantize(lib, w[e * per:(e + 1) * per],
+                                       imatrix=h[e], kind=kind)
+                     for e in range(experts)])
+            else:
+                blocks = q4k_ggml.quantize(lib, w, imatrix=h, kind=kind)
             tm.append(time.time())
-            qs, scales, dm = q4k.split(blocks, rows, nb, KIND)
+            qs, scales, dm = q4k.split(blocks, rows, nb, kind)
             del blocks
             tm.append(time.time())
             if experts > 1:
@@ -297,8 +361,10 @@ def main():
             for suffix in ("weight", "scales", "biases", "dm"):
                 tensors.pop(f"{mod}.{suffix}", None)
             # affine int4 g32 is 5.00 bits, affine int8 g64 is 8.50
-            bytes_before += int(rows * cols * (8.5 if Q6K else 5.0) / 8)
-            bytes_after += rows * nb * q4k_ggml.KINDS[KIND][0]
+            bytes_before += int(
+                rows * cols * (q4k_ggml.KINDS[kind][1] if REDO
+                               else (8.5 if Q6K else 5.0)) / 8)
+            bytes_after += rows * nb * q4k_ggml.KINDS[kind][0]
             tensors[f"{mod}.weight"] = mx.array(qs)
             tensors[f"{mod}.scales"] = mx.array(scales)
             tensors[f"{mod}.dm"] = mx.array(dm)
@@ -314,7 +380,8 @@ def main():
             done += 1
             d = [tm[i + 1] - tm[i] for i in range(len(tm) - 1)]
             print(f"  [{done:3d}/{len(convert)}] {mod}"
-                  + ("  +imatrix" if h is not None else "")
+                  + ("  +per-expert imatrix" if per_expert else
+                     "  +imatrix" if h is not None else "")
                   + f"  [load {d[0]:.1f} hess {d[1]:.1f} quant {d[2]:.1f} "
                     f"split {d[3]:.1f} to-mx {d[4]:.1f}]", flush=True)
         mx.eval(*tensors.values())
@@ -325,11 +392,17 @@ def main():
     # tensor no shard holds.
     idx = json.loads((BASE / "model.safetensors.index.json").read_text())
     for m in convert:
-        shard = idx["weight_map"].pop(m + ".biases")
-        idx["weight_map"][m + ".dm"] = shard
+        # A `--redo` base is already a k-quant and has no `.biases` to lose.
+        shard = idx["weight_map"].pop(m + ".biases", None)
+        if shard is not None:
+            idx["weight_map"][m + ".dm"] = shard
     (OUT / "model.safetensors.index.json").write_text(json.dumps(idx, indent=1))
 
     for m in convert:
+        if REDO:
+            # The format does not change, only which importance vector chose
+            # the codes. Leave the entry exactly as the base wrote it.
+            continue
         # `bits` is informational for a k-quant -- the real rate is 4.50 or
         # 6.5625 and `mode` is what decides the layout -- but mlx-lm's schema
         # wants an integer, so it carries the code width.
