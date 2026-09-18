@@ -53,15 +53,6 @@ CASES = [
 ]
 
 
-def split(blocks):
-    """ggml's 144-byte block -> the three tensors the artifact stores."""
-    b = np.asarray(blocks, np.uint8).reshape(-1, q4k.BLOCK_BYTES)
-    dm = b[:, 0:4].copy()                     # d, dmin -- two halves, in order
-    scales = b[:, 4:4 + q4k.K_SCALE_SIZE].copy()
-    qs = b[:, 4 + q4k.K_SCALE_SIZE:].copy()   # 128 bytes of codes
-    return qs, scales, dm
-
-
 def main():
     import mlx.core as mx
 
@@ -79,7 +70,7 @@ def main():
         nb = cols // q4k.QK_K
 
         blocks = q4k_ggml.quantize(lib, w)
-        qs, scales, dm = split(blocks)
+        qs, scales, dm = q4k.split(blocks, rows, nb)
         deq = q4k_ggml.dequantize(lib, blocks, w.size).reshape(rows, cols)
         # The numpy reader is exact against ggml (`Q4K.md` step 1); assert it
         # here too, so a reference that disagrees with itself cannot be written.
@@ -95,9 +86,9 @@ def main():
         j = int(rng.integers(cols))
         y_onehot = deq[:, j].astype(np.float64)
 
-        case.put(f"{name}_qs", mx.array(qs.reshape(rows, nb * 128).view(np.uint32)))
-        case.put(f"{name}_scales", mx.array(scales.reshape(rows, nb, 12)))
-        case.put(f"{name}_dm", mx.array(dm.reshape(rows, nb * 4).view(np.float16).reshape(rows, nb, 2)))
+        case.put(f"{name}_qs", mx.array(qs))
+        case.put(f"{name}_scales", mx.array(scales))
+        case.put(f"{name}_dm", mx.array(dm))
         case.put(f"{name}_deq", mx.array(deq))
         case.put(f"{name}_x", x)
         case.put(f"{name}_y", mx.array(y.astype(np.float32)))

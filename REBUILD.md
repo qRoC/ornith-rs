@@ -2281,6 +2281,130 @@ a finding.
 
 ---
 
+## Phase 15 -- real Q4_K, built and measured, and the bytes are free -- **DONE**
+
+Phase 14 measured a Q4_K-*shaped* grid as a stand-in and read the same median
+KL as the 5.00-bit base for fewer bytes. `Q4K.md` said the stand-in's two
+constraints were scaffolding and that dropping them buys llama.cpp as the
+oracle. This is the format itself: ggml's own `quantize_q4_K` over the
+parent's weights, a Metal kernel ported from ggml's own
+`kernel_mul_mv_q4_K_f32_impl`, and an artifact mlx cannot load, measured by
+the port because nothing else can.
+
+**Everything was checked before anything was believed.** `check_rebuild.py`
+PASSes and the 452/281 split survives; the 91 modules' weight error against
+the parent is 7.14-7.76% where ggml's own measurement said 7.12-7.55%; and
+`tests/q4k.rs`'s ignored case walks the forged artifact module by module and
+finds the port's dequantize agreeing with ggml's, **digest for digest, on all
+91**. So what follows is a property of the format, not of a loader.
+
+### What it bought
+
+    artifact                bytes/token    decode    median KL(parent || .)
+                                           best of 4   all 64      live 58
+    int4-head-linattn        2.0761 GB    102.6 t/s    0.0350      0.0422
+    **q4k**                  1.9814 GB    106.8 t/s    0.0303      0.0486
+    **q4k + imatrix**        1.9814 GB    104.8 t/s    0.0260      0.0305
+    gptq-head-linattn        2.0761 GB         --      0.0273      0.0300
+
+**-4.6% of a decode step, and +4% of the rate**, both measured rather than
+arithmetic -- `step_bytes.py` off the headers, and four draws because two of
+the twelve timing runs came back at half speed.
+
+**Not the -7.3% Phase 14 advertised, and the difference is coverage, not
+format.** The twin re-encoded all **283** of the artifact's 4-bit modules; this
+cut converts the **91** that `int4-head-linattn` moved to 4 bits, because the
+experts need `q4k_gather_qmv_fast` and that is a second kernel. The experts are
+0.7172 GB of a step, so the remaining 2.7 points are sitting there.
+
+### The quality, and the median is the wrong statistic here
+
+The two medians disagree about the ordering, which is the first thing to
+report rather than the last. `compare_probes.py` drops probes no variant moves
+by 0.001 nats; those six are the six smallest KLs, and removing them shifts
+`q4k`'s median from 0.0303 to 0.0486 while barely moving the others'. A
+statistic that unstable is not the one to read a verdict off.
+
+The rank test is stable, and it says **nothing here is distinguishable**:
+
+    q4k         vs int4-head-linattn    lower on 32 of 64    p = 1.0
+    q4k+imatrix vs int4-head-linattn    lower on 38 of 64    p = 0.17
+    q4k+imatrix vs gptq-head-linattn    lower on 37 of 64    p = 0.26
+
+So the honest verdict is **the bytes are free**: 4.6% of a decode step and 4%
+of the rate for no quality difference this instrument can see. That is what a
+k-quant is supposed to deliver, and it is the first format in this rebuild to
+deliver it. What is *not* demonstrated is `Q4K.md`'s prize -- "GPTQ's quality
+at Q4_K's bytes". The imatrix has the best point estimate of the four, at
+fewer bytes than GPTQ, and 37 of 64 is a coin flip with a story attached.
+
+### Four predictors, all of them wrong, and the last one was supposed to be right
+
+This is the fourth time the norm has been falsified here (Phases 4, 7, 14 and
+now), and it is the strongest instance, because the measure that failed was
+built to be activation-aware. Against the parent, real Q4_K beats affine int4
+g32 on:
+
+  - **total weight error** -- 7.48% median against 8.45%, over all 91;
+  - **weight error in every magnitude decile** -- the obvious mechanism for a
+    format with a shared super-scale is that a sub-block far below its
+    super-block's maximum goes coarse, so the error was split by
+    `group max / super-block max`. There is no crossover: Q4_K is 0.87-0.91x
+    affine's error in all ten deciles of all three modules tried;
+  - **the error in the product**, on random gaussian `x`: 7.13% against 8.07%
+    for `lm_head`, and the per-group bias that would make a weight error and
+    an output error disagree is *lower* for Q4_K (0.123 against 0.145, where
+    an unbiased quantizer sits at 1/sqrt(32) = 0.177);
+  - **the H-weighted weight error**, `diag(H)` from the GPTQ calibration --
+    the quantity the activations say matters. Over all 61 modules that have a
+    Hessian, Q4_K is better in **59**.
+
+Four measures, one of them the activation-aware one, all pointing the same
+way, and 64 probes saying the two artifacts are level. `L0.out_proj` -- 21.62%
+H-weighted against affine's 18.80% while unweighted it is 7.55% against 8.52%
+-- looked like the mechanism until the other 60 modules were measured and it
+turned out to be one of two exceptions.
+
+### What the imatrix did, and it is one argument
+
+`quantize_q4_K` takes an importance vector and `diag(H)` is one, so the
+combination `Q4K.md` described as needing "no super-block coordination, no
+changes to `gptq.py`" cost exactly one argument. Only 61 of the 91 modules
+have a Hessian (`in_proj_z` never had one), so this is a partial application.
+
+It moves the H-weighted error a long way -- `in_proj_qkv` 7.97% -> 6.03%,
+`out_proj` 8.12% -> 6.91%, medians over 30 modules each -- and costs 0.2-0.3
+points of unweighted error, which is what a weighting scheme is supposed to
+do. On the probes its clearest effect is the tail: `arith/ru-7x8`, the probe
+that has broken every fragile format in this rebuild, goes from **1.9555 to
+0.2470 nats**, and the count of probes whose top-1 token moves falls from 10
+to 6, the lowest of any variant here.
+
+### The trap this cleared, and it is the one the file warned about
+
+The first imatrix reading was **38589% error**. `refs/gptq-parent/hessians/`
+holds the whole `H`, `[in, in]`, not its diagonal; handing the array to
+`quantize_q4_K` as it loads gives the quantizer `H`'s first *row*, which has
+negative entries. `Q4K.md`'s own rule -- "a format the entire llama.cpp
+ecosystem ships cannot measure three times worse than plain affine" -- caught
+it, for the second phase running.
+
+### What is left
+
+  - **`q4k_gather_qmv_fast`** for the 256-expert modules: 0.7172 GB of a step,
+    the other 2.7 points of the -7.3%.
+  - **`q4k_qmm_t`** for prefill. The M > 1 path here is ggml's token axis, a
+    mat-vec per token, which re-reads the weights once each; it exists so
+    there can be a probe capture at all.
+  - **A Hessian for `in_proj_z`**, which would take the imatrix from 61 of 91
+    to all of them.
+  - **Q6_K on the 8-bit side**, priced in `Q4K.md`: 2.5x the weight error for
+    22.8% of those bytes, which is 0.68 error-doublings a bit against the 0.96
+    the 4-bit side already pays. Given this phase, price it and expect the
+    probes to say nothing.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

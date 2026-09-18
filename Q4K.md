@@ -320,7 +320,7 @@ has to pay first.
 - **No change to `gptq.py`'s grid logic** for a first cut. GPTQ and the format
   are orthogonal; combine them only once the kernel is measured alone.
 
-## The prize, and the honest version of it
+## The prize, and what it turned out to be
 
     int4-head-linattn + GPTQ    2.076 GB/token   median KL 0.0292   <-- ships today
     Q4_K twin                   1.925 (arith)    median KL 0.0396
@@ -330,6 +330,38 @@ GPTQ is +27.1% of quality at fixed bytes; Q4_K is -7.3% of bytes at fixed
 quality; they touch different things -- one picks the grid, the other picks the
 point on it. Together: **-29.7% of a decode step against the control at the
 quality GPTQ already delivers.**
+
+**BUILT, 2026-09-18. `REBUILD.md` Phase 15 has the numbers; the summary is
+that the bytes are real and the prize is not demonstrated.**
+
+    artifact              bytes/token   decode    median KL, all 64 probes
+    int4-head-linattn      2.0761 GB   102.6 t/s          0.0350
+    q4k                    1.9814 GB   106.8 t/s          0.0303
+    q4k + imatrix          1.9814 GB   104.8 t/s          0.0260
+    gptq-head-linattn      2.0761 GB        --            0.0273
+
+Three corrections to the paragraph above, and the first is the one that
+matters:
+
+- **-4.6%, not -7.3%.** The twin re-encoded all 283 four-bit modules; the
+  kernel's first cut converts the 91. The experts are 0.7172 GB of a step and
+  need `q4k_gather_qmv_fast`, which is where the other 2.7 points are.
+- **The quality difference is not measurable.** Rank tests over the 64 probes:
+  q4k lower than the affine int4 it replaces on 32 of 64 -- a coin flip --
+  and q4k+imatrix lower than GPTQ on 37 of 64, p = 0.26. So *the bytes are
+  free*, which is the result; "GPTQ's quality at Q4_K's bytes" is the best
+  point estimate of the four and is not demonstrated.
+- **The combination that paid was the cheap one.** Not GPTQ x Q4_K, with its
+  super-block coordination problem, but `quantize_q4_K`'s own importance
+  vector fed `diag(H)` -- one argument, no changes to `gptq.py`. It halves
+  nothing on the median and it takes `arith/ru-7x8` from 1.9555 to 0.2470
+  nats, which is a tail result rather than a central one.
+
+And a fourth falsification of weight error, this time of a measure built not
+to be falsifiable that way: Q4_K beats affine int4 on total weight error, on
+weight error in every magnitude decile, on the error in the product against
+random `x`, and on the **H-weighted** error in 59 of the 61 modules that have
+a Hessian. The probes say the two are level.
 
 The combination has one structural snag, and it is worth knowing before
 starting: a super-scale needs all eight of a super-block's sub-block scales at

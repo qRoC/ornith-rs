@@ -3,6 +3,9 @@
     python3 tools/q4k_ggml.py [<ggml build dir>]          # Q4_K vs affine 5.00b
     python3 tools/q4k_ggml.py --q6k                       # Q6_K vs affine 8.50b
     python3 tools/q4k_ggml.py --imatrix                   # Q4_K with diag(H)
+    python3 tools/q4k_ggml.py --groups                    # where each format spends
+    python3 tools/q4k_ggml.py --matvec                    # error in the output, not the weights
+
 
 `q4k.quantize` is a faithful port of `quantize_row_q4_K_ref`'s *shape* and is
 0.77 points worse than ggml, because ggml runs a search. Nothing that ships
@@ -33,9 +36,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import aq       # noqa: E402
 import q4k      # noqa: E402
 
+# The env var wins: other tools import this one and their own argv[1] is a
+# model directory, not a ggml build.
 _args = [a for a in sys.argv[1:] if not a.startswith("--")]
-BUILD = pathlib.Path(_args[0] if _args else
-                     os.environ.get("ORNITH_GGML_BUILD", "../.ggml-build"))
+BUILD = pathlib.Path(
+    os.environ.get("ORNITH_GGML_BUILD")
+    or (_args[0] if _args and __name__ == "__main__" else "../.ggml-build")
+)
 PARENT = pathlib.Path.home() / ".mtplx/models/ornith-ai--Ornith-1.5-35B-A3B"
 
 
@@ -226,8 +233,133 @@ def imatrix():
         del w
 
 
+def matvec():
+    """The error in the *product*, which is the object a KL is about.
+
+    `measure-the-same-object`: every table in this rebuild ranks formats by
+    `||W - W_hat|| / ||W||`, and the thing a distribution sees is
+    `||(W - W_hat) x|| / ||W x||`. The two agree only when the weight error is
+    uncorrelated across a row. A quantizer that leaves a systematic offset
+    inside each group has that offset add *coherently* over the 2048 terms of
+    a dot product, where an unbiased error adds as its square root -- so a
+    format can win the norm and lose the product by a wide margin.
+
+    Reported per module, over random gaussian `x` and over the calibration
+    activations when they are on disk:
+
+        rel out   ||(W - W_hat) x|| / ||W x||
+        bias      the mean error inside a group of 32, as a share of the
+                  group's RMS error. An unbiased quantizer sits near 1/sqrt(32)
+                  = 0.177 by chance alone; well above that is a real offset.
+    """
+    import mlx.core as mx
+    lib = load()
+    idx = json.loads((PARENT / "model.safetensors.index.json").read_text())["weight_map"]
+    cases = [("lm_head", "lm_head.weight", 4096),
+             ("in_proj_qkv", "model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 8192),
+             ("in_proj_z", "model.language_model.layers.0.linear_attn.in_proj_z.weight", 4096),
+             ("out_proj", "model.language_model.layers.0.linear_attn.out_proj.weight", 2048)]
+    rng = np.random.default_rng(3)
+    print(f"{'module':<14}{'weight err':>12}{'  ':2}{'rel out err':>12}{'':4}"
+          f"{'group bias':>12}")
+    print(f"{'':<14}{'Q4_K':>5}{'affine':>7}{'  ':2}{'Q4_K':>5}{'affine':>7}{'':4}"
+          f"{'Q4_K':>5}{'affine':>7}")
+    for lbl, key, rows in cases:
+        t = mx.load(str(PARENT / idx[key]))[key]
+        mx.eval(t)
+        w = np.ascontiguousarray(np.array(t.astype(mx.float32), copy=False)[:rows])
+        del t
+        r, c = w.shape
+        q4 = dequantize(lib, quantize(lib, w), w.size).reshape(r, c)
+        qa, sa, ba = aq.quantize(w, 32, 4)
+        aff = (qa.reshape(r, c).astype(np.float32)
+               * np.repeat(aq.bf16(sa).reshape(r, -1), 32, 1)
+               + np.repeat(aq.bf16(ba).reshape(r, -1), 32, 1))
+
+        x = rng.standard_normal((c, 64)).astype(np.float32)
+        ref = w.astype(np.float64) @ x
+        def out_err(h):
+            return 100 * np.linalg.norm((w - h).astype(np.float64) @ x) / np.linalg.norm(ref)
+        def wt_err(h):
+            return 100 * np.linalg.norm(w - h) / np.linalg.norm(w)
+        def bias(h):
+            e = (w - h).reshape(-1, 32)
+            return float(np.abs(e.mean(1)).mean() / np.sqrt((e ** 2).mean(1)).mean())
+        print(f"{lbl:<14}{wt_err(q4):>5.2f}{wt_err(aff):>7.2f}{'  ':2}"
+              f"{out_err(q4):>5.2f}{out_err(aff):>7.2f}{'':4}"
+              f"{bias(q4):>5.3f}{bias(aff):>7.3f}")
+        del w, q4, aff
+    print("\n(an unbiased quantizer's group bias sits near 1/sqrt(32) = 0.177)")
+
+
+def groups():
+    """Where each format spends its resolution, by sub-block magnitude.
+
+    Q4_K measures *better* total weight error than affine g32 and *worse* KL,
+    which is the third time in this rebuild that the norm has ranked backwards.
+    The norm is an L2 over the whole tensor, so it is dominated by the groups
+    with the largest weights; this splits the same error by how big a group is
+    relative to its own 256-wide super-block.
+
+    The mechanism to look for: affine gives every group of 32 its own bfloat16
+    scale, so its *relative* resolution is the same everywhere. Q4_K gives a
+    group a 6-bit integer against one fp16 super-scale shared by eight, so a
+    group far below its super-block's maximum is coarse in relative terms and
+    a group at the maximum is finer than affine can be. If that is the story,
+    the error split by magnitude decile crosses over.
+    """
+    import mlx.core as mx
+    lib = load()
+    idx = json.loads((PARENT / "model.safetensors.index.json").read_text())["weight_map"]
+    cases = [("lm_head", "lm_head.weight", 4096),
+             ("in_proj_qkv", "model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 8192),
+             ("out_proj", "model.language_model.layers.0.linear_attn.out_proj.weight", 2048)]
+    print("relative error by sub-block magnitude, against the super-block's own maximum")
+    print("(each row is a decile of `group max / super-block max`; 10 = the loudest)\n")
+    for lbl, key, rows in cases:
+        t = mx.load(str(PARENT / idx[key]))[key]
+        mx.eval(t)
+        w = np.ascontiguousarray(np.array(t.astype(mx.float32), copy=False)[:rows])
+        del t
+        r, c = w.shape
+        q4 = dequantize(lib, quantize(lib, w), w.size).reshape(r, c)
+        qa, sa, ba = aq.quantize(w, 32, 4)
+        aff = (qa.reshape(r, c).astype(np.float32)
+               * np.repeat(aq.bf16(sa).reshape(r, -1), 32, 1)
+               + np.repeat(aq.bf16(ba).reshape(r, -1), 32, 1))
+
+        g = w.reshape(-1, 32)
+        gmax = np.abs(g).max(1)
+        smax = np.repeat(np.abs(w.reshape(-1, 256)).max(1), 8)
+        share = np.where(smax > 0, gmax / np.maximum(smax, 1e-30), 0.0)
+        e4 = np.linalg.norm((w - q4).reshape(-1, 32), axis=1)
+        ea = np.linalg.norm((w - aff).reshape(-1, 32), axis=1)
+        nrm = np.linalg.norm(g, axis=1)
+
+        edges = np.quantile(share, np.linspace(0, 1, 11))
+        b = np.clip(np.searchsorted(edges, share, "right") - 1, 0, 9)
+        print(f"{lbl}  [{r}, {c}]")
+        print(f"  {'decile':>6} {'share':>12}  {'Q4_K':>8} {'affine g32':>11}  {'ratio':>7}"
+              f"  {'% of total L2':>14}")
+        tot = (e4 ** 2).sum()
+        for k in range(10):
+            m = b == k
+            if not m.any():
+                continue
+            r4 = 100 * np.linalg.norm(e4[m]) / np.linalg.norm(nrm[m])
+            ra = 100 * np.linalg.norm(ea[m]) / np.linalg.norm(nrm[m])
+            print(f"  {k + 1:>6} {share[m].mean():>12.3f}  {r4:>7.3f}% {ra:>10.3f}%"
+                  f"  {r4 / ra:>7.2f}  {100 * (e4[m] ** 2).sum() / tot:>13.1f}%")
+        print()
+        del w, q4, aff
+
+
 if __name__ == "__main__":
-    if "--q6k" in sys.argv:
+    if "--matvec" in sys.argv:
+        matvec()
+    elif "--groups" in sys.argv:
+        groups()
+    elif "--q6k" in sys.argv:
         q6k()
     elif "--imatrix" in sys.argv:
         imatrix()

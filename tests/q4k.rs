@@ -201,3 +201,60 @@ fn the_token_axis_repeats_the_same_answer() {
         );
     }
 }
+
+/// The forged artifact, module by module, against ggml's own dequantizer.
+///
+/// The cases above pin the kernel on two matrices that never went through a
+/// safetensors file. This asks the question a verdict is actually read off:
+/// **are the weights the port holds the weights ggml wrote?** It covers the
+/// forge's split, the index, the loader and the kernel's read path at once,
+/// over all 91 converted modules.
+///
+/// `tools/q4k_audit.py` writes the digests; an order-sensitive 64-bit sum over
+/// the float32 bits, because the alternative is 0.85 GB of reference floats
+/// and a tolerance would defeat `max_abs == 0.0`.
+///
+/// ```
+/// ORNITH_GGML_BUILD=../.ggml-build python3 tools/q4k_audit.py <artifact>
+/// ORNITH_MODEL=<artifact> cargo test --release --test q4k -- --ignored
+/// ```
+#[test]
+#[ignore = "loads a whole forged artifact; run with --ignored and ORNITH_MODEL"]
+fn the_forged_artifact_reads_back_as_ggml_wrote_it() {
+    const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+    const ADD: u64 = 0x1656_67B1_9E37_79F9;
+    fn digest(v: &[f32]) -> u64 {
+        v.iter().enumerate().fold(0u64, |h, (i, x)| {
+            let m = (i as u64).wrapping_mul(MIX).wrapping_add(ADD);
+            h.wrapping_add((x.to_bits() as u64).wrapping_mul(m))
+        })
+    }
+
+    let dir = ornith_rs::refs::model_dir();
+    let audit = dir.join("q4k_audit.json");
+    if !audit.exists() {
+        eprintln!("skipping: no {}; run tools/q4k_audit.py", audit.display());
+        return;
+    }
+    let raw = std::fs::read(&audit).unwrap();
+    let doc = ornith_rs::json::parse(&raw).unwrap();
+    let mods = doc.as_obj().expect("q4k_audit.json is an object");
+
+    let ctx = Context::new().unwrap();
+    let mut ws = WeightStore::open(&dir, &[]).unwrap();
+    let mut n = 0;
+    for (module, want) in mods {
+        let w = ws.q4k_matrix(&ctx, module);
+        let got = dequantize(&ctx, &w, Dtype::F32).to_vec_f32(&ctx);
+        let want = want.get("digest").and_then(|v| v.as_str()).expect("digest");
+        let want = u64::from_str_radix(want.trim_start_matches("0x"), 16).unwrap();
+        assert_eq!(
+            digest(&got),
+            want,
+            "{module}: the port's dequantize disagrees with ggml's"
+        );
+        n += 1;
+    }
+    assert!(n > 0, "q4k_audit.json named no modules");
+    eprintln!("{n} q4k modules agree with ggml, digest for digest");
+}

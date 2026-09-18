@@ -67,6 +67,23 @@ def put_scale_min_k4(sc, mn):
     return out
 
 
+def split(blocks, rows, nb):
+    """ggml's 144-byte blocks -> the three tensors an artifact stores.
+
+    `Q4K.md`'s storage decision, in one place because it is a byte layout and
+    two copies of a byte layout drift. The bytes are not reinterpreted, only
+    sliced: `dm` is the leading `d, dmin` pair, `scales` the twelve packed
+    6-bit fields, `qs` the 128 bytes of codes -- so the kernel reading them as
+    uint16 sees exactly what ggml's reads out of its packed block.
+    """
+    b = np.asarray(blocks, np.uint8).reshape(-1, BLOCK_BYTES)
+    assert len(b) == rows * nb, (len(b), rows, nb)
+    dm = b[:, 0:4].copy().reshape(rows, nb * 4).view(np.float16).reshape(rows, nb, 2)
+    scales = b[:, 4:4 + K_SCALE_SIZE].copy().reshape(rows, nb, K_SCALE_SIZE)
+    qs = b[:, 4 + K_SCALE_SIZE:].copy().reshape(rows, nb * (QK_K // 2)).view(np.uint32)
+    return qs, scales, dm
+
+
 def dequantize(blocks):
     """`dequantize_row_q4_K`. `blocks` is [n, 144] uint8 -> [n, 256] float32."""
     b = np.asarray(blocks, np.uint8).reshape(-1, BLOCK_BYTES)

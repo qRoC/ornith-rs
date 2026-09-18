@@ -105,7 +105,10 @@ def sha256(path):
 
 
 def module_of(tensor):
-    for suffix in (".weight", ".scales", ".biases"):
+    # `.dm` is Q4_K's pair of super-scales, the one tensor name that is not
+    # mlx's. Without it a q4k module counts as two modules and the 452/281
+    # split reads as a disaster rather than as a format change.
+    for suffix in (".weight", ".scales", ".biases", ".dm"):
         if tensor.endswith(suffix):
             return tensor[: -len(suffix)]
     return tensor
