@@ -199,10 +199,42 @@ two-tensor modules.
    inside a tolerance. That one measures exactly zero over 768 outputs. The
    fourth loads the forged artifact and dequantizes it back to the same bytes.
 
-**Still to write**, and both were always conditional:
+6. **`q4k_gather_qmv` -- DONE.** ggml's `kernel_mul_mv_id`, which turns out
+   to be a *wrapper* rather than a kernel: it offsets the weights by the
+   expert and the activations by the token and calls the matvec already
+   ported. The body moved into an inline `qmv_impl` and both entry points
+   resolve their own pointers. Checked over eleven rows whose experts repeat
+   and whose tokens do not: 2.8e-7 against float64, and **exactly zero** with
+   a one-hot activation, where each output row must be one column of one
+   expert. That unlocks the 96 routed modules, 0.7172 GB of a decode step.
 
-6. **`q4k_gather_qmv_fast`** for the routed experts, if the first cut pays.
-7. **Prefill** (`q4k_qmm_t`) last, and only if the whole thing is kept.
+7. **Prefill** (`qmm_t`) -- **still the debt.** M > 1 goes through ggml's
+   token axis, a mat-vec per token, so the weights are re-read once each.
+   It exists so a k-quant artifact can be run at all; it changes no verdict
+   and it is the reason a probe capture takes minutes rather than seconds.
+
+8. **Q6_K -- kernel DONE, artifact pending.** `kernels/q6k.metal` is ggml's
+   `kernel_mul_mv_q6_K_f32_impl` and `dequantize_row_q6_K`, with `tests/q6k.rs`
+   pinning the dequantize at `max_abs == 0.0`, the matvec at 7.9e-8, the
+   one-hot at exactly zero and the routed gather at 9.0e-8. Two traps of its
+   own, and neither is Q4_K's: the sub-block scale is **signed** and the code
+   is **biased by 32**, so `w = d*sc*(q - 32)` with no minimum anywhere.
+
+   The Rust sides of the two formats differed in three constants, so
+   `ops::q4k` is now `ops::kquant` with a `KQuant` kind and `Linear` carries
+   one k-quant variant rather than one per format.
+
+   `forge_q4k.py --q6k` converts **128 of the 169** 8-bit modules: not
+   `embed_tokens`, which is read by a gather and never by a matvec, and not
+   `shared_expert_gate`, which is `[1, 2048]` where the kernel covers four
+   rows at a time. 80 of the 128 get an importance vector.
+
+9. **`in_proj_z`'s Hessian -- DONE, and free.** It reads the same tensor
+   `in_proj_qkv` does, one line apart in both mlx-lm's `qwen3_5.py` and the
+   port, so `X^T X` is the same matrix and the diagonal is the same vector.
+   Borrowed on four layers it moves H-weighted error down 14-30% for 1-4% of
+   unweighted, which is the shape every other module shows. The imatrix now
+   covers all 91 rather than 61, at no calibration cost.
 
 And between them and a verdict: a forge (`quantize_q4_K` over the 91 modules,
 with the imatrix, writing the three tensors), the model wiring that routes a
