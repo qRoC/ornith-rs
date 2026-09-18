@@ -2748,6 +2748,14 @@ affine artifact still does 2.49 s of GPU where `q6k-full` does 2.75, and it is
 reading **more** bytes a token. mlx's steel gemm is a tuned kernel and this is
 ggml's untuned one; ~10% is what that costs.
 
+**That last sentence is not supported by that measurement, and Phases 23 and 25
+both aimed at it as if it were.** 2.49 against 2.75 compares *two artifacts'
+whole prefills*, which read different bytes and convert different modules --
+not two kernels on one shape. Phase 23 closed 1.3-4.3% of the gap by tuning the
+tile and Phase 25 showed the rest is not in the tile's knowledge of its own
+shape; whether any of it belongs to the kernel at all is unmeasured. To be an
+item it has to be re-posed kernel against kernel at one shape.
+
 ### The crossover, measured rather than picked
 
 `src/bin/kquant_mm.rs` times both kernels at M = 1..64 on the four shapes the
@@ -2867,10 +2875,13 @@ loop does, so there is no second kernel to write.
     before Phase 16 and every artifact on disk was forged with it. `Q4K.md`
     step 9 has the measurement; Phase 15's "what is left" predates it and is
     left as written.
-  - **Re-capturing the last two k-quant artifacts on the tile**, if their
-    numbers are ever going to be compared against anything again. `q4k-all`,
-    `q6k-all`, `q6k-full` and `int4-head-linattn` are done; `q4k-imatrix` and
-    `q4k` (the 91-module first cut) are not.
+  - **Re-capturing the last two k-quant artifacts**, if their numbers are ever
+    going to be compared against anything again -- `q4k-imatrix` and `q4k`, the
+    91-module first cut. **Not "on the tile", which is what this item used to
+    say**: a capture taken on whatever kernel happened to ship goes stale the
+    next time one changes, which is the debt this very item is. Phase 21 has
+    the fix -- `ORNITH_INVARIANT=all` makes a capture independent of every
+    kernel choice, and costs 31 s for 64 probes.
   - ~~**The tile is ggml's shape, not a tuned one.**~~ **Phase 23 did it**, and
     the guess in this item was backwards: flat across M = 1..32 means the
     fixed per-block cost is a third to three fifths of the time, so the tile
