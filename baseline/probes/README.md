@@ -15,6 +15,12 @@ regenerable while the 28 GB artifacts they came from are still on disk.
 | `fp8scale-twin.json` | `tools/forge_fp8scale_twin.py` | 0.0340 | 0.4890 |
 | `int4-except-gates.json` | `recipes/int4-except-gates.json` | 0.0549 | 1.5938 |
 | `nvfp4-head-linattn.json` | `recipes/nvfp4-head-linattn.json` | 0.0649 | 6.6391 |
+| `awq-linattn.json` | `tools/forge_awq.py`, Latin calibration | 0.0300 | 0.8389 |
+| `awq-ml.json` | `tools/forge_awq.py`, held-out multilingual | 0.0329 | 0.4181 |
+
+The two AWQ rows carry byte-identical traffic to `int4-head-linattn` --
+`REBUILD.md` Phase 6 is what they are for, and the medians above are why it
+was not adopted.
 
 Medians are over the 60 live probes, KL against the control.
 

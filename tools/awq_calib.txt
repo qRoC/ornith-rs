@@ -1,0 +1,161 @@
+Calibration text for activation-aware scaling. It exists so that the channel
+statistics are not taken from the corpus the result is then scored on, and so
+that they are not taken from one writing system.
+
+The first attempt at this experiment calibrated on the perplexity corpus and
+then reported perplexity. The number improved and nothing else did, which is
+what an in-sample measurement looks like. Nothing below appears in
+ppl_corpus.txt, and none of it is a probe string.
+
+A bank of sediment builds where a river slows, and the coarse grains settle
+first. Geologists read the ordering backwards: a bed that fines upward records
+a current that was losing energy, and one that coarsens upward records the
+opposite. The same logic applies to lake deposits, where a season of melt
+leaves a pale band and a season of quiet leaves a dark one. Counting the pairs
+gives a calendar that runs backwards from the surface.
+
+Harbour towns grow along the line where deep water comes closest to shore. The
+warehouses stand behind the quay, the customs house at the end of it, and the
+streets run inland at right angles because carts were easier to turn that way.
+When the trade moved to containers the quays were too short and the water too
+shallow, so the old harbours became parks and the new ones were built where
+nobody had lived.
+
+A printing press pushes paper against inked type, and the pressure has to be
+even or the letters at the edge print faintly. Compositors packed the empty
+space with blank slugs so the block could not shift, and the slugs were cast
+from the same alloy as the letters but shorter, so they never touched the
+paper. The alloy was lead with tin and antimony: the antimony keeps the cast
+letter from shrinking as it cools, which is the property that made movable
+type reproducible at all.
+
+Хвойный лес держит снег на ветвях дольше, чем лиственный, и потому весной под
+ним сходит вода медленнее. Там, где склон обращён к югу, снег стаивает на две
+недели раньше, и разница видна по тому, где раньше зацветает подлесок.
+Лесники называют такие полосы прогалинами и не считают их вырубками, хотя
+издали различить трудно.
+
+Гончар оценивает глину на ощупь: если полоска, свёрнутая в кольцо, трескается
+по внешнему краю, воды мало. Обжиг идёт в два приёма — первый закрепляет
+форму, второй расплавляет глазурь. Между ними изделие остаётся пористым, и
+именно в этот промежуток его расписывают, потому что сухая поверхность берёт
+краску ровно.
+
+Пятью пять — двадцать пять, шестью шесть — тридцать шесть, девятью девять —
+восемьдесят один. Таблицу учат вслух, потому что ритм запоминается раньше
+смысла.
+
+潮汐发电依靠涨落之间的水位差。水闸在涨潮时开启，让海水灌入蓄水池，退潮后再
+放水推动涡轮。一天两次的周期使输出可以精确预测，这一点是风力和太阳能都做不
+到的。缺点在于适合的海湾很少，而且水工建筑会改变泥沙沉积。
+
+三三得九，四四十六，五五二十五。这一串口诀在识字之前就学会了。
+
+日本の在来線は、区間ごとに設計された時代が違うため、同じ路線でも曲線半径が
+大きく変わる。高速化のためには線形そのものを改める必要があり、それが新しい
+路線を別に敷く理由になった。車両側で傾斜させる方式は、改良費用を抑える代わ
+りに乗り心地の調整が難しい。
+
+한지는 닥나무 껍질을 삶아서 만들며, 섬유가 길어 얇아도 잘 찢어지지 않는다.
+종이를 뜬 뒤에는 여러 장을 겹쳐 두드리는데, 이 과정에서 표면이 치밀해져 먹이
+번지지 않게 된다. 같은 재료라도 두드린 횟수에 따라 쓰임이 달라진다.
+
+Ein Deich hält nicht durch seine Höhe allein, sondern durch die Breite seines
+Fußes. Wasser drückt nicht nur gegen die Böschung, es sickert darunter hindurch
+und sucht den Weg des geringsten Widerstands. Deshalb liegt im Kern ein dichter
+Kleikern, und der Sandmantel darüber dient vor allem dem Gewicht.
+
+Zwei mal sieben ist vierzehn, drei mal neun ist siebenundzwanzig.
+
+La acequia reparte el agua por turnos, y el turno se mide en tiempo, no en
+volumen. Quien riega de noche recibe más agua por la misma hora porque hay
+menos evaporación, así que el reparto alterna los turnos cada temporada. El
+tribunal que resuelve las disputas se reúne en la puerta de la catedral y no
+levanta acta: todo es oral, y por eso las sentencias son breves.
+
+Cinco por cinco son veinticinco, siete por ocho son cincuenta y seis.
+
+Le vitrail ancien contient du fer et du manganèse en proportions variables, ce
+qui explique les teintes vertes et violettes des verres dits incolores. En
+vieillissant, le manganèse s'oxyde et le verre brunit, mais seulement du côté
+exposé au soleil. Les restaurateurs s'en servent pour savoir quel côté d'un
+panneau était tourné vers l'extérieur.
+
+يعتمد نظام الريّ بالأفلاج على قناة مائلة تُحفر تحت الأرض حتى تبلغ طبقة الماء،
+ثم تسير بانحدار لطيف حتى تخرج إلى السطح. ولأن القناة مغطاة فإن الفقد بالتبخر
+قليل، غير أن صيانتها تتطلب فتحات رأسية على مسافات منتظمة. وتوزَّع الحصص
+بالزمن، ويقاس الزمن بظل عمود مغروس في الأرض.
+
+ثلاثة في أربعة يساوي اثني عشر.
+
+הזיתים נמסקים כשהם עדיין ירוקים אם רוצים שמן חריף, וכשהם שחורים אם רוצים שמן
+עדין. הכבישה הראשונה נעשית בקור, משום שחימום מגדיל את התפוקה אך פוגע בטעם.
+הפסולת שנשארת משמשת לחימום, וכך אין דבר שנזרק.
+
+Η ελιά αντέχει την ξηρασία επειδή τα φύλλα της είναι μικρά και καλυμμένα με
+τρίχες στην κάτω πλευρά, που κρατούν τον αέρα ακίνητο και μειώνουν την απώλεια
+νερού. Το ριζικό σύστημα απλώνεται ρηχά και πλατιά, ώστε να πιάνει και τη λίγη
+βροχή που δεν προλαβαίνει να κατέβει.
+
+नदी के मुहाने पर बनी दलदली भूमि लहरों की ऊर्जा सोख लेती है, इसलिए उसके पीछे का
+किनारा कम कटता है। जब इस भूमि को भरकर बस्ती बसाई जाती है तो सुरक्षा दीवार बनानी
+पड़ती है, और दीवार के सामने की रेत धीरे-धीरे बह जाती है।
+
+การทอผ้ายกดอกต้องยกเส้นยืนตามลายที่กำหนดไว้ล่วงหน้า ช่างจะนับเส้นด้ายเป็นชุด
+แล้วผูกเชือกไว้ที่กี่ เพื่อให้ยกซ้ำได้เหมือนเดิมทุกรอบ ลวดลายจึงเกิดจากการ
+เรียงลำดับ ไม่ใช่จากการย้อมสี
+
+Ջրաղացի անիվը դրվում է առվի այն հատվածում, որտեղ հոսքն ամենակայունն է, և ոչ
+թե այնտեղ, որտեղ ամենաարագն է։ Կայուն հոսքը թույլ է տալիս աղալ հավասար, իսկ
+արագ, բայց փոփոխական հոսքը մաշում է առանցքը։
+
+def rolling_median(xs, k):
+    """Median over a sliding window, kept sorted by insertion."""
+    import bisect
+    window, out = [], []
+    for i, x in enumerate(xs):
+        bisect.insort(window, x)
+        if len(window) > k:
+            window.pop(bisect.bisect_left(window, xs[i - k]))
+        if len(window) == k:
+            out.append(window[k // 2] if k % 2 else
+                       (window[k // 2 - 1] + window[k // 2]) / 2)
+    return out
+
+pub fn merge_spans(mut spans: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    spans.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+    for (lo, hi) in spans {
+        match out.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
+SELECT region, date_trunc('month', ts) AS month, SUM(amount) AS total
+FROM ledger
+WHERE ts >= '2024-01-01' AND status <> 'void'
+GROUP BY region, month
+HAVING SUM(amount) > 10000
+ORDER BY region, month;
+
+{"pipeline": "ingest", "stages": [{"name": "parse", "retries": 3},
+{"name": "validate", "strict": true}, {"name": "load", "batch": 512}],
+"on_failure": "quarantine"}
+
+steps:
+  - uses: actions/checkout@v4
+  - run: cargo build --release
+  - run: cargo test --release -- --nocapture
+
+A gear train multiplies torque by the ratio of tooth counts, and the ratio is
+exact because teeth are counted, not measured. That is why clocks were built
+from gears rather than from levers: an error in a lever accumulates with every
+stroke, while a gear that has meshed a thousand times has advanced exactly a
+thousand teeth. The escapement is the one place where the count is turned back
+into time, and it is the one place where a clock's accuracy is decided.
+
+Seven times six is forty-two, eleven times twelve is one hundred and
+thirty-two, and nine squared is eighty-one.
