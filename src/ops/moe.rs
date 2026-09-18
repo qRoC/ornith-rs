@@ -287,14 +287,14 @@ fn counting_sort(ctx: &Context, inds: &Array, n_experts: usize) -> (Array, Array
 pub fn sparse_moe_block(
     ctx: &Context,
     x: &Array,
-    gate: &QuantMatrix,
+    gate: &Linear,
     switch_gate: &Linear,
     switch_up: &Linear,
     switch_down: &Linear,
-    shared_gate: &QuantMatrix,
-    shared_up: &QuantMatrix,
-    shared_down: &QuantMatrix,
-    shared_expert_gate: &QuantMatrix,
+    shared_gate: &Linear,
+    shared_up: &Linear,
+    shared_down: &Linear,
+    shared_expert_gate: &Linear,
     top_k_n: usize,
     norm_topk_prob: bool,
 ) -> Array {
@@ -310,16 +310,16 @@ pub fn sparse_moe_block(
     // five more. Every kernel still sees the same inputs and writes the same
     // bytes, so the result is bit-exact -- only the issue order moves. See
     // HANDOFF, "Where the 1216 barriers come from".
-    let gates = quantized_matmul(ctx, &x2, gate);
-    let sg = quantized_matmul(ctx, &x2, shared_gate);
-    let su = quantized_matmul(ctx, &x2, shared_up);
-    let gate_scalar = quantized_matmul(ctx, &x2, shared_expert_gate);
+    let gates = gate.matmul(ctx, &x2);
+    let sg = shared_gate.matmul(ctx, &x2);
+    let su = shared_up.matmul(ctx, &x2);
+    let gate_scalar = shared_expert_gate.matmul(ctx, &x2);
 
     let gates = super::softmax::softmax(ctx, &gates, true);
     let sact = super::elementwise::swiglu(ctx, &sg, &su);
 
     let (inds, scores) = top_k(ctx, &gates, top_k_n);
-    let shared_y = quantized_matmul(ctx, &sact, shared_down);
+    let shared_y = shared_down.matmul(ctx, &sact);
 
     let scores = if norm_topk_prob { normalize_scores(ctx, &scores) } else { scores };
     let shared_y = super::elementwise::sigmoid_gate(ctx, &gate_scalar, &shared_y);

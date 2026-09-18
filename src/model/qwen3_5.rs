@@ -44,23 +44,23 @@ pub struct GatedDeltaNet {
 }
 
 pub struct Attention {
-    pub q_proj: QuantMatrix,
-    pub k_proj: QuantMatrix,
-    pub v_proj: QuantMatrix,
-    pub o_proj: QuantMatrix,
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
     pub q_norm: Array,
     pub k_norm: Array,
 }
 
 pub struct MoeBlock {
-    pub gate: QuantMatrix,
+    pub gate: Linear,
     pub switch_gate: Linear,
     pub switch_up: Linear,
     pub switch_down: Linear,
-    pub shared_gate: QuantMatrix,
-    pub shared_up: QuantMatrix,
-    pub shared_down: QuantMatrix,
-    pub shared_expert_gate: QuantMatrix,
+    pub shared_gate: Linear,
+    pub shared_up: Linear,
+    pub shared_down: Linear,
+    pub shared_expert_gate: Linear,
 }
 
 pub enum Mixer {
@@ -124,10 +124,10 @@ impl TextModel {
                 })
             } else {
                 Mixer::Full(Attention {
-                    q_proj: ws.quant_matrix(ctx, &format!("{lp}.self_attn.q_proj")),
-                    k_proj: ws.quant_matrix(ctx, &format!("{lp}.self_attn.k_proj")),
-                    v_proj: ws.quant_matrix(ctx, &format!("{lp}.self_attn.v_proj")),
-                    o_proj: ws.quant_matrix(ctx, &format!("{lp}.self_attn.o_proj")),
+                    q_proj: ws.linear(ctx, &format!("{lp}.self_attn.q_proj")),
+                    k_proj: ws.linear(ctx, &format!("{lp}.self_attn.k_proj")),
+                    v_proj: ws.linear(ctx, &format!("{lp}.self_attn.v_proj")),
+                    o_proj: ws.linear(ctx, &format!("{lp}.self_attn.o_proj")),
                     q_norm: ws.tensor(ctx, &format!("{lp}.self_attn.q_norm.weight")),
                     k_norm: ws.tensor(ctx, &format!("{lp}.self_attn.k_norm.weight")),
                 })
@@ -138,15 +138,14 @@ impl TextModel {
                 post_attention_layernorm: ws
                     .tensor(ctx, &format!("{lp}.post_attention_layernorm.weight")),
                 mlp: MoeBlock {
-                    gate: ws.quant_matrix(ctx, &format!("{lp}.mlp.gate")),
+                    gate: ws.linear(ctx, &format!("{lp}.mlp.gate")),
                     switch_gate: ws.linear(ctx, &format!("{lp}.mlp.switch_mlp.gate_proj")),
                     switch_up: ws.linear(ctx, &format!("{lp}.mlp.switch_mlp.up_proj")),
                     switch_down: ws.linear(ctx, &format!("{lp}.mlp.switch_mlp.down_proj")),
-                    shared_gate: ws.quant_matrix(ctx, &format!("{lp}.mlp.shared_expert.gate_proj")),
-                    shared_up: ws.quant_matrix(ctx, &format!("{lp}.mlp.shared_expert.up_proj")),
-                    shared_down: ws.quant_matrix(ctx, &format!("{lp}.mlp.shared_expert.down_proj")),
-                    shared_expert_gate: ws
-                        .quant_matrix(ctx, &format!("{lp}.mlp.shared_expert_gate")),
+                    shared_gate: ws.linear(ctx, &format!("{lp}.mlp.shared_expert.gate_proj")),
+                    shared_up: ws.linear(ctx, &format!("{lp}.mlp.shared_expert.up_proj")),
+                    shared_down: ws.linear(ctx, &format!("{lp}.mlp.shared_expert.down_proj")),
+                    shared_expert_gate: ws.linear(ctx, &format!("{lp}.mlp.shared_expert_gate")),
                 },
             });
         }
@@ -360,12 +359,12 @@ impl Attention {
         let scale = (hd as f32).powf(-0.5);
 
         // q_proj emits 2 * head_dim per head: the query and its output gate.
-        let qg = quantized_matmul(ctx, x, &self.q_proj).reshape(&[b, l, hq, 2 * hd]);
+        let qg = self.q_proj.matmul(ctx, x).reshape(&[b, l, hq, 2 * hd]);
         let queries = slice_inner(ctx, &qg, 0, hd);
         let gate = slice_inner(ctx, &qg, hd, hd).reshape(&[b, l, hq * hd]);
 
-        let keys = quantized_matmul(ctx, x, &self.k_proj).reshape(&[b, l, hkv, hd]);
-        let values = quantized_matmul(ctx, x, &self.v_proj).reshape(&[b, l, hkv, hd]);
+        let keys = self.k_proj.matmul(ctx, x).reshape(&[b, l, hkv, hd]);
+        let values = self.v_proj.matmul(ctx, x).reshape(&[b, l, hkv, hd]);
 
         let queries = rms_norm(ctx, &queries, Some(&self.q_norm), cfg.rms_norm_eps);
         let keys = rms_norm(ctx, &keys, Some(&self.k_norm), cfg.rms_norm_eps);
@@ -389,7 +388,7 @@ impl Attention {
 
         let out = transpose_hl(ctx, &out).reshape(&[b, l, hq * hd]);
         let gated = sigmoid_gate(ctx, &gate, &out);
-        quantized_matmul(ctx, &gated, &self.o_proj)
+        self.o_proj.matmul(ctx, &gated)
     }
 }
 

@@ -27,13 +27,13 @@ fn router_matches_mlx() {
     }
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
-    let gate = ws.quant_matrix(&ctx, &format!("{P}.gate"));
+    let gate = ws.linear(&ctx, &format!("{P}.gate"));
     let k = case.meta_usize("top_k");
 
     for t in TS {
         let x = case.array(&ctx, &format!("x_t{t}"));
         let x2 = x.reshape(&[t, x.dim(-1)]);
-        let gates = softmax(&ctx, &quantized_matmul(&ctx, &x2, &gate), true);
+        let gates = softmax(&ctx, &gate.matmul(&ctx, &x2), true);
         exact(&format!("router gates T={t}"), &gates.to_vec_f32(&ctx), &case.f32(&format!("gates_t{t}")));
 
         let (inds, scores) = top_k(&ctx, &gates, k);
@@ -90,14 +90,14 @@ fn whole_block_matches_mlx() {
     }
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
-    let gate = ws.quant_matrix(&ctx, &format!("{P}.gate"));
+    let gate = ws.linear(&ctx, &format!("{P}.gate"));
     let sg = ws.linear(&ctx, &format!("{P}.switch_mlp.gate_proj"));
     let su = ws.linear(&ctx, &format!("{P}.switch_mlp.up_proj"));
     let sd = ws.linear(&ctx, &format!("{P}.switch_mlp.down_proj"));
-    let hg = ws.quant_matrix(&ctx, &format!("{P}.shared_expert.gate_proj"));
-    let hu = ws.quant_matrix(&ctx, &format!("{P}.shared_expert.up_proj"));
-    let hd = ws.quant_matrix(&ctx, &format!("{P}.shared_expert.down_proj"));
-    let seg = ws.quant_matrix(&ctx, &format!("{P}.shared_expert_gate"));
+    let hg = ws.linear(&ctx, &format!("{P}.shared_expert.gate_proj"));
+    let hu = ws.linear(&ctx, &format!("{P}.shared_expert.up_proj"));
+    let hd = ws.linear(&ctx, &format!("{P}.shared_expert.down_proj"));
+    let seg = ws.linear(&ctx, &format!("{P}.shared_expert_gate"));
     let k = case.meta_usize("top_k");
 
     for t in TS {
@@ -120,10 +120,10 @@ fn mixture_and_shared_expert_match_mlx() {
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
     let k = case.meta_usize("top_k");
-    let hg = ws.quant_matrix(&ctx, &format!("{P}.shared_expert.gate_proj"));
-    let hu = ws.quant_matrix(&ctx, &format!("{P}.shared_expert.up_proj"));
-    let hd = ws.quant_matrix(&ctx, &format!("{P}.shared_expert.down_proj"));
-    let seg = ws.quant_matrix(&ctx, &format!("{P}.shared_expert_gate"));
+    let hg = ws.linear(&ctx, &format!("{P}.shared_expert.gate_proj"));
+    let hu = ws.linear(&ctx, &format!("{P}.shared_expert.up_proj"));
+    let hd = ws.linear(&ctx, &format!("{P}.shared_expert.down_proj"));
+    let seg = ws.linear(&ctx, &format!("{P}.shared_expert_gate"));
 
     for t in TS {
         let x = case.array(&ctx, &format!("x_t{t}"));
@@ -137,11 +137,11 @@ fn mixture_and_shared_expert_match_mlx() {
         exact(&format!("mixture T={t}"), &mixed.to_vec_f32(&ctx), &case.f32(&format!("mixed_t{t}")));
 
         // The shared expert
-        let sg = quantized_matmul(&ctx, &x2, &hg);
-        let su = quantized_matmul(&ctx, &x2, &hu);
+        let sg = hg.matmul(&ctx, &x2);
+        let su = hu.matmul(&ctx, &x2);
         let act = ornith_rs::ops::elementwise::swiglu(&ctx, &sg, &su);
-        let sy = quantized_matmul(&ctx, &act, &hd);
-        let gs = quantized_matmul(&ctx, &x2, &seg);
+        let sy = hd.matmul(&ctx, &act);
+        let gs = seg.matmul(&ctx, &x2);
         let sy = ornith_rs::ops::elementwise::sigmoid_gate(&ctx, &gs, &sy);
         exact(&format!("shared expert T={t}"), &sy.to_vec_f32(&ctx), &case.f32(&format!("shared_t{t}")));
     }
