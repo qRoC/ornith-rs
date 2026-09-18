@@ -3529,6 +3529,99 @@ optimisation.
 
 ---
 
+## Phase 24 -- the per-expert importance vector, built and not adopted -- **DONE**
+
+`forge_q4k.py` converted the routed experts with one importance vector a layer
+and said why: "One vector serves all 256 experts of a layer, because the input
+distribution is the layer's and not the expert's." That is true of `gate_proj`
+and `up_proj`, which all read one `post_attention_layernorm`, and **false of
+`down_proj`**, whose input is `silu(gate) * up`. Phase 22 measured the cost of
+the pooling and Phase 12's alternative explanation #4 with it; this spends the
+correction.
+
+### Priced first, and the price said build it
+
+`tools/imatrix_expert_ceiling.py`, three currencies because a weighting scheme
+is *supposed* to lose on the ones it does not optimise, 16 experts a layer:
+
+    layer  currency        plain   pooled   per-expert   pooled/plain  per-exp/pooled
+      0    per-expert     0.0630   0.0636     0.0518         +0.9%         -18.7%
+      5    per-expert     0.0712   0.0706     0.0682         -0.8%          -3.4%
+     20    per-expert     0.0717   0.0711     0.0678         -0.9%          -4.6%
+     39    per-expert     0.0187   0.0184     0.0169         -1.7%          -8.1%
+      0    unweighted     0.0695   0.0683     0.0895         -1.8%         +31.7%
+
+**The vector the five artifacts carry is nearly inert on this tensor** -- it
+moves every currency by 1-4%, which is what a statistic with 1.1-1.7x spread
+across channels can do. The per-expert one is worth 3.4% to 18.7%. Layer 0 is
+the extreme of both because 41.4% of its channels are dead in the parent
+(Phase 20), and the per-expert vector is the only one that knows a channel is
+dead *for this expert*.
+
+### One variable, checked by digest
+
+`forge_q4k.py --redo --per-expert --only mlp.switch_mlp.down_proj --from
+q6k-full`: 40 modules, 427 s, one `quantize_q4_K` call an expert. The point of
+`--redo` is that it makes a one-variable experiment cost 40 modules instead of
+315 from `int4-head-linattn` twice over.
+
+`q4k_audit.py` confirms it landed where it should: **exactly 40 of 315 digests
+move, and all 40 are `down_proj`.** Their unweighted error rises -- 6.035% ->
+6.159% mean, layer 0's 6.93% -> 8.72% -- which is Phase 18's own signature of a
+weighting scheme doing its job. Bytes are unchanged to the digit.
+
+### And the instrument reads a coin flip
+
+64 probes, both arms captured on the same tile:
+
+    variant            median      p90      max    best on   top-1 moved
+    q6k-full           0.0362   0.2126   4.5238   26 of 56       5 of 64
+    q6k-perexpert      0.0347   0.2110   3.3834   30 of 56       6 of 64
+
+    sign test: per-expert lower on 30 of 56 live probes, p = 0.69
+    median ratio 1.04x
+
+**Not a reduction of damage, a redistribution of it.** Five groups improve and
+three do not:
+
+    group        q6k-full   per-expert          group        q6k-full   per-expert
+    longrange      0.0810     **0.0468**        arith          0.0578       0.0743
+    format         0.0127     **0.0072**        script         0.0190       0.0331
+    rare           0.0350     **0.0274**        morph          0.0350       0.0387
+    code           0.0560     **0.0477**
+    mixed          0.0175     **0.0123**
+
+and the individual probes move in both directions by more than the medians do
+(`script/he-capital` 0.1947 -> 0.0324, `script/ru-capital` 0.0164 -> 0.0461).
+
+The one column that is not a wash is `max`: **4.5238 -> 3.3834**, and the
+largest single gap in the head-to-head is +1.14 nats on `arith/ru-7x8` in the
+new artifact's favour. That probe is this rebuild's known cliff, and 3.38 nats
+is still on it -- the variant moved along the cliff, not off it. Worth one line,
+not a verdict.
+
+### What it settles
+
+  - **The premise is corrected by measurement rather than by argument.** The
+    comment in `forge_q4k.py` was wrong for one of its three modules, and the
+    file now says so and can do the other thing.
+  - **An imatrix where there was none is a bigger step than a better imatrix
+    where there was a weak one.** Phase 18 went from *no vector at all* on 48
+    modules to a vector and Phase 17's loss disappeared. This goes from a
+    nearly-inert vector to a good one and nothing moves. The lever has
+    diminishing returns and this is the far end of them.
+  - **The pricing predicted the null exactly**, which is the part worth
+    keeping: 3-18% of the objective, against an instrument whose own draw
+    spread swallowed Phase 12's +3.5%. Spending the forge was still right --
+    it cost 427 s and it is the difference between a prediction and a result --
+    but the prediction was not wrong.
+
+`ornith-1.5-35b-a3b-q6k-perexpert` stays on disk (296 GB free) and
+`refs/artifact/q6k-perexpert` is its capture. **`q6k-full` remains the
+artifact.**
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
