@@ -231,7 +231,21 @@ Why it suits this project better than anything else here:
 ## Checked and rejected
 
 - **Block deduplication.** Entropy per group is too high for exact matches.
-- **Weight sparsity.** Dense training; nothing to skip.
+- **Weight sparsity.** Dense training; nothing to skip -- **except in layer 0's
+  experts**, where `REBUILD.md` Phase 20 measured 41.4% of the intermediate
+  channels dead in the parent (mean over 256 experts; median 43.9%, max 81.8%).
+  That is 0.38% of a decode step, so the correction is to the claim and not to
+  the conclusion: there is something to skip and there is very little of it.
+- **Reversible rotations** (QuaRot / SpinQuant). Priced out in Phase 20, and
+  the reason on record for not trying it -- HIGGS's three blockers -- turned
+  out to belong to HIGGS's grid rather than to the Hadamard. The premise is
+  what fails: at the granularity affine g32 sees, these weights already sit at
+  the Gaussian floor for `(max - min) / rms` (4.13-4.31 against a simulated
+  4.14), so there is no incoherence to remove. Rotating buys at best 6-7% of
+  weight error on one module, costs 11-12% on the 8-bit side, and in the
+  H-weighted output error it is a wash with `L0.out_proj` coming out 23%
+  *worse*. And the thing a rotation is for -- surviving activation outliers at
+  4-bit activations -- does not arise: this artifact is W4A16.
 - **Exact MIPS by clustering `lm_head`.** The bound `c.h + r||h||` is useless
   at 2048 dimensions with any tractable number of clusters -- the residual
   radius barely shrinks. The two-stage scheme above works because its bound is

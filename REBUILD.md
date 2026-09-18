@@ -2866,6 +2866,161 @@ loop does, so there is no second kernel to write.
 
 ---
 
+## Phase 20 -- reversible rotations, priced out before building -- **DONE**
+
+Rotation is the last untried lever in this rebuild. The taxonomy the earlier
+phases built has five axes and four of them have been walked:
+
+    coverage     which module gets how many bits      Phases 4-5, knee mapped
+    grid         the representable set                Phases 4, 14-18
+    rounding     which grid point                     GPTQ, Phases 7-11
+    weights      a diagonal rescale folded in         AWQ, Phase 6, rejected
+    weighting    the objective                        imatrix, Phases 15, 18
+    **weights**  **an orthogonal rotation folded in**  **this phase**
+
+**And the recorded reason for not trying it was pointed at the wrong thing.**
+Phase 4 surveyed HIGGS -- "Hadamard incoherence, MSE-optimal grids, data-free"
+-- and parked it on three blockers: a CUDA runtime, a non-affine format, and no
+MLX oracle. All three belong to HIGGS's *grid*. QuaRot and SpinQuant are the
+rotation without the grid: an orthogonal `Q` folded offline into the
+neighbouring weight matrices, with plain affine or Q4_K afterwards. The
+artifact stays in a format mlx has, so **the oracle survives** -- and the one
+piece that cannot be folded offline, the online Hadamard, mlx already
+implements (`mlx::hadamard_transform`, `kernels/hadamard.h`, `n = m*2^k` for
+`m` in 1, 12, 20, 28; every input dim here is a power of two). So the blocker
+on record did not apply, and the question was open rather than closed.
+
+`tools/rotation_ceiling.py` answers it without building anything, which is
+Phase 13's move.
+
+### The premise is already satisfied, so there is nothing to spread
+
+A rotation exists to kill outliers. What binds here is not a tensor's outliers
+but a **group's**: affine g32 fits a scale and a bias to each run of 32 input
+channels, so the quantity is `(max - min) / rms` per group, and the yardstick
+is what 32 Gaussian draws give. Simulated, not quoted: **median 4.14**, p99
+5.35.
+
+    module                  spread med   p99      (the 4-bit side, g32)
+    lm_head                    4.13     5.60     <- already below the floor
+    L0.in_proj_qkv             4.16     5.46
+    L0.out_proj                4.26     5.85
+    L20.in_proj_qkv            4.31     6.00     <- the furthest from it
+    L20.experts.gate_up        4.16     5.41
+    L20.experts.down           4.14     5.35
+    L11.self_attn.q_proj       4.85     6.45     (8-bit side, g64)
+    L11.self_attn.o_proj       4.84     7.28
+
+**At the granularity the quantizer actually sees, these weights are already
+Gaussian.** There is no incoherence to remove.
+
+### Rotate and re-quantize, which is the direct answer
+
+`W' = W @ Q` along the *input* axis -- the axis the groups run along and the
+one QuaRot rotates, because `x' = Q.T x` undoes it in the previous op. A
+Hadamard, which is what an implementation would use, and a Haar-random
+orthogonal, which is the best case incoherence theory offers. Ratios
+rotated/unrotated, below 1.00 means the rotation helps:
+
+    module                  spread  affine  k-quant   out(aff)  out(kq)
+    lm_head                   1.00    1.00     0.99      0.99     0.99
+    L0.in_proj_qkv            0.99    0.99     0.99      1.00     1.00
+    L0.out_proj               0.97    0.95     0.95    **1.23**   0.91
+    L20.in_proj_qkv           0.96    0.94     0.93      0.95     0.91
+    L11.self_attn.q_proj      0.96  **1.12**   0.96      0.90     0.95
+    L11.self_attn.o_proj      0.96  **1.11**   0.96      0.96     0.84
+    L20.experts.gate_up       0.99    0.99     0.99       --       --
+    L20.experts.down          1.00    1.00     1.00       --       --
+
+(Hadamard rows; the Haar rows differ by at most 0.03 except where noted below.)
+
+The best weight-error gain anywhere is **6-7%**, on `L20.in_proj_qkv`, the
+module that started furthest from the floor. On the 8-bit side affine gets
+**11-12% worse**. Haar is never better than Hadamard, which is the tell: if the
+mechanism were incoherence, the Haar-random rotation would be the ceiling and
+it is not.
+
+### And in the currency that has a link to the output, it is a wash with a tail
+
+Weight error has been falsified as a selector four times here (Phases 4, 7, 14,
+15), so the column that decides is `out`: the error in the layer's *product*
+under the real activation second moment,
+
+    rel = sqrt( tr(dW H dW.T) / tr(W H W.T) ),   H' = Q.T H Q
+
+which is the same output error in two bases and therefore directly comparable.
+`refs/gptq-parent/hessians/` and `refs/gptq-attn/hessians/` hold the full `H`.
+
+It is a wash -- and `L0.out_proj`, the module `Q4K.md` already flagged for
+carrying 21.6% H-weighted error against 7.5% unweighted, comes out **23% worse
+with a Hadamard and 17% worse with Haar.**
+
+The mechanism is clean. A rotation makes the **weights** uniform; the
+**activations** do not become uniform. Mixing the input channels destroys
+whatever alignment existed between the quantizer's error and the directions the
+activations do not use, and the more concentrated the Hessian, the more there
+was to destroy.
+
+### The prize does not exist in this artifact
+
+QuaRot's gain is **W4A4**. It exists so that *activations* can be quantized to
+four bits, and the rotation is what makes activation outliers survivable. This
+artifact is **W4A16**: every activation on every path is bfloat16 and nothing
+here quantizes one. So the cost is paid and the thing it buys is not on the
+table.
+
+Which means the fold-point question -- the one AWQ's Phase 6 says decides scope,
+and which looked hard here because 30 of 40 layers are gated-delta rather than
+q/k/v/o -- never had to be asked. **Rejected, on measurement, before a line of
+it was written.**
+
+One honesty. SpinQuant *learns* the rotation against a task loss rather than
+taking a fixed one, and a learned rotation optimising the H-weighted objective
+could avoid `L0.out_proj`'s regression by construction. What this phase kills
+is the argument from incoherence, which is measured and dead. The argument from
+a learned rotation is untested and costs training, which is a different class
+of expense than anything in this rebuild so far.
+
+### What it found on the way: layer 0's experts are 41% dead in the parent
+
+`L0.experts.gate_up` came back with a median group spread of **0.00**, which is
+not a number a weight matrix produces. Read straight out of the safetensors
+bytes, past mlx:
+
+**16% to 82% of each layer-0 expert's intermediate channels are dead** -- a
+whole row of `gate_up_proj` at the single bf16 pattern `0x01D4` = 7.7877e-38,
+thirty-five orders below the mean weight of 0.0032, and the matching column of
+`down_proj`. Over all 256 experts: **mean 41.4%, median 43.9%, min 0.4%, max
+81.8%, and not one expert is fully alive; 71 of 256 are more than half dead.**
+
+    layer      gate_up            down_proj
+             all    whole rows   all    whole rows
+       0    62.5%     62.5%     54.7%      0.0%   <- columns, not rows
+       1     0.0%      0.0%      0.4%      0.0%
+    2..39    0.0%      0.0%      0.0%      0.0%
+
+No other layer, and no non-expert tensor of layer 0 (`in_proj_qkv`,
+`shared_expert`, the router gate). The correspondence is exact and explains
+itself: a dead `gate_up` row is a dead channel of `h`, which is a dead
+`down_proj` column.
+
+**It is worth about 0.38% of a decode step**, so it is not a lever. It is two
+other things:
+
+  - **a measurement hazard.** Any per-module statistic taken on layer 0's
+    experts is computed on a tensor that is 41% constant, and the first run of
+    this phase tripped over exactly that.
+  - **a second defect in a published artifact from this publisher**, after the
+    unshifted RMSNorm gain in 2.9.1's MTP head. It was found by a number that
+    was too strange to be a result -- the same rule that caught Phase 14's
+    `floor`-for-`ceil`.
+
+`IDEAS.md`'s "Weight sparsity. Dense training; nothing to skip." is corrected
+rather than deleted: for layer 0 there *is* something to skip, and there is
+very little of it.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
@@ -2909,6 +3064,11 @@ locally removes the whole constraint.
   the port reads, so every tokenizer test stays green on the wrong pattern.
   Caught by the three tokenizer invariants in `check_rebuild.py`, fixed by
   `tools/align_rebuild.py`, and it was not on this list before.
+- **A defect in the parent itself**, which no check here looks for: every test
+  compares the port against MLX on the same weights, and `check_rebuild.py`
+  checks shapes and counts. Two have turned up anyway, both because a number
+  came back too strange to be a result -- 2.9.1's unshifted MTP norm gain, and
+  layer 0's 41%-dead experts in Phase 20. Neither was caught by machinery.
 - **A quality regression from the format.** Caught by perplexity against the
   Phase 0 baseline -- which is why Phase 0 cannot be skipped.
 - **A port bug in the new kernels.** Caught by `max_abs == 0.0`, as usual.

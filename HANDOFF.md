@@ -206,6 +206,8 @@ IDEAS.md                   what designing the artifact buys, with the arithmetic
 tools/quant_error.py       every quantization number in those two, reproducible
 tools/weight_error.py      what a variant's format actually cost, against the
                            bf16 parent, one module at a time
+tools/rotation_ceiling.py  what a QuaRot/SpinQuant rotation could buy, priced
+                           against the parent before writing one
 tools/step_bytes.py        bytes one decode step reads, from the safetensors
                            headers rather than by hand
 tools/aq.py                mlx's affine_quantize in numpy, bit-exact, with the
