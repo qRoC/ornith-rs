@@ -54,9 +54,9 @@ pub struct Attention {
 
 pub struct MoeBlock {
     pub gate: QuantMatrix,
-    pub switch_gate: QuantMatrix,
-    pub switch_up: QuantMatrix,
-    pub switch_down: QuantMatrix,
+    pub switch_gate: Linear,
+    pub switch_up: Linear,
+    pub switch_down: Linear,
     pub shared_gate: QuantMatrix,
     pub shared_up: QuantMatrix,
     pub shared_down: QuantMatrix,
@@ -139,9 +139,9 @@ impl TextModel {
                     .tensor(ctx, &format!("{lp}.post_attention_layernorm.weight")),
                 mlp: MoeBlock {
                     gate: ws.quant_matrix(ctx, &format!("{lp}.mlp.gate")),
-                    switch_gate: ws.quant_matrix(ctx, &format!("{lp}.mlp.switch_mlp.gate_proj")),
-                    switch_up: ws.quant_matrix(ctx, &format!("{lp}.mlp.switch_mlp.up_proj")),
-                    switch_down: ws.quant_matrix(ctx, &format!("{lp}.mlp.switch_mlp.down_proj")),
+                    switch_gate: ws.linear(ctx, &format!("{lp}.mlp.switch_mlp.gate_proj")),
+                    switch_up: ws.linear(ctx, &format!("{lp}.mlp.switch_mlp.up_proj")),
+                    switch_down: ws.linear(ctx, &format!("{lp}.mlp.switch_mlp.down_proj")),
                     shared_gate: ws.quant_matrix(ctx, &format!("{lp}.mlp.shared_expert.gate_proj")),
                     shared_up: ws.quant_matrix(ctx, &format!("{lp}.mlp.shared_expert.up_proj")),
                     shared_down: ws.quant_matrix(ctx, &format!("{lp}.mlp.shared_expert.down_proj")),

@@ -79,6 +79,12 @@ def main():
         scales = np.array(t[f"{mod}.scales"], copy=False)
         dm = np.array(t[f"{mod}.dm"], copy=False)
         del t
+        # A routed module carries an [E, ...] axis; flatten it, since the block
+        # layout below is the same either way.
+        shape = qs.shape
+        qs = qs.reshape(-1, shape[-1])
+        scales = scales.reshape(-1, scales.shape[-2], scales.shape[-1])
+        dm = dm.reshape(-1, dm.shape[-2], dm.shape[-1])
         rows, nb = scales.shape[0], scales.shape[1]
 
         # Reassemble ggml's 144-byte blocks out of the three tensors -- the
@@ -89,10 +95,13 @@ def main():
         blocks[:, 4 + q4k.K_SCALE_SIZE :] = qs.reshape(rows * nb, 32).view(np.uint8)
         deq = q4k_ggml.dequantize(lib, blocks, rows * nb * q4k.QK_K).reshape(rows, -1)
 
-        pname = parent_of(mod)
+        pname, half = parent_of(mod)
         pt = mx.load(str(PARENT / pidx[pname]))[pname]
+        if half:
+            h2 = pt.shape[1] // 2
+            pt = pt[:, :h2, :] if half == "lo" else pt[:, h2:, :]
         mx.eval(pt)
-        w = np.array(pt.astype(mx.float32), copy=False)
+        w = np.array(pt.astype(mx.float32), copy=False).reshape(deq.shape)
         del pt
         rel = 100 * float(np.linalg.norm(w - deq) / np.linalg.norm(w))
         worst = max(worst, rel)

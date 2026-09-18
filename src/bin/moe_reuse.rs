@@ -27,6 +27,7 @@
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
 use ornith_rs::model::cache::zero;
+use ornith_rs::ops::linear::Linear;
 use ornith_rs::ops::moe::switch_glu_sorted;
 use ornith_rs::refs::model_dir;
 use ornith_rs::weights::WeightStore;
@@ -75,9 +76,9 @@ fn main() {
     let dir = model_dir();
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
-    let g = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.gate_proj"));
-    let u = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.up_proj"));
-    let dn = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.down_proj"));
+    let g = Linear::Mlx(ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.gate_proj")));
+    let u = Linear::Mlx(ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.up_proj")));
+    let dn = Linear::Mlx(ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.down_proj")));
     let dim = g.in_dims();
     println!("{}\n{} experts, dim {dim}\n", dir.display(), g.num_experts());
 

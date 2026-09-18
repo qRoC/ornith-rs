@@ -22,7 +22,7 @@
 
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
-use ornith_rs::ops::q4k::{Q4kMatrix, dequantize, qmv};
+use ornith_rs::ops::q4k::{Q4kMatrix, dequantize, gather_qmv, qmv};
 use ornith_rs::refs::{RefCase, compare, refs_root};
 use ornith_rs::weights::WeightStore;
 
@@ -257,4 +257,65 @@ fn the_forged_artifact_reads_back_as_ggml_wrote_it() {
     }
     assert!(n > 0, "q4k_audit.json named no modules");
     eprintln!("{n} q4k modules agree with ggml, digest for digest");
+}
+
+/// The routed gather: `kernel_mul_mv_id` at M = 1.
+///
+/// One output row per (token, expert) pair, reading `x[lhs[r]]` against expert
+/// `rhs[r]` -- `mx.gather_qmm`'s contract and what `SwitchGLU` produces. The
+/// expert stride is the one thing the two-dimensional cases cannot exercise,
+/// so it is checked twice: against a float64 reference over eleven rows whose
+/// experts repeat and whose tokens do not, and again with a one-hot
+/// activation, where the answer is one column of one expert and a stride that
+/// lands on a neighbour cannot pass.
+#[test]
+fn the_routed_gather_picks_the_right_expert() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    if !case.has("moe_qs") {
+        eprintln!("skipping: the reference predates the routed case; rerun dump_q4k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    let w = Q4kMatrix::new(
+        case.array(&ctx, "moe_qs"),
+        case.array(&ctx, "moe_scales"),
+        case.array(&ctx, "moe_dm"),
+    );
+    let experts = case.meta_usize("moe_experts");
+    let rows = case.meta_usize("moe_rows");
+    let cols = case.meta_usize("moe_cols");
+    let n = case.meta_usize("moe_n");
+    assert_eq!((w.num_experts(), w.out_dims(), w.in_dims()), (experts, rows, cols));
+
+    // The stacked weights dequantize to the same values one at a time.
+    let deq = dequantize(&ctx, &w, Dtype::F32);
+    let d = compare(&deq.to_vec_f32(&ctx), &case.f32("moe_deq"));
+    assert_eq!(d.max_abs, 0.0, "routed dequantize: {d}");
+
+    let lhs = case.array(&ctx, "moe_lhs");
+    let rhs = case.array(&ctx, "moe_rhs");
+    let x = case.array(&ctx, "moe_x");
+    let got = gather_qmv(&ctx, &x, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    let d = compare(&got, &case.f32("moe_y"));
+    eprintln!("routed gather, {n} rows over {experts} experts: {d}");
+    assert!(d.max_rel <= MATVEC_MAX_REL, "routed gather: {d}");
+
+    // One-hot per row: output row `r` must be column `r` of expert `rhs[r]`.
+    let j = case.meta_usize("head_onehot_j") % cols;
+    let mut xs = vec![0.0f32; n * cols];
+    for r in 0..n {
+        xs[r * cols + j] = 1.0;
+    }
+    let xs = Array::from_f32(&ctx, &xs, &[n, cols]);
+    let got = gather_qmv(&ctx, &xs, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    let deq = case.f32("moe_deq");
+    let rhs_ids = case.get("moe_rhs").to_u32();
+    let mut want = Vec::with_capacity(n * rows);
+    for r in 0..n {
+        let e = rhs_ids[r] as usize;
+        want.extend((0..rows).map(|o| deq[(e * rows + o) * cols + j]));
+    }
+    let d = compare(&got, &want);
+    eprintln!("routed one-hot, column {j}: {d}");
+    assert!(d.max_rel <= ONE_HOT_MAX_REL, "routed one-hot: {d}");
 }

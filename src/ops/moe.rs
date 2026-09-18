@@ -21,6 +21,7 @@
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
+use crate::ops::linear::Linear;
 
 use super::quantized::{QuantMatrix, gather_qmm_rows, quantized_matmul};
 use super::reduce::{sum_last_axis, sum_second_last_axis};
@@ -145,9 +146,9 @@ pub fn switch_glu(
     ctx: &Context,
     x: &Array,
     inds: &Array,
-    gate_proj: &QuantMatrix,
-    up_proj: &QuantMatrix,
-    down_proj: &QuantMatrix,
+    gate_proj: &Linear,
+    up_proj: &Linear,
+    down_proj: &Linear,
 ) -> Array {
     switch_glu_sorted(ctx, x, inds, gate_proj, up_proj, down_proj, None)
 }
@@ -158,9 +159,9 @@ pub fn switch_glu_sorted(
     ctx: &Context,
     x: &Array,
     inds: &Array,
-    gate_proj: &QuantMatrix,
-    up_proj: &QuantMatrix,
-    down_proj: &QuantMatrix,
+    gate_proj: &Linear,
+    up_proj: &Linear,
+    down_proj: &Linear,
     force_sort: Option<bool>,
 ) -> Array {
     let tokens = x.shape[0];
@@ -203,14 +204,14 @@ pub fn switch_glu_sorted(
     };
     let lhs_indices = Array::from_slice(ctx, &lhs, &[rows], Dtype::U32);
 
-    let x_up = gather_qmm_rows(ctx, &xs, up_proj, &lhs_indices, &idx, do_sort);
-    let x_gate = gather_qmm_rows(ctx, &xs, gate_proj, &lhs_indices, &idx, do_sort);
+    let x_up = up_proj.gather_matmul(ctx, &xs, &lhs_indices, &idx, do_sort);
+    let x_gate = gate_proj.gather_matmul(ctx, &xs, &lhs_indices, &idx, do_sort);
     let act = super::elementwise::swiglu(ctx, &x_gate, &x_up);
     // down_proj consumes the activation row-for-row, so its lhs indices are
     // the identity regardless of sorting.
     let identity: Vec<u32> = (0..rows as u32).collect();
     let lhs_down = Array::from_slice(ctx, &identity, &[rows], Dtype::U32);
-    let y = gather_qmm_rows(ctx, &act, down_proj, &lhs_down, &idx, do_sort);
+    let y = down_proj.gather_matmul(ctx, &act, &lhs_down, &idx, do_sort);
 
     match inv_order {
         Some(inv) => {
@@ -287,9 +288,9 @@ pub fn sparse_moe_block(
     ctx: &Context,
     x: &Array,
     gate: &QuantMatrix,
-    switch_gate: &QuantMatrix,
-    switch_up: &QuantMatrix,
-    switch_down: &QuantMatrix,
+    switch_gate: &Linear,
+    switch_up: &Linear,
+    switch_down: &Linear,
     shared_gate: &QuantMatrix,
     shared_up: &QuantMatrix,
     shared_down: &QuantMatrix,

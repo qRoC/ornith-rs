@@ -29,6 +29,11 @@ What is written, per case:
                         nonzero term and the answer is a column of `deq`.
                         That one *is* checkable tightly, and it catches an
                         addressing error that a tolerance would hide
+
+And one routed case, `moe`, with the same tensors carrying an `[E, ...]` axis
+in front and a `(lhs, rhs)` pair per output row -- `mx.gather_qmm`'s contract
+and `SwitchGLU`'s shape. An expert stride is the one thing the two-dimensional
+cases cannot exercise.
 """
 
 import json
@@ -100,6 +105,49 @@ def main():
         print(f"{name:<6} [{rows}, {cols}]  {nb} blocks a row  "
               f"ggml Q4_K rel RMS {100 * rel:.3f}%  onehot col {j}")
         del w, deq
+
+    # --- the routed case ------------------------------------------------
+    EXPERTS, EROWS, ECOLS, ROWS = 4, 512, 2048, 11
+    key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+    t = mx.load(str(PARENT / idx[key]))[key]
+    mx.eval(t)
+    # `gate_proj` is the low half of the parent's fused `gate_up_proj`, which
+    # is how `forge_q4k_twin.py` maps it too.
+    we = np.ascontiguousarray(
+        np.array(t.astype(mx.float32), copy=False)[:EXPERTS, :EROWS, :ECOLS])
+    del t
+    nb = ECOLS // q4k.QK_K
+    qs = np.empty((EXPERTS, EROWS, nb * 32), np.uint32)
+    scales = np.empty((EXPERTS, EROWS, nb, 12), np.uint8)
+    dm = np.empty((EXPERTS, EROWS, nb, 2), np.float16)
+    deq = np.empty_like(we)
+    for e in range(EXPERTS):
+        blocks = q4k_ggml.quantize(lib, we[e])
+        qs[e], scales[e], dm[e] = q4k.split(blocks, EROWS, nb)
+        deq[e] = q4k_ggml.dequantize(lib, blocks, we[e].size).reshape(EROWS, ECOLS)
+
+    # Distinct tokens and a repeated expert, so a wrong stride cannot land on
+    # the right answer by accident.
+    lhs = rng.integers(0, ROWS, ROWS).astype(np.uint32)
+    rhs = rng.integers(0, EXPERTS, ROWS).astype(np.uint32)
+    rhs[0], rhs[1] = 0, EXPERTS - 1
+    xe = mx.array(rng.standard_normal((ROWS, ECOLS)).astype(np.float32) * 0.05)
+    mx.eval(xe)
+    xf = np.array(xe, copy=False).astype(np.float64)
+    ye = np.stack([deq[rhs[r]].astype(np.float64) @ xf[lhs[r]] for r in range(ROWS)])
+
+    case.put("moe_qs", mx.array(qs))
+    case.put("moe_scales", mx.array(scales))
+    case.put("moe_dm", mx.array(dm))
+    case.put("moe_deq", mx.array(deq))
+    case.put("moe_x", xe.astype(mx.float32))
+    case.put("moe_lhs", mx.array(lhs))
+    case.put("moe_rhs", mx.array(rhs))
+    case.put("moe_y", mx.array(ye.astype(np.float32)))
+    meta.update(moe_experts=EXPERTS, moe_rows=EROWS, moe_cols=ECOLS, moe_n=ROWS)
+    print(f"moe    [{EXPERTS}, {EROWS}, {ECOLS}]  {ROWS} routed rows  "
+          f"experts {sorted(set(int(v) for v in rhs))}")
+    del we, deq
 
     meta["cases"] = [c[0] for c in CASES]
     meta["module"] = MODULE

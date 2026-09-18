@@ -20,6 +20,9 @@
 //!   scales  uint8   [O, I / 256, 12]  8 x 6-bit scale + 8 x 6-bit min
 //!   dm      float16 [O, I / 256, 2]   d and dmin
 //!
+//! A routed expert module carries the same three with an `[E, ...]` axis in
+//! front, exactly as the affine ones do, and [`gather_qmv`] indexes it.
+//!
 //! **One kernel, and it is a mat-vec.** `Q4K.md` scopes the first cut to
 //! M = 1, because `affine_qmv_fast` is 38% of a decode step and that alone is
 //! enough to measure GB/token and GPU busy for real. ggml's kernel also
@@ -72,10 +75,16 @@ impl Q4kMatrix {
         self.dm.shape[self.dm.ndim() - 2]
     }
 
+    /// Experts for a 3-D (routed) weight, else 1 -- `QuantMatrix` counts the
+    /// same way.
+    pub fn num_experts(&self) -> usize {
+        if self.qs.ndim() >= 3 { self.qs.shape[0] } else { 1 }
+    }
+
     /// Everything the kernel assumes about the three tensors, checked once at
     /// load rather than read as garbage per dispatch.
     fn check(&self) {
-        let (o, nb) = (self.out_dims(), self.blocks_per_row());
+        let (o, nb, e) = (self.out_dims(), self.blocks_per_row(), self.num_experts());
         assert_eq!(self.qs.dtype, Dtype::U32, "q4k qs must be uint32");
         assert_eq!(self.scales.dtype, Dtype::U8, "q4k scales must be uint8");
         assert_eq!(self.dm.dtype, Dtype::F16, "q4k dm must be float16");
@@ -86,8 +95,9 @@ impl Q4kMatrix {
             self.qs.shape[self.qs.ndim() - 1],
             nb * QK_K / 8
         );
-        assert_eq!(self.scales.numel(), o * nb * 12, "q4k scales size");
-        assert_eq!(self.dm.numel(), o * nb * 2, "q4k dm size");
+        assert_eq!(self.scales.numel(), e * o * nb * 12, "q4k scales size");
+        assert_eq!(self.dm.numel(), e * o * nb * 2, "q4k dm size");
+        assert_eq!(self.qs.numel(), e * o * nb * QK_K / 8, "q4k qs size");
     }
 }
 
@@ -97,9 +107,12 @@ impl Q4kMatrix {
 /// loop has. Used by the tests and by anything that wants the weights back;
 /// the model path never calls it.
 pub fn dequantize(ctx: &Context, w: &Q4kMatrix, dtype: Dtype) -> Array {
-    let (o, k) = (w.out_dims(), w.in_dims());
-    let out = Array::empty(ctx, &[o, k], dtype);
-    let blocks = o * k / QK_K;
+    let (o, k, e) = (w.out_dims(), w.in_dims(), w.num_experts());
+    // A routed weight keeps its `[E, O, I]` shape; the kernel is per block and
+    // does not care, but the output has to have room for all of them.
+    let shape = if e > 1 { vec![e, o, k] } else { vec![o, k] };
+    let out = Array::empty(ctx, &shape, dtype);
+    let blocks = e * o * k / QK_K;
     let tg = 256.min(blocks.next_power_of_two()).max(1);
     ctx.kernel(&format!("q4k_dequantize_{}", type_name(dtype)))
         .arr(&w.qs)
@@ -155,4 +168,46 @@ fn type_name(d: Dtype) -> &'static str {
         Dtype::F32 => "float32",
         d => panic!("no q4k kernel for {}", d.name()),
     }
+}
+
+/// `mx.gather_qmm(x, w, rhs_indices=..., transpose=True)` at M = 1, which is
+/// the only shape `SwitchGLU` produces -- ggml's `kernel_mul_mv_id`.
+///
+/// One output row per (token, expert) pair: row `r` reads `x[lhs[r]]` against
+/// expert `rhs[r]`. `x` is `[R, I]` or `[T, I]` depending on whether the
+/// caller sorted, `lhs`/`rhs` are `[R]`, and the result is `[R, O]`.
+///
+/// There is no rhs-sorted streaming variant here. mlx has one and takes it
+/// when the rows outnumber the experts four to one, because it reads each
+/// expert's weights once for a run of rows instead of once per row. At the
+/// batch this model decodes -- 8 rows a token -- that path is unreachable
+/// anyway, and at prefill it would be the difference between a mat-vec and a
+/// gemm, which is the same debt `qmv` already owes at M > 1.
+pub fn gather_qmv(
+    ctx: &Context,
+    x: &Array,
+    w: &Q4kMatrix,
+    lhs_indices: &Array,
+    rhs_indices: &Array,
+) -> Array {
+    let (o, k) = (w.out_dims(), w.in_dims());
+    assert_eq!(x.dim(-1), k, "q4k gather: x is {k}-wide?");
+    assert_eq!(k % QK_K, 0, "q4k gather: {k} is not a multiple of {QK_K}");
+    assert_eq!(o % (NSG * NR0), 0, "q4k gather: {o} rows is not a multiple of 4");
+    let rows = rhs_indices.numel();
+    assert_eq!(lhs_indices.numel(), rows, "q4k gather: index arrays disagree");
+
+    let out = Array::empty(ctx, &[rows, o], x.dtype);
+    ctx.kernel(&format!("q4k_gather_qmv_{}", type_name(x.dtype)))
+        .arr(&w.qs)
+        .arr(&w.scales)
+        .arr(&w.dm)
+        .arr(x)
+        .out(&out)
+        .bytes(&(k as i32))
+        .bytes(&(o as i32))
+        .arr(lhs_indices)
+        .arr(rhs_indices)
+        .groups((o / (NSG * NR0), rows, 1), (32, NSG, 1));
+    out
 }

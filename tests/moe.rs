@@ -58,9 +58,9 @@ fn switch_glu_matches_mlx() {
     }
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
-    let g = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.gate_proj"));
-    let u = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.up_proj"));
-    let dn = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.down_proj"));
+    let g = ws.linear(&ctx, &format!("{P}.switch_mlp.gate_proj"));
+    let u = ws.linear(&ctx, &format!("{P}.switch_mlp.up_proj"));
+    let dn = ws.linear(&ctx, &format!("{P}.switch_mlp.down_proj"));
     let k = case.meta_usize("top_k");
 
     for t in TS {
@@ -91,9 +91,9 @@ fn whole_block_matches_mlx() {
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
     let gate = ws.quant_matrix(&ctx, &format!("{P}.gate"));
-    let sg = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.gate_proj"));
-    let su = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.up_proj"));
-    let sd = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.down_proj"));
+    let sg = ws.linear(&ctx, &format!("{P}.switch_mlp.gate_proj"));
+    let su = ws.linear(&ctx, &format!("{P}.switch_mlp.up_proj"));
+    let sd = ws.linear(&ctx, &format!("{P}.switch_mlp.down_proj"));
     let hg = ws.quant_matrix(&ctx, &format!("{P}.shared_expert.gate_proj"));
     let hu = ws.quant_matrix(&ctx, &format!("{P}.shared_expert.up_proj"));
     let hd = ws.quant_matrix(&ctx, &format!("{P}.shared_expert.down_proj"));
@@ -182,9 +182,9 @@ fn sorting_does_not_change_switch_glu() {
     }
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
-    let g = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.gate_proj"));
-    let u = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.up_proj"));
-    let dn = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.down_proj"));
+    let g = ws.linear(&ctx, &format!("{P}.switch_mlp.gate_proj"));
+    let u = ws.linear(&ctx, &format!("{P}.switch_mlp.up_proj"));
+    let dn = ws.linear(&ctx, &format!("{P}.switch_mlp.down_proj"));
     let k = case.meta_usize("top_k");
 
     for t in [24usize] {
@@ -259,7 +259,7 @@ fn debug_gather_qmv_sorted() {
     }
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
-    let up = ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.up_proj"));
+    let up = ws.linear(&ctx, &format!("{P}.switch_mlp.up_proj"));
     let k = case.meta_usize("top_k");
     let n_experts = case.meta_usize("n_experts");
     let t = 24usize;
@@ -274,7 +274,7 @@ fn debug_gather_qmv_sorted() {
     let lhs_u: Vec<u32> = (0..rows as u32).map(|i| i / k as u32).collect();
     let lhs_u = Array::from_slice(&ctx, &lhs_u, &[rows], ornith_rs::array::Dtype::U32);
     let rhs_u = inds.reshape(&[rows]);
-    let y_u = ornith_rs::ops::quantized::gather_qmm_rows(&ctx, &x2, &up, &lhs_u, &rhs_u, false);
+    let y_u = up.gather_matmul(&ctx, &x2, &lhs_u, &rhs_u, false);
 
     // Sorted: gather the rows first, lhs = arange
     let (order, _inv) = ornith_rs::ops::moe::counting_sort_for_test(&ctx, &inds, n_experts);
@@ -284,7 +284,7 @@ fn debug_gather_qmv_sorted() {
     let idx_s = Array::from_slice(&ctx, &idx_s, &[rows], ornith_rs::array::Dtype::U32);
     let lhs_s: Vec<u32> = (0..rows as u32).collect();
     let lhs_s = Array::from_slice(&ctx, &lhs_s, &[rows], ornith_rs::array::Dtype::U32);
-    let y_s = ornith_rs::ops::quantized::gather_qmm_rows(&ctx, &xs, &up, &lhs_s, &idx_s, true);
+    let y_s = up.gather_matmul(&ctx, &xs, &lhs_s, &idx_s, true);
 
     let n = up.out_dims();
     let hu = y_u.to_vec_f32(&ctx);

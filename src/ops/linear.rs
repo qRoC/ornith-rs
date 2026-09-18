@@ -16,7 +16,7 @@
 use crate::array::Array;
 use crate::metal::Context;
 use crate::ops::q4k::{self, Q4kMatrix};
-use crate::ops::quantized::{QuantMatrix, QuantMode, quantized_matmul};
+use crate::ops::quantized::{QuantMatrix, QuantMode, gather_qmm_rows, quantized_matmul};
 
 /// A quantized `[O, I]` matrix that `x @ w.T` can be asked of.
 #[derive(Clone)]
@@ -33,6 +33,36 @@ impl Linear {
         match self {
             Linear::Mlx(q) => quantized_matmul(ctx, x, q),
             Linear::Q4k(q) => q4k::qmv(ctx, x, q),
+        }
+    }
+
+    /// `mx.gather_qmm` at M = 1: one output row per (token, expert) pair,
+    /// reading `x[lhs[r]]` against expert `rhs[r]`.
+    ///
+    /// `sorted` is mlx's hint that the rows are grouped by expert, which lets
+    /// its kernel stream an expert's weights once for a run of rows. The
+    /// k-quant has no such variant, so the flag only reaches the mlx side --
+    /// stated here rather than silently ignored, because the two paths then
+    /// differ in speed and not in result.
+    pub fn gather_matmul(
+        &self,
+        ctx: &Context,
+        x: &Array,
+        lhs_indices: &Array,
+        rhs_indices: &Array,
+        sorted: bool,
+    ) -> Array {
+        match self {
+            Linear::Mlx(q) => gather_qmm_rows(ctx, x, q, lhs_indices, rhs_indices, sorted),
+            Linear::Q4k(q) => crate::ops::q4k::gather_qmv(ctx, x, q, lhs_indices, rhs_indices),
+        }
+    }
+
+    /// Experts for a routed weight, else 1.
+    pub fn num_experts(&self) -> usize {
+        match self {
+            Linear::Mlx(q) => q.num_experts(),
+            Linear::Q4k(q) => q.num_experts(),
         }
     }
 

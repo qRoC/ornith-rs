@@ -107,18 +107,22 @@ template <typename T>
 // shape for *having* a prefill at all -- `Q4K.md` leaves `q4k_qmm_t` for last,
 // and until it exists this is what lets a q4k artifact be measured rather than
 // only benchmarked at M = 1.
+// The body, with every pointer already resolved: the caller decides which
+// expert's weights and which token's activations these are. ggml splits it the
+// same way -- `kernel_mul_mv_id` is a wrapper that offsets `src0` by the
+// expert and `src1` by the token and then calls this.
 template <typename T, short nr0, short NSG>
-[[kernel]] void q4k_qmv(
-    const device uint16_t* qs [[buffer(0)]],
-    const device uint16_t* scales [[buffer(1)]],
-    const device half* dm [[buffer(2)]],
-    const device T* x [[buffer(3)]],
-    device T* out [[buffer(4)]],
-    const constant int& K [[buffer(5)]],
-    const constant int& O [[buffer(6)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    ushort tiisg [[thread_index_in_simdgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+static inline void q4k_qmv_impl(
+    const device uint16_t* qs,
+    const device uint16_t* scales,
+    const device half* dm,
+    const device T* y,
+    device T* dst,
+    int K,
+    int O,
+    int tgx,
+    ushort tiisg,
+    ushort sgitg) {
   constexpr uint16_t kmask1 = 0x3f3f;
   constexpr uint16_t kmask2 = 0x0f0f;
   constexpr uint16_t kmask3 = 0xc0c0;
@@ -129,8 +133,7 @@ template <typename T, short nr0, short NSG>
   const short ir = it % 4; // 0...3
 
   const int nb = K / QK_K;
-  const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
-  const int r1 = int(tgpig.y); // which row of x, i.e. which token
+  const int first_row = (tgx * NSG + sgitg) * nr0;
 
   // Row strides, in each tensor's own unit.
   const int qs_row = nb * Q4K_QS_U16;
@@ -141,7 +144,7 @@ template <typename T, short nr0, short NSG>
   float yh[16];
   float sumf[nr0] = {0.f};
 
-  const device T* y4 = x + (int64_t)r1 * K + ix * QK_K + 64 * iq + 8 * ir;
+  const device T* y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
   uint16_t sc16[4];
   thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
@@ -207,13 +210,76 @@ template <typename T, short nr0, short NSG>
   for (short row = 0; row < nr0 && first_row + row < O; ++row) {
     const float sum_all = simd_sum(sumf[row]);
     if (tiisg == 0) {
-      out[(int64_t)r1 * O + first_row + row] = T(sum_all);
+      dst[first_row + row] = T(sum_all);
     }
   }
 }
 
+// The plain matvec: row `r1` of `x` against the one weight matrix.
+template <typename T, short nr0, short NSG>
+[[kernel]] void q4k_qmv(
+    const device uint16_t* qs [[buffer(0)]],
+    const device uint16_t* scales [[buffer(1)]],
+    const device half* dm [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& O [[buffer(6)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  const int r1 = int(tgpig.y);
+  q4k_qmv_impl<T, nr0, NSG>(
+      qs,
+      scales,
+      dm,
+      x + (int64_t)r1 * K,
+      out + (int64_t)r1 * O,
+      K,
+      O,
+      int(tgpig.x),
+      tiisg,
+      sgitg);
+}
+
+// `kernel_mul_mv_id`: the MoE gather. One output row per (token, expert) pair
+// -- `lhs[r]` says which row of `x` it reads and `rhs[r]` which expert's
+// weights it reads, which is `mx.gather_qmm`'s contract and `SwitchGLU`'s
+// shape. The weights are `[E, O, I]`, so an expert is one stride away in each
+// of the three tensors.
+template <typename T, short nr0, short NSG>
+[[kernel]] void q4k_gather_qmv(
+    const device uint16_t* qs [[buffer(0)]],
+    const device uint16_t* scales [[buffer(1)]],
+    const device half* dm [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& O [[buffer(6)]],
+    const device uint32_t* lhs [[buffer(7)]],
+    const device uint32_t* rhs [[buffer(8)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  const int r = int(tgpig.y);
+  const int64_t nb = K / QK_K;
+  const int64_t e = int64_t(rhs[r]);
+  q4k_qmv_impl<T, nr0, NSG>(
+      qs + e * O * nb * Q4K_QS_U16,
+      scales + e * O * nb * Q4K_SC_U16,
+      dm + e * O * nb * Q4K_DM_F16,
+      x + int64_t(lhs[r]) * K,
+      out + (int64_t)r * O,
+      K,
+      O,
+      int(tgpig.x),
+      tiisg,
+      sgitg);
+}
+
 #define instantiate_q4k(tname, type)                                  \
   instantiate_kernel("q4k_dequantize_" #tname, q4k_dequantize, type)  \
-  instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)
+  instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)          \
+  instantiate_kernel("q4k_gather_qmv_" #tname, q4k_gather_qmv, type, 2, 2)
 
 instantiate_q4k(bfloat16, bfloat16_t) instantiate_q4k(float32, float)
