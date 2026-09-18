@@ -39,12 +39,19 @@ marked unmeasured.
 > **And then weight error turned out not to be the thing that decides.** The
 > fp8-scale family was built and run end to end (`REBUILD.md`, "The other
 > 4.50-bit format"): at 4.50 bits it is +3% weight error against the body and
-> **nine times the KL**, which is the same damage nvfp4 does at +34%. Two
+> read as **nine times the KL**, the same damage nvfp4 does at +34%. Two
 > formats four percentage points apart on this table, indistinguishable where
-> it counts. So the whole table -- this one and the real-weights one above --
-> ranks formats by a quantity that has no demonstrated relationship to the
-> distribution the model ends up with. It explains a result once you have
-> one. It does not choose.
+> it counts.
+>
+> **Phase 5 then halved the force of that, without rescuing the table.** Both
+> "nine times" figures were a maximum over eight contexts of which seven were
+> asleep; on 64 probes the twin pays 1.46x and nvfp4 2.08x, which is the
+> right *order* for once. What does not survive is any use of this table as a
+> chooser: `int4-except-gates` has the lower weight error and the higher
+> median KL, because a coverage change and a format change are not comparable
+> in this currency at all. So the table ranks formats within fixed coverage,
+> by order and never by magnitude. It explains a result once you have one. It
+> does not choose.
 
 Relative RMS weight error against the rate-distortion floor for a Gaussian
 source, which is the best any code can do at that rate:
@@ -81,8 +88,9 @@ Three readings:
 - **The cheap wins looked like the group metadata, not the grid** -- and on
   weight error this measured true, with a condition the synthetic table could
   not express. On the distribution it did not: built and run, the 4.50-bit
-  form of this idea costs nine times the KL for its half bit. See the caveat
-  above and `REBUILD.md`.
+  form of this idea costs 1.46x the KL for its half bit, and loses on 40 of
+  60 probes (it read as nine times before Phase 5 widened the probe set). See
+  the caveat above and `REBUILD.md`.
   Moving from a bf16 scale+bias at g32 to an **fp8 scale+bias at g16** buys
   10% less error on a gaussian and 15-17% on the heavy-tailed columns, at the
   *same* 5.00 bits, because the overhead fp8 frees pays for a group half the
