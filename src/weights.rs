@@ -14,7 +14,7 @@ use std::rc::Rc;
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
 use crate::ops::linear::Linear;
-use crate::ops::q4k::Q4kMatrix;
+use crate::ops::kquant::{KMatrix, QK_K};
 use crate::ops::quantized::{QuantMatrix, QuantMode};
 use crate::safetensors::{SafeTensors, TensorInfo, shards_from_index};
 
@@ -143,9 +143,10 @@ impl WeightStore {
                 "{path} is nvfp4 but the artifact has a {biases_name}; nvfp4 \
                  has no zero point, so this is not the layout mlx produces"
             ),
-            QuantMode::Q4k => panic!(
-                "{path} is q4k, which has no mlx kernel -- load it with \
-                 `q4k_matrix` instead of `quant_matrix`"
+            QuantMode::K(k) => panic!(
+                "{path} is {}, which has no mlx kernel -- load it with \
+                 `kquant_matrix` instead of `quant_matrix`",
+                k.name()
             ),
         }
         // The optional global scale is the other way a quantized module can
@@ -177,12 +178,12 @@ impl WeightStore {
     /// for everything else, which is every module whose mode cannot change.
     pub fn linear(&mut self, ctx: &Context, path: &str) -> Linear {
         match self.quant_config(path).mode {
-            QuantMode::Q4k => Linear::Q4k(self.q4k_matrix(ctx, path)),
+            QuantMode::K(_) => Linear::K(self.kquant_matrix(ctx, path)),
             _ => Linear::Mlx(self.quant_matrix(ctx, path)),
         }
     }
 
-    /// Load `<path>.weight` / `.scales` / `.dm` as one Q4_K matrix.
+    /// Load `<path>.weight` / `.scales` / `.dm` as one k-quantized matrix.
     ///
     /// The three-tensor split is `Q4K.md`'s storage decision: ggml keeps one
     /// packed 144-byte `block_q4_K`, and an artifact that did the same would
@@ -195,31 +196,30 @@ impl WeightStore {
     /// mode here also has; `.dm` is the one new name, and `.biases` must be
     /// absent because Q4_K's minimum lives in the packed 6-bit fields rather
     /// than in a zero-point tensor.
-    pub fn q4k_matrix(&mut self, ctx: &Context, path: &str) -> Q4kMatrix {
+    pub fn kquant_matrix(&mut self, ctx: &Context, path: &str) -> KMatrix {
         let spec = self.quant_config(path);
+        let QuantMode::K(kind) = spec.mode else {
+            panic!("{path} is not a k-quant in config.json's quantization block")
+        };
         assert_eq!(
-            spec.mode,
-            QuantMode::Q4k,
-            "{path} is not q4k in config.json's quantization block"
-        );
-        assert_eq!(
-            spec.group_size,
-            crate::ops::q4k::QK_K,
-            "{path}: q4k's super-block is {} weights, not {}",
-            crate::ops::q4k::QK_K,
+            spec.group_size, QK_K,
+            "{path}: a k-quant's super-block is {QK_K} weights, not {}",
             spec.group_size
         );
         for absent in [format!("{path}.biases"), format!("{path}.global_scale")] {
             assert!(
                 !self.has(&absent),
-                "{path} is q4k but the artifact has a {absent}; the minimum is \
-                 one of the packed 6-bit fields, not a separate tensor"
+                "{path} is {} but the artifact has a {absent}; a k-quant's \
+                 minimum is one of the packed sub-block fields when it has one \
+                 at all, never a separate tensor",
+                kind.name()
             );
         }
-        // `Q4kMatrix::new` checks the three against each other -- dtypes,
-        // block counts, row widths -- so a mismatched set fails at load rather
-        // than being read as garbage once per dispatch.
-        Q4kMatrix::new(
+        // `KMatrix::new` checks the three against each other -- dtypes, block
+        // counts, row widths -- so a mismatched set fails at load rather than
+        // being read as garbage once per dispatch.
+        KMatrix::new(
+            kind,
             self.tensor(ctx, &format!("{path}.weight")),
             self.tensor(ctx, &format!("{path}.scales")),
             self.tensor(ctx, &format!("{path}.dm")),
@@ -355,7 +355,7 @@ mod tests {
                 }
                 // `quant_matrix` refuses a q4k module, so this walk cannot
                 // produce one; `tests/q4k.rs` checks that layout instead.
-                QuantMode::Q4k => unreachable!("quant_matrix rejects q4k"),
+                QuantMode::K(_) => unreachable!("quant_matrix rejects a k-quant"),
             }
         }
     }

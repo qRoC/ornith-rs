@@ -22,7 +22,7 @@
 
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
-use ornith_rs::ops::q4k::{Q4kMatrix, dequantize, gather_qmv, qmv};
+use ornith_rs::ops::kquant::{KMatrix, KQuant, dequantize, gather_qmv, qmv};
 use ornith_rs::refs::{RefCase, compare, refs_root};
 use ornith_rs::weights::WeightStore;
 
@@ -36,8 +36,9 @@ const MATVEC_MAX_REL: f32 = 1e-5;
 /// One term per output, so only the association differs: ~16 float32 ULPs.
 const ONE_HOT_MAX_REL: f32 = 1e-6;
 
-fn matrix(ctx: &Context, case: &RefCase, name: &str) -> Q4kMatrix {
-    Q4kMatrix::new(
+fn matrix(ctx: &Context, case: &RefCase, name: &str) -> KMatrix {
+    KMatrix::new(
+        KQuant::Q4K,
         case.array(ctx, &format!("{name}_qs")),
         case.array(ctx, &format!("{name}_scales")),
         case.array(ctx, &format!("{name}_dm")),
@@ -150,7 +151,7 @@ fn the_loader_reads_the_three_tensors() {
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
     let module = "language_model.model.layers.0.linear_attn.out_proj";
-    let w = ws.q4k_matrix(&ctx, module);
+    let w = ws.kquant_matrix(&ctx, module);
     assert_eq!(
         (w.out_dims(), w.in_dims()),
         (case.meta_usize("head_rows"), case.meta_usize("head_cols"))
@@ -244,7 +245,7 @@ fn the_forged_artifact_reads_back_as_ggml_wrote_it() {
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
     let mut n = 0;
     for (module, want) in mods {
-        let w = ws.q4k_matrix(&ctx, module);
+        let w = ws.kquant_matrix(&ctx, module);
         let got = dequantize(&ctx, &w, Dtype::F32).to_vec_f32(&ctx);
         let want = want.get("digest").and_then(|v| v.as_str()).expect("digest");
         let want = u64::from_str_radix(want.trim_start_matches("0x"), 16).unwrap();
@@ -276,7 +277,8 @@ fn the_routed_gather_picks_the_right_expert() {
         return;
     }
     let ctx = Context::new().unwrap();
-    let w = Q4kMatrix::new(
+    let w = KMatrix::new(
+        KQuant::Q4K,
         case.array(&ctx, "moe_qs"),
         case.array(&ctx, "moe_scales"),
         case.array(&ctx, "moe_dm"),

@@ -23,7 +23,7 @@ use crate::array::{Array, Dtype};
 use crate::metal::Context;
 use crate::ops::linear::Linear;
 
-use super::quantized::{QuantMatrix, gather_qmm_rows, quantized_matmul};
+use super::quantized::{QuantMatrix, quantized_matmul};
 use super::reduce::{sum_last_axis, sum_second_last_axis};
 
 fn tname(d: Dtype) -> &'static str {

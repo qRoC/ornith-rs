@@ -15,7 +15,7 @@
 
 use crate::array::Array;
 use crate::metal::Context;
-use crate::ops::q4k::{self, Q4kMatrix};
+use crate::ops::kquant::{self, KMatrix};
 use crate::ops::quantized::{QuantMatrix, QuantMode, gather_qmm_rows, quantized_matmul};
 
 /// A quantized `[O, I]` matrix that `x @ w.T` can be asked of.
@@ -23,8 +23,8 @@ use crate::ops::quantized::{QuantMatrix, QuantMode, gather_qmm_rows, quantized_m
 pub enum Linear {
     /// One of mlx's modes, held to `max_abs == 0.0` against MLX.
     Mlx(QuantMatrix),
-    /// ggml's Q4_K, held to `max_abs == 0.0` against ggml.
-    Q4k(Q4kMatrix),
+    /// One of ggml's k-quants, held to `max_abs == 0.0` against ggml.
+    K(KMatrix),
 }
 
 impl Linear {
@@ -32,7 +32,7 @@ impl Linear {
     pub fn matmul(&self, ctx: &Context, x: &Array) -> Array {
         match self {
             Linear::Mlx(q) => quantized_matmul(ctx, x, q),
-            Linear::Q4k(q) => q4k::qmv(ctx, x, q),
+            Linear::K(q) => kquant::qmv(ctx, x, q),
         }
     }
 
@@ -54,7 +54,7 @@ impl Linear {
     ) -> Array {
         match self {
             Linear::Mlx(q) => gather_qmm_rows(ctx, x, q, lhs_indices, rhs_indices, sorted),
-            Linear::Q4k(q) => crate::ops::q4k::gather_qmv(ctx, x, q, lhs_indices, rhs_indices),
+            Linear::K(q) => kquant::gather_qmv(ctx, x, q, lhs_indices, rhs_indices),
         }
     }
 
@@ -62,28 +62,28 @@ impl Linear {
     pub fn num_experts(&self) -> usize {
         match self {
             Linear::Mlx(q) => q.num_experts(),
-            Linear::Q4k(q) => q.num_experts(),
+            Linear::K(q) => q.num_experts(),
         }
     }
 
     pub fn out_dims(&self) -> usize {
         match self {
             Linear::Mlx(q) => q.out_dims(),
-            Linear::Q4k(q) => q.out_dims(),
+            Linear::K(q) => q.out_dims(),
         }
     }
 
     pub fn in_dims(&self) -> usize {
         match self {
             Linear::Mlx(q) => q.in_dims(),
-            Linear::Q4k(q) => q.in_dims(),
+            Linear::K(q) => q.in_dims(),
         }
     }
 
     pub fn mode(&self) -> QuantMode {
         match self {
             Linear::Mlx(q) => q.mode,
-            Linear::Q4k(_) => QuantMode::Q4k,
+            Linear::K(q) => QuantMode::K(q.kind),
         }
     }
 
@@ -97,8 +97,8 @@ impl Linear {
     pub fn as_mlx(&self) -> &QuantMatrix {
         match self {
             Linear::Mlx(q) => q,
-            Linear::Q4k(_) => panic!(
-                "this module is q4k; the caller wants mlx's three-tensor \
+            Linear::K(_) => panic!(
+                "this module is a k-quant; the caller wants mlx's three-tensor \
                  affine layout, which a k-quant does not have"
             ),
         }

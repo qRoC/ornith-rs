@@ -39,6 +39,7 @@
 //! `x @ w.T`, which is the layout every linear layer in this model uses.
 
 use crate::array::Array;
+use crate::ops::kquant::KQuant;
 use crate::metal::{Context, Dispatch};
 
 /// Which of mlx's quantization modes a weight is stored in.
@@ -46,10 +47,10 @@ use crate::metal::{Context, Dispatch};
 pub enum QuantMode {
     Affine,
     Nvfp4,
-    /// ggml's Q4_K. Not an mlx mode -- see [`crate::ops::q4k`] -- so it names
-    /// none of the kernels below and is carried here only because
-    /// `config.json` has to say it somewhere.
-    Q4k,
+    /// One of ggml's k-quants. Not an mlx mode -- see
+    /// [`crate::ops::kquant`] -- so it names none of the kernels below and is
+    /// carried here only because `config.json` has to say it somewhere.
+    K(KQuant),
 }
 
 impl QuantMode {
@@ -59,7 +60,8 @@ impl QuantMode {
         match s {
             "affine" => QuantMode::Affine,
             "nvfp4" => QuantMode::Nvfp4,
-            "q4k" => QuantMode::Q4k,
+            "q4k" => QuantMode::K(KQuant::Q4K),
+            "q6k" => QuantMode::K(KQuant::Q6K),
             // mxfp4 and mxfp8 are real mlx modes with real kernels; this port
             // does not instantiate them, so say so rather than fall through to
             // a kernel name that will not resolve.
@@ -78,9 +80,10 @@ impl QuantMode {
             // Every name built from this prefix is one of mlx's, and mlx has
             // no k-quant. A q4k module goes through `ops::q4k` instead, and
             // reaching here means a caller routed it to the wrong family.
-            QuantMode::Q4k => panic!(
-                "q4k is not an mlx mode; route it through ops::q4k, not \
-                 quantized_matmul"
+            QuantMode::K(k) => panic!(
+                "{} is not an mlx mode; route it through ops::kquant, not \
+                 quantized_matmul",
+                k.name()
             ),
         }
     }
@@ -237,7 +240,7 @@ fn qmv_wide_k_lanes(mode: QuantMode) -> usize {
     match mode {
         QuantMode::Affine => 8,
         QuantMode::Nvfp4 => 16,
-        QuantMode::Q4k => panic!("q4k has no qmv_wide; ops::q4k is M = 1 only"),
+        QuantMode::K(_) => panic!("a k-quant has no qmv_wide; ops::kquant is M = 1 only"),
     }
 }
 
