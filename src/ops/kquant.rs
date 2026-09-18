@@ -51,16 +51,144 @@ const NSG: usize = 2;
 const NR0: usize = 2;
 
 /// The gemm tile, from the legacy branch of ggml's `kernel_mul_mm`: 64 output
-/// features by 32 rows, four simdgroups, 128 threads. `kernels/kquant_mm.h`
-/// holds the same numbers and the two must agree.
+/// features by [`mm_rows`] rows, four simdgroups, 128 threads.
+/// `kernels/kquant_mm.h` holds the same numbers and the two must agree.
 const MM_NR0: usize = 64;
-const MM_NR1: usize = 32;
 const MM_NK: usize = 32;
 const MM_THREADS: usize = 128;
+
+/// Rows per tile. ggml's is 32; `ORNITH_KQUANT_TILE_ROWS=16` is the narrow
+/// instantiation, and both are compiled.
+///
+/// The tile does a full tile's work whether the rows are there or not --
+/// `src/bin/kquant_mm.rs` measures its time as flat from M = 1 to 32 -- so the
+/// row count is not a free parameter, it is the tile's cost below a full
+/// batch. It is also what decides how often a routed run of ~64 rows an expert
+/// straddles a tile boundary, and every straddle is one more pass over K.
+static MM_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static MM_ROWS_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn rows_from(var: &str, cell: &std::sync::atomic::AtomicUsize, default: usize) -> usize {
+    use std::sync::atomic::Ordering;
+    match cell.load(Ordering::Relaxed) {
+        0 => {
+            let n = match std::env::var(var).as_deref() {
+                Ok("16") => 16,
+                Ok("32") => 32,
+                Ok("64") => 64,
+                Err(_) => default,
+                Ok(other) => {
+                    panic!("{var}={other}: only 16, 32 and 64 are instantiated")
+                }
+            };
+            cell.store(n, Ordering::Relaxed);
+            n
+        }
+        n => n,
+    }
+}
+
+/// Rows per tile on the **dense** path, `ORNITH_KQUANT_TILE_ROWS`.
+///
+/// The tile's cost is a fixed part plus a part per row -- `src/bin/kquant_mm.rs`
+/// separates them by timing two widths, and the fixed part is 32-60% of a full
+/// 32-row block, because the A side is dequantized once per block whatever the
+/// rows are. So a *wider* tile amortises it, and 64 rows measures 5-7% faster
+/// than 32 at every prefill width. (It is also why the tile's time is flat
+/// from M = 1 to its width: below a full block the fixed part is all there is.)
+pub fn mm_rows() -> usize {
+    rows_from("ORNITH_KQUANT_TILE_ROWS", &MM_ROWS, 64)
+}
+
+/// Rows per tile on the **routed** path.
+///
+/// A different number from the dense one, and not a constant, because the
+/// routed tile pays a second cost: it runs the whole K loop once per maximal
+/// run of one expert inside its own rows, so a tile wider than the runs
+/// straddles boundaries and pays for it. `src/bin/kquant_mm.rs` times that
+/// directly -- at runs of 16 rows a 32-row tile takes 2.1x its aligned time,
+/// and a 64-row tile 1.9x a 32-row one.
+///
+/// So the width follows the average run, which is `rows / experts` -- the same
+/// quantity mlx's own `GatherQMM::eval_gpu` thresholds on. Measured end to
+/// end, GPU seconds on `q6k-full`, two draws each:
+///
+///   prompt   rows an expert   tile 16    tile 32
+///     748          23        **0.77**     0.80
+///    1887          59          1.72     **1.70**
+///    3402          64          3.16     **3.13**
+///
+/// 64 is never the answer here even when the mean run is 64, because the
+/// distribution has short runs in it: `routed = 64` measures 3.43 s against
+/// 3.13 at the same prompt. `ORNITH_KQUANT_TILE_ROWS_ID` pins a width.
+pub fn mm_rows_id(rows: usize, experts: usize) -> usize {
+    match MM_ROWS_ID.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            if let Ok(v) = std::env::var("ORNITH_KQUANT_TILE_ROWS_ID") {
+                let n = rows_from("ORNITH_KQUANT_TILE_ROWS_ID", &MM_ROWS_ID, 32);
+                let _ = v;
+                return n;
+            }
+            if experts > 0 && rows / experts < 32 { 16 } else { 32 }
+        }
+        n => n,
+    }
+}
+
+/// `ORNITH_KQUANT_TILE_HALF=1`: ggml's own tile scalar instead of this port's.
+///
+/// ggml dequantizes into `half` and multiplies half by half; this port
+/// instantiates the same kernel at `float` because a gemm that replaces a
+/// checked kernel owes agreement with it, and eleven significand bits is a
+/// 5e-4 perturbation where reassociation is 2e-6 (`kernels/kquant_mm.h`).
+/// That was a decision taken on a contract and never priced. **Priced now, and
+/// it was free**: 0-4% on every shape, which is inside the measurement. The
+/// flag stays so the next person does not have to ask again.
+pub fn mm_half() -> bool {
+    use std::sync::atomic::Ordering;
+    match MM_HALF.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var("ORNITH_KQUANT_TILE_HALF").as_deref() == Ok("1");
+            MM_HALF.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        n => n == 2,
+    }
+}
+
+static MM_HALF: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_mm_half(on: bool) {
+    MM_HALF.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The kernel-name suffix a width and a scalar produce.
+fn mm_variant(rows: usize) -> String {
+    format!("r{}{}", rows, if mm_half() { "h" } else { "" })
+}
+
+/// Pick the tile width for everything dispatched after this call.
+///
+/// All three widths are compiled, so the A/B runs inside one process -- the
+/// only way to compare two kernels on a machine whose wall clock swings 3x
+/// between sittings while its GPU seconds hold to 1% within one.
+pub fn set_mm_rows(rows: usize) {
+    assert!(matches!(rows, 16 | 32 | 64), "only 16, 32 and 64 are instantiated");
+    MM_ROWS.store(rows, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The same, for the routed tile.
+pub fn set_mm_rows_id(rows: usize) {
+    assert!(matches!(rows, 16 | 32 | 64), "only 16, 32 and 64 are instantiated");
+    MM_ROWS_ID.store(rows, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A tile of A plus a tile of B, both in the float the kernel multiplies in.
-/// The output staging reuses the same allocation and is smaller (64 x 32
+/// The output staging reuses the same allocation and is smaller (64 x rows
 /// floats), so this is the maximum of the two.
-const MM_SHMEM: usize = 4 * (MM_NR0 * MM_NK + MM_NR1 * MM_NK);
+fn mm_shmem(rows: usize) -> usize {
+    4 * (MM_NR0 * MM_NK + rows * MM_NK)
+}
 
 /// Which k-quant a weight is stored in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -310,7 +438,8 @@ pub fn qmm_t(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
     let n = shape.len();
     shape[n - 1] = o;
     let out = Array::empty(ctx, &shape, x.dtype);
-    ctx.kernel(&w.kernel("qmm_t", x.dtype))
+    let rows = mm_rows();
+    ctx.kernel(&w.kernel(&format!("qmm_t_{}", mm_variant(rows)), x.dtype))
         .arr(&w.qs)
         .arr(&w.scales)
         .arr(&w.dm)
@@ -319,8 +448,8 @@ pub fn qmm_t(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
         .bytes(&(k as i32))
         .bytes(&(o as i32))
         .bytes(&(m as i32))
-        .threadgroup_memory(MM_SHMEM, 0)
-        .groups((m.div_ceil(MM_NR1), o.div_ceil(MM_NR0), 1), (MM_THREADS, 1, 1));
+        .threadgroup_memory(mm_shmem(rows), 0)
+        .groups((m.div_ceil(rows), o.div_ceil(MM_NR0), 1), (MM_THREADS, 1, 1));
     out
 }
 
@@ -348,7 +477,12 @@ pub fn gather_qmm_t(
     assert_eq!(lhs_indices.numel(), rows, "{} gather gemm: index arrays disagree", w.kind.name());
 
     let out = Array::empty(ctx, &[rows, o], x.dtype);
-    ctx.kernel(&w.kernel("gather_qmm_t", x.dtype))
+    let tile_rows = mm_rows_id(rows, w.num_experts());
+    assert!(
+        !(mm_half() && tile_rows != 32),
+        "the half scalar is instantiated at 32 rows only"
+    );
+    ctx.kernel(&w.kernel(&format!("gather_qmm_t_{}", mm_variant(tile_rows)), x.dtype))
         .arr(&w.qs)
         .arr(&w.scales)
         .arr(&w.dm)
@@ -359,8 +493,8 @@ pub fn gather_qmm_t(
         .bytes(&(rows as i32))
         .arr(lhs_indices)
         .arr(rhs_indices)
-        .threadgroup_memory(MM_SHMEM, 0)
-        .groups((rows.div_ceil(MM_NR1), o.div_ceil(MM_NR0), 1), (MM_THREADS, 1, 1));
+        .threadgroup_memory(mm_shmem(tile_rows), 0)
+        .groups((rows.div_ceil(tile_rows), o.div_ceil(MM_NR0), 1), (MM_THREADS, 1, 1));
     out
 }
 
@@ -384,11 +518,13 @@ pub fn gather_qmm_t(
 /// not the rows are there -- so the ratio is the mat-vec's linear growth
 /// divided by a constant, and the crossover is where that line passes it.
 ///
-/// **8, which is deliberately the conservative end of 4 to 8.** It is right
-/// for the two widest shapes and leaves the two narrow ones a little on the
-/// mat-vec, and it keeps the speculative verify window (`depth + 1` = 4 rows)
-/// exactly where it was, on a path this change has no business moving.
-const MM_ROW_LIMIT: usize = 8;
+/// **16, and it moved with the tile.** It was 8 when the dense tile was 32
+/// rows wide; a 64-row tile costs 1.7x a 32-row one below a full block, so the
+/// crossover moved with it -- 13 and 14 rows on the two wide shapes, 8 and 9
+/// on the narrow ones. 16 is where the tile wins on all four, which is the
+/// same conservative rule the old 8 was picked by, and it still leaves the
+/// speculative verify window (`depth + 1` = 4 rows) on the mat-vec.
+const MM_ROW_LIMIT: usize = 16;
 
 /// `ORNITH_KQUANT_GEMM=0` sends every shape back through the mat-vec.
 ///

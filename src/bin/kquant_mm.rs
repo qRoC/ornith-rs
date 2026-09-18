@@ -20,7 +20,10 @@
 
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
-use ornith_rs::ops::kquant::{KMatrix, KQuant, QK_K, qmm_t, qmv};
+use ornith_rs::ops::kquant::{
+    KMatrix, KQuant, QK_K, gather_qmm_t, qmm_t, qmv, set_mm_half, set_mm_rows,
+    set_mm_rows_id,
+};
 
 /// `bandwidth.rs`'s timer, with one change that the first run of this file
 /// forced: **`CHAIN` dispatches inside each sync window**.
@@ -75,6 +78,64 @@ fn fake(ctx: &Context, kind: KQuant, o: usize, k: usize) -> KMatrix {
     )
 }
 
+/// A routed weight of `e` experts, and the sorted row lists a prefill produces.
+fn routed(ctx: &Context, kind: KQuant, e: usize, o: usize, k: usize) -> KMatrix {
+    let w = fake(ctx, kind, e * o, k);
+    KMatrix::new(
+        kind,
+        w.qs.reshape(&[e, o, w.qs.shape[1]]),
+        w.scales.reshape(&[e, o, w.scales.shape[1], w.scales.shape[2]]),
+        w.dm.reshape(&[e, o, w.dm.shape[1], w.dm.shape[2]]),
+    )
+}
+
+/// The routed half, which is where the brief's hypothesis lives: a tile walks
+/// its own rows' expert ids and runs the K loop once per maximal run, so a
+/// narrower tile straddles fewer expert boundaries. `switch_glu_sorted` sorts
+/// at every batch of 64 rows or more, and this model routes ~64 rows to an
+/// expert at prefill -- against a 32-row tile that is ~1.5 passes over K on
+/// average, and the question is whether 16's ~1.25 pays for its own overhead.
+fn bench_routed(ctx: &Context, reps: usize) {
+    const K: usize = 2048;
+    const O: usize = 512;
+    println!("routed [{O}, {K}] over 256 experts, sorted rows, run length as at prefill\n");
+    println!(
+        "{:<14} {:>6}  {:>9} {:>9} {:>9} {:>7} {:>7}",
+        "run length", "rows", "tile 32", "tile 16", "tile 64", "16/32", "64/32"
+    );
+    let w = routed(ctx, KQuant::Q4K, 256, O, K);
+    for run in [16usize, 32, 48, 64, 96] {
+        let rows = 2048usize;
+        let x = Array::from_f32_as_bf16(ctx, &vec![0.01f32; rows * K], &[rows, K]);
+        let lhs: Vec<u32> = (0..rows as u32).collect();
+        let rhs: Vec<u32> = (0..rows).map(|r| (r / run) as u32 % 256).collect();
+        let lhs_i = Array::from_slice(ctx, &lhs, &[rows], Dtype::U32);
+        let rhs_i = Array::from_slice(ctx, &rhs, &[rows], Dtype::U32);
+        set_mm_rows_id(32);
+        let t32 = best_of(ctx, reps, || {
+            std::hint::black_box(gather_qmm_t(ctx, &x, &w, &lhs_i, &rhs_i));
+        });
+        set_mm_rows_id(16);
+        let t16 = best_of(ctx, reps, || {
+            std::hint::black_box(gather_qmm_t(ctx, &x, &w, &lhs_i, &rhs_i));
+        });
+        set_mm_rows_id(64);
+        let t64 = best_of(ctx, reps, || {
+            std::hint::black_box(gather_qmm_t(ctx, &x, &w, &lhs_i, &rhs_i));
+        });
+        set_mm_rows_id(32);
+        println!(
+            "{run:<14} {rows:>6}  {:>9.1} {:>9.1} {:>9.1} {:>7.2} {:>7.2}",
+            t32 * 1e6,
+            t16 * 1e6,
+            t64 * 1e6,
+            t16 / t32,
+            t64 / t32
+        );
+    }
+    println!();
+}
+
 fn main() {
     let ctx = Context::new().unwrap();
     // The shapes the two formats are actually used at: `in_proj_qkv` and
@@ -86,11 +147,14 @@ fn main() {
         (KQuant::Q6K, "q_proj      [2048, 2048]", 2048, 2048),
         (KQuant::Q6K, "down_proj   [2048,  512]", 2048, 512),
     ];
-    const MS: [usize; 9] = [1, 2, 4, 6, 8, 12, 16, 32, 64];
+    const MS: [usize; 11] = [1, 2, 4, 6, 8, 12, 16, 32, 64, 128, 256];
     const REPS: usize = 40;
 
-    println!("us per call, best of {REPS} windows of {CHAIN}; ratio < 1 means the tile wins\n");
-    println!("{:<26} {:>4}  {:>9} {:>9} {:>7}", "shape", "M", "mat-vec", "tile", "ratio");
+    println!("us per call, best of {REPS} windows of {CHAIN}; ratio < 1 means that tile wins\n");
+    println!(
+        "{:<26} {:>4}  {:>9} {:>9} {:>9} {:>9} {:>7} {:>7} {:>7}",
+        "shape", "M", "mat-vec", "f 32", "f 16", "f 64", "r32", "r16", "r64"
+    );
     for (kind, name, o, k) in shapes {
         let w = fake(&ctx, kind, o, k);
         for m in MS {
@@ -98,16 +162,34 @@ fn main() {
             let v = best_of(&ctx, REPS, || {
                 std::hint::black_box(qmv(&ctx, &x, &w));
             });
-            let t = best_of(&ctx, REPS, || {
+            // Both widths in one process and interleaved, because two runs an
+            // hour apart on this machine are not a comparison.
+            set_mm_rows(32);
+            let t32 = best_of(&ctx, REPS, || {
                 std::hint::black_box(qmm_t(&ctx, &x, &w));
             });
+            set_mm_rows(16);
+            let t16 = best_of(&ctx, REPS, || {
+                std::hint::black_box(qmm_t(&ctx, &x, &w));
+            });
+            set_mm_rows(64);
+            let t64 = best_of(&ctx, REPS, || {
+                std::hint::black_box(qmm_t(&ctx, &x, &w));
+            });
+            set_mm_rows(32);
+            let _ = set_mm_half;
             println!(
-                "{name:<26} {m:>4}  {:>9.1} {:>9.1} {:>7.2}",
+                "{name:<26} {m:>4}  {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>7.2} {:>7.2} {:>7.2}",
                 v * 1e6,
-                t * 1e6,
-                t / v
+                t32 * 1e6,
+                t16 * 1e6,
+                t64 * 1e6,
+                t32 / v,
+                t16 / v,
+                t64 / t32
             );
         }
         println!();
     }
+    bench_routed(&ctx, REPS);
 }

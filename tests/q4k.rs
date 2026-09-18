@@ -28,7 +28,7 @@
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
 use ornith_rs::ops::kquant::{
-    KMatrix, KQuant, dequantize, gather_qmm_t, gather_qmv, qmm_t, qmv,
+    KMatrix, KQuant, dequantize, gather_qmm_t, gather_qmv, qmm_t, qmv, set_mm_rows,
 };
 use ornith_rs::refs::{RefCase, compare, refs_root};
 use ornith_rs::weights::WeightStore;
@@ -583,4 +583,38 @@ fn the_routed_gemm_does_not_need_sorted_rows() {
     let d = compare(&got, &permuted);
     eprintln!("routed gemm, {n} shuffled rows: {d}");
     assert!(d.max_rel <= MATVEC_MAX_REL, "routed gemm, unsorted: {d}");
+}
+
+/// The three tile widths are one kernel, and they owe each other an answer.
+///
+/// `NR1` is coupled to four other things -- the accumulator count, `lsmb`'s
+/// offset and stride, and the output staging offset -- so a narrower tile is
+/// not a constant edit. The one-hot cases above catch an addressing mistake on
+/// their own; this catches the subtler one, where both widths are
+/// self-consistent and disagree with each other. They may differ only by
+/// summation order, and at 32 against 16 rows over the same K there is not
+/// even any of that: each output element sums the same K terms in the same
+/// eight-wide fragments either way.
+#[test]
+fn the_tile_widths_agree() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    let ctx = Context::new().unwrap();
+    let w = matrix(&ctx, &case, "qkv");
+    let k = w.in_dims();
+    for m in [1usize, 5, 16, 17, 32, 37, 64, 65, 100] {
+        let host: Vec<f32> = (0..m * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 97.0).collect();
+        let x = Array::from_f32_as_bf16(&ctx, &host, &[m, k]);
+        set_mm_rows(32);
+        let a = qmm_t(&ctx, &x, &w).to_vec_f32(&ctx);
+        for rows in [16usize, 64] {
+            set_mm_rows(rows);
+            let b = qmm_t(&ctx, &x, &w).to_vec_f32(&ctx);
+            let d = compare(&b, &a);
+            assert_eq!(
+                d.max_abs, 0.0,
+                "M={m}: the {rows}-row tile differs from the 32-row one: {d}"
+            );
+        }
+        set_mm_rows(32);
+    }
 }

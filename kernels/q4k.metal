@@ -335,8 +335,25 @@ struct Q4KFmt {
   instantiate_kernel("q4k_dequantize_" #tname, q4k_dequantize, type)           \
   instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)                   \
   instantiate_kernel("q4k_gather_qmv_" #tname, q4k_gather_qmv, type, 2, 2)     \
-  instantiate_kernel("q4k_qmm_t_" #tname, kquant_qmm_t, type, Q4KFmt, float)   \
   instantiate_kernel(                                                          \
-      "q4k_gather_qmm_t_" #tname, kquant_gather_qmm_t, type, Q4KFmt, float)
+      "q4k_qmm_t_r32_" #tname, kquant_qmm_t, type, Q4KFmt, float, 32)         \
+  instantiate_kernel(                                                          \
+      "q4k_qmm_t_r32h_" #tname, kquant_qmm_t, type, Q4KFmt, half, 32)         \
+  instantiate_kernel(                                                          \
+      "q4k_gather_qmm_t_r32h_" #tname, kquant_gather_qmm_t, type, Q4KFmt,     \
+      half, 32)                                                                \
+  instantiate_kernel(                                                          \
+      "q4k_qmm_t_r16_" #tname, kquant_qmm_t, type, Q4KFmt, float, 16)         \
+  instantiate_kernel(                                                          \
+      "q4k_qmm_t_r64_" #tname, kquant_qmm_t, type, Q4KFmt, float, 64)         \
+  instantiate_kernel(                                                          \
+      "q4k_gather_qmm_t_r64_" #tname, kquant_gather_qmm_t, type, Q4KFmt,      \
+      float, 64)                                                               \
+  instantiate_kernel(                                                          \
+      "q4k_gather_qmm_t_r32_" #tname, kquant_gather_qmm_t, type, Q4KFmt,      \
+      float, 32)                                                               \
+  instantiate_kernel(                                                          \
+      "q4k_gather_qmm_t_r16_" #tname, kquant_gather_qmm_t, type, Q4KFmt,      \
+      float, 16)
 
 instantiate_q4k(bfloat16, bfloat16_t) instantiate_q4k(float32, float)

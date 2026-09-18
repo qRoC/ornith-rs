@@ -2871,11 +2871,11 @@ loop does, so there is no second kernel to write.
     numbers are ever going to be compared against anything again. `q4k-all`,
     `q6k-all`, `q6k-full` and `int4-head-linattn` are done; `q4k-imatrix` and
     `q4k` (the 91-module first cut) are not.
-  - **The tile is ggml's shape, not a tuned one.** `vendor/accelerated-qwen-3.8`
-    specialises ggml's *mat-vec* for Apple Silicon by moving shape parameters
-    into function constants; nothing here has done the equivalent for the tile,
-    and the flat 98.4 us across M = 1..32 says a narrower tile would help the
-    shapes that cross late.
+  - ~~**The tile is ggml's shape, not a tuned one.**~~ **Phase 23 did it**, and
+    the guess in this item was backwards: flat across M = 1..32 means the
+    fixed per-block cost is a third to three fifths of the time, so the tile
+    wanted to be *wider*, not narrower. 64 rows dense, 16 or 32 routed by
+    `rows / experts`, -1.3% to -4.3% of prefill GPU and byte-identical output.
 
 ---
 
@@ -3367,6 +3367,132 @@ tensors that delivered nothing. **Not built either**, for the same reason.
 `refs/awq-experts/` is kept: 21 MB, and it is the first per-expert statistic
 this rebuild has, which is the part of this phase most likely to be wanted
 again.
+
+---
+
+## Phase 23 -- the tile tuned, and the narrow one was the wrong direction -- **DONE**
+
+Phase 19 built ggml's tile and said what it had not done: "the tile is ggml's
+shape, not a tuned one ... the flat 98.4 us across M = 1..32 says a narrower
+tile would help the shapes that cross late." The flatness is the right
+diagnosis and the conclusion drawn from it is backwards.
+
+### What flat actually means
+
+Time two widths and the tile separates into a fixed part and a part per row:
+
+    shape                     tile 32   tile 16   fixed   per row   fixed share
+    in_proj_qkv [8192, 2048]   100 us     66 us   32 us   2.13 us      32%
+    out_proj    [2048, 4096]    56         38     21      1.09         38%
+    q_proj      [2048, 2048]    31         22     13      0.56         42%
+    down_proj   [2048,  512]    11.5        9.2    6.9     0.14         60%
+
+The fixed part is the A side: 64 weight rows dequantized once per block
+whatever the rows are. Flat from M = 1 to the width is that fixed part being
+*all there is* below a full block -- and above one it is still a third to
+three fifths of the time, paid once per block. **A narrower tile pays it twice
+as often; a wider one halves it.**
+
+### The narrow tile, built and measured
+
+`kquant_mm.h`'s `NR1` is a template parameter now, and 16, 32 and 64 are all
+instantiated. `tests/q4k.rs::the_tile_widths_agree` holds them to `max_abs ==
+0.0` against each other at nine row counts, which is what the coupling needs:
+`NR1` moves the accumulator count, `lsmb`'s offset and stride, the staging
+offset and the B-side thread mapping together.
+
+    M                         1      4      8     16     32     64    256
+    tile 16 / tile 32       0.66   0.67   0.68   0.67   1.26   1.27   1.33
+
+**33% better below 16 rows and 26-33% worse above**, which end to end is
+**7.6% worse** at 3402 prompt tokens. The shapes it helps are not shapes this
+model has: below 16 rows the mat-vec is still better than either tile, and
+above them prefill lives. Kept as an instantiation, not as a default.
+
+### The wide tile, and a 20x cliff that is not about the shape
+
+64 rows is the direction the fixed part points, and the first build of it was
+**12 to 23 times slower**, uniformly, at every shape and width. Not register
+spilling in the sense one would guess from occupancy -- `maxTotalThreadsPerThreadgroup`
+reports 1024 for every one of these kernels. The Metal compiler stops fully
+unrolling the accumulator loop somewhere between 8 and 16 iterations, and an
+array of `simdgroup_matrix` that is indexed dynamically is not in registers at
+all. `#pragma clang loop unroll(full)` on the three `mc` loops takes the
+64-row tile from 2238 us to 179 us.
+
+**Worth recording as a trap rather than a fix**: a shape parameter that
+changes an accumulator count also changes whether the compiler unrolls, and
+the failure mode is a cliff, not a slope. Nothing about the arithmetic
+changed -- the bit-identical test passed at 2238 us and at 179 us alike.
+
+Unrolled, the wide tile does what the decomposition predicts:
+
+    M                        64    128    256
+    tile 64 / tile 32      0.94   0.93   0.94   (in_proj_qkv)
+                           0.95   0.94   0.95   (out_proj)
+                           0.97   0.97   0.94   (q_proj)
+                           0.98   0.98   0.93   (down_proj)
+
+### The routed tile wants a different width, and the quantity is mlx's own
+
+The routed tile runs the K loop once per maximal run of one expert inside its
+own rows, so a tile wider than the runs straddles boundaries. Timed against
+synthetic runs:
+
+    run length              16     32     48     64     96
+    tile 16 / tile 32     0.71   1.35   0.95   1.35   1.29
+    tile 64 / tile 32     1.89   1.89   1.37   0.97   1.30
+
+A 32-row tile takes **2.1x its aligned time** when the runs are 16 long. So
+the width should follow the average run, which is `rows / experts` -- the same
+quantity `GatherQMM::eval_gpu` already thresholds on. End to end, GPU seconds,
+two draws each:
+
+    prompt   rows an expert   routed 16   routed 32   routed 64
+      748          23          **0.77**      0.80
+     1887          59            1.72      **1.70**
+     3402          64            3.16      **3.13**       3.43
+
+**64 is never right even when the mean run is 64**, because the distribution
+has short runs in it. The rule is 16 below 32 rows an expert and 32 above.
+
+### What it bought, and what it did not
+
+Shipped: dense tile 64, routed tile 16 or 32 by `rows / experts`,
+`MM_ROW_LIMIT` 8 -> 16 (a 64-row tile costs 1.7x a 32-row one below a full
+block, so the crossover moved with it). GPU seconds, two draws a cell:
+
+    prompt tokens     q6k-full           q4k-all
+                    before   after     before   after
+       748           0.81     0.78
+      1887           1.73     1.70
+      3402           3.18     3.13      3.09     3.05
+    decode          8.78     8.69  ms/token -- M = 1, untouched by construction
+
+**-4.3% at 748 tokens, -1.7% at 1887, -1.3% at 3402.** Against Phase 19's
+~10% gap to mlx's steel gemm, that closes a small part of it; the rest is not
+in the tile's shape.
+
+### The scalar was free, and nobody had checked
+
+`kquant_mm.h` instantiates the tile at `float` where ggml uses `half`, and
+says why: a gemm replacing a checked kernel owes agreement with it, and eleven
+significand bits is a 5e-4 perturbation where reassociation is 2e-6. That was
+a decision taken on a contract and never priced. Priced now --
+`ORNITH_KQUANT_TILE_HALF=1` instantiates ggml's own scalar -- and it is
+**0 to 4% on every shape**, inside the measurement. So the exactness cost
+nothing, and the flag stays so the question does not have to be asked again.
+
+### And the whole phase is quality-neutral by construction
+
+Not "the sign tests are coin flips", which is what every other kernel change
+in this rebuild has had to settle for. All three widths are bit-identical to
+each other, and the probe capture proves it end to end: 64 probes through
+`q6k-full` on the old tile and the tuned one are the **same 63,569,920 bytes**.
+`cmp`, not a tolerance.
+
+That is the difference between tuning a shape and changing arithmetic, and it
+is the reason Phase 19's instrument question does not reappear here.
 
 ---
 

@@ -289,8 +289,25 @@ struct Q6KFmt {
   instantiate_kernel("q6k_dequantize_" #tname, q6k_dequantize, type)           \
   instantiate_kernel("q6k_qmv_" #tname, q6k_qmv, type, 2, 2)                   \
   instantiate_kernel("q6k_gather_qmv_" #tname, q6k_gather_qmv, type, 2, 2)     \
-  instantiate_kernel("q6k_qmm_t_" #tname, kquant_qmm_t, type, Q6KFmt, float)   \
   instantiate_kernel(                                                          \
-      "q6k_gather_qmm_t_" #tname, kquant_gather_qmm_t, type, Q6KFmt, float)
+      "q6k_qmm_t_r32_" #tname, kquant_qmm_t, type, Q6KFmt, float, 32)         \
+  instantiate_kernel(                                                          \
+      "q6k_qmm_t_r32h_" #tname, kquant_qmm_t, type, Q6KFmt, half, 32)         \
+  instantiate_kernel(                                                          \
+      "q6k_gather_qmm_t_r32h_" #tname, kquant_gather_qmm_t, type, Q6KFmt,     \
+      half, 32)                                                                \
+  instantiate_kernel(                                                          \
+      "q6k_qmm_t_r16_" #tname, kquant_qmm_t, type, Q6KFmt, float, 16)         \
+  instantiate_kernel(                                                          \
+      "q6k_qmm_t_r64_" #tname, kquant_qmm_t, type, Q6KFmt, float, 64)         \
+  instantiate_kernel(                                                          \
+      "q6k_gather_qmm_t_r64_" #tname, kquant_gather_qmm_t, type, Q6KFmt,      \
+      float, 64)                                                               \
+  instantiate_kernel(                                                          \
+      "q6k_gather_qmm_t_r32_" #tname, kquant_gather_qmm_t, type, Q6KFmt,      \
+      float, 32)                                                               \
+  instantiate_kernel(                                                          \
+      "q6k_gather_qmm_t_r16_" #tname, kquant_gather_qmm_t, type, Q6KFmt,      \
+      float, 16)
 
 instantiate_q6k(bfloat16, bfloat16_t) instantiate_q6k(float32, float)

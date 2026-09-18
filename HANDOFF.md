@@ -473,6 +473,10 @@ sitting on a machine whose wall clock swings 3x between sittings:
     ORNITH_AFFINE_GEMM=0    mlx's affine modules take *its* mat-vec at every M
     ORNITH_INVARIANT=1      every batch of <= 4 rows computes row by row
     ORNITH_INVARIANT=all    ... at every M, which is what a capture wants
+    ORNITH_KQUANT_TILE_ROWS=16|32|64       the dense tile's width
+    ORNITH_KQUANT_TILE_ROWS_ID=16|32|64    the routed tile's, which otherwise
+                                           follows `rows / experts`
+    ORNITH_KQUANT_TILE_HALF=1              ggml's `half` tile scalar
 
 The second is the control for the first: it makes the same move on a path
 nobody here wrote, which is how Phase 19 established that a tiled prefill
@@ -485,8 +489,20 @@ it less than mlx's own does.
 through ggml's token axis -- a mat-vec per token, so the weights were re-read
 once each instead of being tiled, which is invisible on a short prompt and not
 on a long one. `kernels/kquant_mm.h` is ggml's `kernel_mul_mm` for both
-formats, and `kquant::MM_ROW_LIMIT` (8, measured) is where the dispatcher
-switches. In GPU seconds, which is the number to read on this machine:
+formats, and `kquant::MM_ROW_LIMIT` (16, measured) is where the dispatcher
+switches.
+
+**Phase 23 then tuned its shape**, which Phase 19 had left as ggml's. The
+tile's width is a template parameter now and three are instantiated: the dense
+path takes 64 rows, the routed path 16 or 32 by `rows / experts`, because a
+routed tile wider than the runs straddles expert boundaries and pays a whole
+pass over K for each. Worth **-4.3% of prefill GPU at 748 prompt tokens, -1.3%
+at 3402**, and the output is *byte-identical* -- all three widths agree at
+`max_abs == 0.0` and 64 probes come back the same 63,569,920 bytes. The guess
+Phase 19 left behind ("a narrower tile would help") was backwards: flat time
+across M = 1..32 means the fixed per-block cost is 32-60% of the total, so the
+tile wanted to be wider. ggml's `half` tile scalar, which this port declined
+for exactness, is priced in the same phase at 0-4%: the exactness was free. In GPU seconds, which is the number to read on this machine:
 
     prompt tokens        affine    q4k-all              q6k-full
                          int4      mat-vec    tile      mat-vec    tile
