@@ -2405,6 +2405,85 @@ it, for the second phase running.
 
 ---
 
+## Phase 16 -- the experts, and the full -7% arrives -- **DONE**
+
+Phase 15 converted the 91 modules `int4-head-linattn` moves to 4 bits and got
+-4.6% of a decode step where `Q4K.md` had advertised -7.3%. The gap was
+coverage: the twin it was compared against re-encoded all 283 four-bit modules,
+and the 96 **routed-expert** ones were out of the first cut because they need a
+gathered kernel. This is that kernel and those modules.
+
+`kernel_mul_mv_id` turns out to be a *wrapper* rather than a kernel -- ggml
+offsets the weights by the expert and the activations by the token and calls
+the matvec already ported -- so the port does the same: the body moved into an
+inline `qmv_impl` and two entry points resolve their own pointers.
+
+**Checked before believed**, as in Phase 15. `check_rebuild.py` PASSes with 187
+q4k modules and the 452/281 split intact; weight error against the parent is
+6.93-8.20%, median 7.33%; and the port's dequantize agrees with ggml's on all
+**187 modules, digest for digest**. The kernel itself is pinned twice over
+eleven routed rows whose experts repeat and whose tokens do not: 2.8e-7 against
+a float64 reference, and **exactly zero** with a one-hot activation, where each
+output row must be one column of one expert.
+
+### What it bought
+
+    artifact              bytes/token   decode      median KL, all 64 probes
+                                        best of 4   median     p90      max
+    int4-head-linattn      2.0761 GB    102.6 t/s   0.0350   0.1933   0.7394
+    gptq-head-linattn      2.0761 GB         --     0.0273   0.2412   1.0122
+    q4k          (91)      1.9814 GB    106.8 t/s   0.0303   0.2113   1.9555
+    q4k-imatrix  (91)      1.9814 GB    104.8 t/s   0.0260   0.2336   1.6524
+    **q4k-all   (187)**    **1.9311 GB** **107.9**  **0.0237** **0.1697** 4.6466
+
+**-7.0% of a decode step and +5.2% of the rate**, which is the number
+`Q4K.md` promised and Phase 15 could not reach. The experts are 0.6669 GB of
+the step after conversion against 0.7172 before.
+
+**And the experts cost nothing measurable in quality: 31 of 64 against
+`q4k-imatrix` is a coin flip.** That is the same verdict Phase 15 reached for
+the first 91 and it is the one that matters -- the bytes are free. Against the
+others, still nothing significant: 36 of 64 over GPTQ (p = 0.38), 39 of 64 over
+the affine int4 it replaces (p = 0.10).
+
+By point estimate `q4k-all` is now the best artifact this rebuild has produced
+on median *and* p90 *and* on the count of probes whose top-1 token moves (6 of
+64, tied with `q4k-imatrix` and better than every affine variant). None of it
+is significant, and the honest headline stays the one Phase 15 wrote: at
+7% fewer bytes and 5% more tokens a second, the quality is where it was.
+
+### The one probe that is not fine
+
+    probe                    q4k-all   q4k-imatrix   int4    gptq
+    arith/ru-7x8              4.6466      0.2470    0.1570  1.0122
+    code/metal-kernel         1.8749      1.6524    0.2890  0.4771
+    everything else            <=0.26
+
+`arith/ru-7x8` is 19x what the same artifact pays without the experts, and it
+is the probe that has broken every fragile format in this rebuild -- nvfp4 paid
+6.64 nats on it, and Phase 5 recorded it as the one context that carried
+Phase 4's whole verdict. Drop it and `q4k-all`'s mean falls from 0.1476 to
+0.0761 and its max to 1.8749, which is `code/metal-kernel`, a probe
+`q4k-imatrix` already pays 1.65 on.
+
+So the tail is **one probe, not a pattern**, and it is the probe most likely to
+show one. What it is not is explained: the experts' own weight error is in line
+with everything else, and the routed kernel is pinned at exactly zero on a
+one-hot. Worth a bisection -- which layer's experts, and whether the router's
+top-k selection moves -- before the artifact is called finished.
+
+### What is left
+
+  - **`qmm_t`**, still. M > 1 is ggml's token axis, a mat-vec per token, and
+    now the experts go through it too: the probe capture is the slowest step of
+    the whole pipeline.
+  - **Q6_K on the 8-bit side**: the kernel is written and pinned
+    (`tests/q6k.rs`, dequantize bit-exact against ggml, one-hot exactly zero),
+    `forge_q4k.py --q6k` selects its 128 of the 169, and the artifact is not
+    built. Expect what this phase found: bytes, and nothing in the probes.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

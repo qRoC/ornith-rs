@@ -375,9 +375,13 @@ that the bytes are real and the prize is not demonstrated.**
 Three corrections to the paragraph above, and the first is the one that
 matters:
 
-- **-4.6%, not -7.3%.** The twin re-encoded all 283 four-bit modules; the
-  kernel's first cut converts the 91. The experts are 0.7172 GB of a step and
-  need `q4k_gather_qmv_fast`, which is where the other 2.7 points are.
+- **-4.6%, not -7.3%** -- for the first cut. The twin re-encoded all 283
+  four-bit modules; that cut converted the 91. **Phase 16 added the 96 routed
+  experts and the number arrived: 1.9311 GB/token, -7.0% of a decode step and
+  +5.2% of the rate, with the experts costing 31 of 64 probes against the same
+  artifact without them, which is a coin flip.** One probe is not fine --
+  `arith/ru-7x8` pays 4.65 nats against 0.25 without the experts -- and it is
+  the probe that has broken every fragile format here.
 - **The quality difference is not measurable.** Rank tests over the 64 probes:
   q4k lower than the affine int4 it replaces on 32 of 64 -- a coin flip --
   and q4k+imatrix lower than GPTQ on 37 of 64, p = 0.26. So *the bytes are
