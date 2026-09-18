@@ -312,12 +312,20 @@ byte has to come from somewhere, it should come from here -- which is what
 this measurement was for, and it is the opposite of `mxfp8`, which sat *off*
 the curve rather than on it.
 
-**AND THAT PARAGRAPH IS WRONG, which Phase 17 measured.** Built, the 8-bit
-side's bytes are the *only* ones that cost anything: `q6k-all` is lower than
-`q4k-all` on 22 of 64 probes, p = 0.017, the first significant comparison this
-instrument has produced -- while the 4-bit side's 187 modules were a coin flip
-across two phases. The per-bit argument is a fifth falsified predictor, and
-the first one this project reasoned out for itself rather than borrowed.
+**AND IT IS POINTED AT THE WRONG STEP, which Phase 17 showed.** Built, the
+8-bit side's bytes are the only ones that cost anything -- `q6k-all` is lower
+than `q4k-all` on 22 of 64 probes, p = 0.017 -- while the 4-bit side's 187
+modules were a coin flip across two phases. The reason is not that the
+arithmetic above is wrong but that the two moves are different in kind:
+
+    the 4-bit side   affine 5.00 bits, 8.45%  ->  Q4_K 4.50 bits, 7.48%
+    the 8-bit side   affine 8.50 bits, 0.74%  ->  Q6_K 6.56 bits, 1.85%
+
+Fewer bits and *less* error on one, fewer bits and 2.5x the error on the
+other. The per-bit table compares two movements down the rate-distortion
+curve; the 4-bit conversion is not on that curve, because a better grid buys
+bytes and accuracy together. Rank steps of the same kind with it, and never a
+grid change against a rate change.
 
 What it does not say is that Q6_K keeps the quality: this is weight error, the
 currency this rebuild has falsified twice as a selector (Phases 4 and 7).

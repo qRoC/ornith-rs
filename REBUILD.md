@@ -2546,7 +2546,8 @@ rather than a typical one.
 
 **22 of 64 is the first significant result this instrument has produced.**
 Every comparison in Phases 15 and 16 was a coin flip; this one is not, and it
-says the last step *hurt*. The whole package is still indistinguishable from
+says the last step *hurt* -- which, once the two steps are set side by side
+below, is the expected answer rather than a surprising one. The whole package is still indistinguishable from
 the artifact that ships -- 36 of 64 against `int4-head-linattn`, at 13% fewer
 bytes -- but the marginal move from `q4k-all` to `q6k-all` is a measured loss
 rather than a free byte.
@@ -2556,19 +2557,34 @@ run, so Bonferroni would put it at 0.068. And it is in the *expected*
 direction -- more quantization, more damage -- so it is a confirmation that
 the instrument can see something rather than a surprise it dug up.
 
-### The prediction it falsifies is this file's own
+### Why one side was free and the other was not, which is not what was written first
 
-`Q4K.md`'s per-bit framing said the 8-bit side was where the next byte should
-come from, because giving up a bit there costs 0.68 error-doublings against
-the 4-bit side's 0.96. The probes invert it: **the 4-bit side's bytes were
-free across two phases and 187 modules, and the 8-bit side's are not.**
+The first version of this section called the per-bit argument a fifth
+falsified predictor. **That was wrong, and the reason is worth more than the
+claim.** The two conversions are not the same kind of move:
 
-That is the fifth static predictor this rebuild has falsified -- after total
-weight error, per-decile weight error, output error on random `x`, and the
-H-weighted error -- and the first that was *this project's own reasoning*
-rather than a borrowed one. The mechanism is not established; what is
-established is that a rate-distortion argument about where bits are cheapest
-does not survive contact with 64 probes any better than a norm does.
+    the 4-bit side   affine int4 g32   5.00 bits   8.45%  ->  Q4_K  4.50 bits  7.48%
+    the 8-bit side   affine int8 g64   8.50 bits   0.74%  ->  Q6_K  6.56 bits  1.85%
+
+**Fewer bits and *less* error on one; fewer bits and 2.5x the error on the
+other.** The 4-bit step was never a trade -- Q4_K is a better grid than affine
+int4, so it bought bytes and accuracy at once, which is the whole reason a
+k-quant is interesting. The 8-bit step is an ordinary purchase along the
+rate-distortion curve.
+
+`Q4K.md`'s per-bit arithmetic compared two movements *down that curve*
+(8.50 -> 6.5625 at 0.68 doublings a bit, 6.5625 -> 4.50 at 0.96) and then
+applied the ranking to a step that was not on the curve at all: affine 5.00 ->
+Q4_K 4.50 is **-0.27** doublings a bit, because the error falls. So the
+argument was not refuted by the probes; it was pointed at the wrong step, by
+this file, and the probes did what they should -- the free lunch measured
+free, and the purchase measured like a purchase.
+
+What that does *not* license is rehabilitating weight error as a selector.
+Phase 15 stands: at fixed coverage it ranked Q4_K above affine int4 on four
+separate measures and the probes said level. What these two steps show is only
+that the *sign* of a large weight-error change carried through, which is a
+much weaker claim than ranking two formats that differ by a point.
 
 ### The shape of the trade is not uniform
 
