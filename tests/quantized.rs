@@ -16,6 +16,15 @@ const ROWS: [usize; 7] = [1, 2, 4, 8, 16, 64, 256];
 
 #[test]
 fn matches_mlx_bit_for_bit() {
+    // **With `ops::invariant` off, and that is the point of the test.** The
+    // window mode is on by default and is a deliberate departure: it makes a
+    // 2..4-row batch compute row by row where mlx shares one weight read
+    // across five. This case pins the *mlx* dispatch, so it asks for the path
+    // that has not departed -- `tests/batch_invariance.rs` owns the other one.
+    ornith_rs::ops::invariant::with(false, matches_mlx_bit_for_bit_inner)
+}
+
+fn matches_mlx_bit_for_bit_inner() {
     let Some(case) = RefCase::open_or_skip("quantized_matmul") else { return };
     let dir = model_dir();
     if !dir.exists() {

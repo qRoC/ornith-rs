@@ -3210,6 +3210,37 @@ rebuild was ever outside it.
   - **The MTP head is not covered and does not need to be.** Its arithmetic
     decides which drafts are proposed, not which are accepted.
 
+### The default, taken 2026-09-19
+
+**The window mode is on by default now**, and the argument that decided it is
+not the one this phase was built on. By Phase 26 the shipped configuration is
+`--mtp-depth 1 --frspec`, where the verify window is two rows and the flag is
+worth *one point* of acceptance (0.72 -> 0.73) and nothing on the clock
+(7.22/7.31 against 7.43/7.31 ms of GPU). What it is worth is the property:
+without it `--mtp --greedy` silently prints something other than `--greedy`,
+and `src/frspec.rs`'s own argument for why a draft cannot change what the model
+emits is true of the draft and **false of the target**, whose arithmetic moves
+with the window. A port whose contract is `max_abs == 0.0` should not ship the
+side of that where the two disagree.
+
+**Scoped by call site, not by width, and that is what makes it free.** A
+five-token prompt prefills four rows, so a width rule would have changed the
+arithmetic of short prompts for nothing. `generate::prefill` runs inside
+`invariant::without_window`, so a prefill chunk is never invariant and `all`
+passes through untouched. Three checks, all byte-for-byte:
+
+    --mtp --greedy against --greedy, depth 1 and depth 3   identical
+    a five-token prompt, default against ORNITH_INVARIANT=0  identical
+    64 probes through q6k-full, before the flip and after    identical
+
+So the blast radius is exactly the speculative path.
+
+**And it makes the test suite say where the departure is**, which is the part
+worth keeping. Four cases pin *mlx's* or MTPLX's dispatch rather than this
+port's -- `quantized.rs`, `quantized_nvfp4.rs` and two in `mtp.rs` -- and they
+now ask for the undeparted path explicitly, with the reason written where they
+ask. `ORNITH_INVARIANT=0` is that path.
+
 ---
 
 ## Phase 22 -- AWQ on the experts, priced on the right object and rejected -- **DONE**

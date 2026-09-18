@@ -38,6 +38,12 @@ fn matrix(case: &RefCase, ctx: &Context, tag: &str) -> QuantMatrix {
 
 #[test]
 fn matmul_matches_mlx_bit_for_bit() {
+    // Off, for the reason `tests/quantized.rs` gives: this pins mlx's dispatch
+    // and the window mode is a deliberate departure from it at 2..4 rows.
+    ornith_rs::ops::invariant::with(false, matmul_matches_mlx_bit_for_bit_inner)
+}
+
+fn matmul_matches_mlx_bit_for_bit_inner() {
     let Some(case) = RefCase::open_or_skip("quantized_matmul_nvfp4") else { return };
     let ctx = Context::new().unwrap();
 

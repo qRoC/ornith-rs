@@ -25,6 +25,12 @@ fn check(case: &RefCase, ctx: &Context, name: &str, got: &Array) {
 #[test]
 #[ignore = "loads the trunk and the 1.7 GB MTP sidecar; run with --ignored"]
 fn head_matches_mtplx() {
+    // MTPLX computed these references with its own window forward, so they pin
+    // the undeparted path -- see `tests/quantized.rs` for the argument.
+    ornith_rs::ops::invariant::with(false, head_matches_mtplx_inner)
+}
+
+fn head_matches_mtplx_inner() {
     let Some(case) = RefCase::open_or_skip("mtp") else { return };
     let dir = model_dir();
     if !dir.exists() {
@@ -171,6 +177,12 @@ fn head_matches_mtplx() {
 #[test]
 #[ignore = "loads the whole model; run with --ignored"]
 fn capture_matches_the_packed_forward() {
+    // Both arms of this are window forwards against MTPLX's own, so it pins the
+    // undeparted path -- see `tests/quantized.rs`.
+    ornith_rs::ops::invariant::with(false, capture_matches_the_packed_forward_inner)
+}
+
+fn capture_matches_the_packed_forward_inner() {
     let Some(case) = RefCase::open_or_skip("mtp") else { return };
     let dir = model_dir();
     if !dir.exists() {
@@ -347,6 +359,14 @@ fn speculative_tracks_autoregressive() {
 #[test]
 #[ignore = "loads the whole model; run with --ignored"]
 fn window_and_steps_both_match_mlx() {
+    // Off, for `tests/quantized.rs`'s reason: this pins both of *mlx's*
+    // answers, and the window mode deliberately computes a third thing -- the
+    // one the single-step path would have given. That the two mlx answers
+    // differ at all is what the window mode exists to fix.
+    ornith_rs::ops::invariant::with(false, window_and_steps_both_match_mlx_inner)
+}
+
+fn window_and_steps_both_match_mlx_inner() {
     let Some(case) = RefCase::open_or_skip("mtp") else { return };
     let dir = model_dir();
     if !dir.exists() {

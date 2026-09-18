@@ -93,6 +93,24 @@ pub fn prefill(
     caches: &mut [LayerCache],
     prompt: &[u32],
     prefill_step_size: usize,
+    splice: Option<&mut VisionSplice>,
+    progress: impl FnMut(usize, usize),
+) -> usize {
+    crate::ops::invariant::without_window(|| {
+        prefill_inner(ctx, model, caches, prompt, prefill_step_size, splice, progress)
+    })
+}
+
+/// The loop itself. Separate only so that the whole of it sits inside
+/// `without_window`: a prefill chunk is not a batch of rows that would
+/// otherwise have run alone, and a five-token prompt's is four rows wide.
+#[allow(clippy::too_many_arguments)]
+fn prefill_inner(
+    ctx: &Context,
+    model: &TextModel,
+    caches: &mut [LayerCache],
+    prompt: &[u32],
+    prefill_step_size: usize,
     mut splice: Option<&mut VisionSplice>,
     mut progress: impl FnMut(usize, usize),
 ) -> usize {

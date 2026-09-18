@@ -35,11 +35,20 @@
 //! prefill it is the mat-vec prefill `Q4K.md` Phase 19 replaced.
 //!
 //! **Two settings, because a prefill chunk is not a batch of rows that would
-//! otherwise have run alone.** `ORNITH_INVARIANT=1` covers batches up to
+//! otherwise have run alone.** The window mode covers batches up to
 //! [`EXACT_WINDOW`] rows -- every width a decode step or a depth-3 verify
-//! produces -- and leaves a prefill on the tile Phase 19 built, so the mode
-//! costs nothing at a long prompt. `ORNITH_INVARIANT=all` covers every M,
-//! which is what the probe captures want and what makes them expensive.
+//! produces -- and [`without_window`] takes a prefill out of it by call site
+//! rather than by width, because a five-token prompt prefills four rows and is
+//! not a batch of rows that would have run alone.
+//! `ORNITH_INVARIANT=all` covers every M, which is what the probe captures
+//! want and what makes them expensive.
+//!
+//! **The window mode is the default**, and it was not always: it is on because
+//! without it `--mtp --greedy` silently prints something other than `--greedy`,
+//! and this file's own argument for why a draft cannot change what the model
+//! emits is true of the draft and false of the *target*, whose arithmetic
+//! moves with the window. `ORNITH_INVARIANT=0` is the way back to what mlx
+//! dispatches, which is what every test that pins mlx-equivalence asks for.
 //!
 //! [`set`] moves it at runtime, which is how an A/B runs inside one process --
 //! the only way to compare two kernels on a machine whose wall clock swings 3x
@@ -67,9 +76,9 @@ fn rows() -> usize {
     match ROWS.load(Ordering::Relaxed) {
         UNREAD => {
             let n = match std::env::var("ORNITH_INVARIANT").as_deref() {
-                Ok("1") => EXACT_WINDOW,
+                Ok("1") | Err(_) => EXACT_WINDOW,
                 Ok("all") => usize::MAX - 1,
-                Ok("0") | Err(_) => 0,
+                Ok("0") => 0,
                 Ok(other) => panic!(
                     "ORNITH_INVARIANT={other}: expected 1 (a verify window) or \
                      all (every M, which is what a probe capture wants)"
@@ -112,6 +121,28 @@ pub fn set_rows(n: usize) {
 pub fn with<T>(on: bool, f: impl FnOnce() -> T) -> T {
     let was = rows();
     set(on);
+    let out = f();
+    ROWS.store(was, Ordering::Relaxed);
+    out
+}
+
+/// Run `f` with the *window* mode suspended, leaving `all` alone.
+///
+/// The window mode's contract is about rows that would otherwise have been
+/// computed one at a time, and the dispatcher cannot tell those from a prefill
+/// chunk that happens to be narrow -- a five-token prompt prefills four rows.
+/// The caller can, so the caller says so: `generate::prefill` runs inside this
+/// and everything after it does not. That keeps the blast radius of the
+/// default at exactly the speculative path.
+///
+/// `all` is the capture mode and means every M including a prefill's, so it
+/// passes through untouched.
+pub fn without_window<T>(f: impl FnOnce() -> T) -> T {
+    if all() {
+        return f();
+    }
+    let was = rows();
+    set(false);
     let out = f();
     ROWS.store(was, Ordering::Relaxed);
     out

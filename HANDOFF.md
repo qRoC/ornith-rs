@@ -471,8 +471,10 @@ sitting on a machine whose wall clock swings 3x between sittings:
 
     ORNITH_KQUANT_GEMM=0    k-quants take the mat-vec at every M
     ORNITH_AFFINE_GEMM=0    mlx's affine modules take *its* mat-vec at every M
-    ORNITH_INVARIANT=1      every batch of <= 4 rows computes row by row
-    ORNITH_INVARIANT=all    ... at every M, which is what a capture wants
+    ORNITH_INVARIANT=0      *off*; the window mode is the default, and this
+                            is the way back to what mlx dispatches
+    ORNITH_INVARIANT=all    every M, not just a verify window's rows, which is
+                            what a probe capture wants
     ORNITH_KQUANT_TILE_ROWS=16|32|64       the dense tile's width
     ORNITH_KQUANT_TILE_ROWS_ID=16|32|64    the routed tile's, which otherwise
                                            follows `rows / experts`
@@ -941,7 +943,7 @@ against shrank. That also names the largest remaining lever in this file -- the
 MTP head is the only part of the artifact still at bfloat16 that a decode step
 reads every cycle.
 
-### How exact it is: exactly, under `ORNITH_INVARIANT=1`
+### How exact it is: exactly, and it is the default
 
 The acceptance rule and the rewind were always exact. The output was not, and
 the reason was the batching: the verify forward runs `depth + 1` tokens at
@@ -958,8 +960,10 @@ tree the whole time** -- `models/quantized_verifier.py`,
 `singleton_quantized_linear`, "fuse a runtime-sized batch while retaining
 singleton qmv arithmetic". The window's rows do not have to be batched
 arithmetic; they only have to be batched *dispatch*. `ops::invariant` makes
-every batch of at most four rows compute row by row, `REBUILD.md` Phase 21 has
-the whole measurement, and the headline is:
+every batch of at most four rows compute row by row -- **on by default since
+2026-09-19**, scoped out of prefill by call site so that its blast radius is
+exactly the speculative path, and `ORNITH_INVARIANT=0` is the way back.
+`REBUILD.md` Phase 21 has the whole measurement, and the headline is:
 
   - `speculative_tracks_autoregressive` went from **36 of 214** tokens agreed
     to **221 of 221**;
