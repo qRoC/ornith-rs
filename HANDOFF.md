@@ -188,7 +188,12 @@ src/mtp_generate.rs        the MTP draft/verify loop
 src/frspec.rs              the pruned draft head (FR-Spec)
 src/main.rs                the console chat
 src/refs.rs                golden-reference reader
+src/bin/probes.rs          the 64 probe contexts, captured from the port --
+                           the instrument for artifacts mlx cannot load
 tools/dump_*.py            golden-reference writers (run against MLX)
+tools/export_probes.py     probe_set.py -> refs/probe_set.json, for the port
+tools/probes_from_logits.py  the port's logits -> probes.bin, and the
+                           port-against-mlx check that says it may stand in
 tools/epoch_schedule.py    how few barrier epochs a step's dependencies allow
 M5.md                      what changes on a GPU where nax_available() is true
 REBUILD.md                 rebuilding the artifact from its bf16 parent
@@ -317,6 +322,77 @@ gather, with `got 0 want -0.287`.
 `sync` now keeps the last buffer `flush` committed and waits on that when
 nothing is open. The queue is serial, so waiting on the newest buffer means
 every earlier one has completed too.
+
+### The divergence the probe set found, and it is not a bug
+
+Every test here asserts `max_abs == 0.0`, and every one of them passes. Run
+the port over the *64 probe contexts* instead -- `src/bin/probes.rs`, below --
+and **58 of 64 come back bit-identical to mlx and six do not.** Worth
+following, because the answer says something about what bit-exactness can
+mean at all.
+
+The six are `arith/ar-2p2`, `script/el-capital`, `script/hi-capital`,
+`morph/ru-prep`, `longrange/password` and `format/sql-order`. They share no
+length (8 to 395 tokens) and no shape. Everything cheap was excluded first:
+
+- **Not the tokenizer.** All 64 probes encode to identical ids against
+  `mlx_lm`'s tokenizer, not merely identical counts.
+- **Not nondeterminism.** `dump_probes.py` run twice on the same artifact is
+  bit-identical (`max_abs == 0`, 64 of 64 rows), and so is the port. Both
+  sides are reproducible; they reproduce different numbers.
+- **Not the compile flags.** Rebuilt without `-fmetal-math-mode=safe
+  -fmetal-math-fp32-functions=precise` and again without `-std=metal4.0` --
+  mlx's precompiled metallib is built with neither. The divergent element does
+  not move.
+
+`ORNITH_MODEL_PROMPT` makes `dump_model.py` dump the probe's own walk, and
+`ORNITH_MODEL_LAYERS=all` keeps all forty layers instead of the frozen eight,
+so `tests/model.rs` bisects it. On `morph/ru-prep`: layers 0-14 are exact,
+**layer 15 -- a full-attention layer -- differs in 1196 of 14336 elements,
+all of them in the last of the seven token rows.** Inside it, `q @ k^T`
+differs in exactly **one of 784 scores**: query row 6 against key 0 of kv head
+1, where mlx has 9.375 and the port has 9.3125. Those are adjacent bfloat16
+values.
+
+The dot product in float64 is **9.343749961815774**, and the midpoint between
+those two neighbours is **9.34375**. The true value sits 3.8e-8 *below* a
+rounding tie. mlx's float32 accumulator lands exactly on the tie and rounds to
+even, which is up; the port's lands one float32 ULP below it and rounds down,
+which is what the exact value does. **On this element the port is the more
+accurate of the two**, which is not a defence of anything -- it is the point.
+Two correct implementations of the same gemm, differing by one float32 ULP in
+the accumulation order, cannot agree on a value this close to a tie. The same
+kernel source compiled by a different toolchain is enough, and the runtime
+here is mlx **0.32.2** against `vendor/mlx` at **0.32.3**.
+
+What it costs, and this is the number that matters: that one ULP passes
+through 25 more layers and comes out as **0.98 in a log-probability** and
+**3.8e-3 nats of KL** on the worst of the six probes, and a different top-1
+token on one probe of 64. What it does *not* cost is a verdict -- against the
+bf16 parent the port's capture of `gptq-head-linattn` gives median 0.0297,
+p90 0.2491, max 1.0122, which is mlx's own capture to four decimals.
+
+So `max_abs == 0.0` against mlx remains the right contract for an op on fixed
+inputs, and it is not available for a 40-layer forward over arbitrary text.
+Between the two sits a band -- six probes in 64, a thousandth of a nat -- that
+is a property of bfloat16 and the toolchain rather than of this port.
+
+### Capturing the probe set from the port
+
+```
+cd tools && python3 export_probes.py              # probe_set.py -> refs/probe_set.json
+ORNITH_MODEL=<artifact> ORNITH_PROBES_OUT=refs/artifact/<capture> \
+  cargo run --release --bin probes                # logits.bin + logits.json
+python3 tools/probes_from_logits.py refs/artifact/<capture> [<mlx capture>]
+```
+
+`Q4K.md` needs this: an artifact in a mode mlx has no quantization mode for
+cannot be loaded by `mlx_lm.load`, so `dump_probes.py` stops working exactly
+when the format under test is the interesting one. The port runs it. The
+capture writes raw logits and leaves `lp = logits - mx.logsumexp(logits)` to
+mlx, so the one arithmetic step outside the model is the same code on both
+sides. With a second argument the last step also reports `max_abs` against an
+mlx capture, which is how the paragraph above was measured.
 
 ---
 

@@ -15,8 +15,6 @@ use ornith_rs::ops::quantized::quantized_matmul;
 use ornith_rs::refs::{RefCase, compare, model_dir};
 use ornith_rs::weights::WeightStore;
 
-const DUMPED_LAYERS: [usize; 8] = [0, 1, 2, 3, 4, 7, 8, 39];
-
 #[test]
 #[ignore = "loads the whole 28 GB model; run with --ignored"]
 fn full_forward_matches_mlx() {
@@ -68,7 +66,9 @@ fn check_pass(
 
     for (i, layer) in model.layers.iter().enumerate() {
         h = layer.forward(ctx, &model.cfg, &h, &mut caches[i]);
-        if DUMPED_LAYERS.contains(&i) {
+        // Whichever layers the reference holds: eight in the frozen case,
+        // all forty when `dump_model.py` is asked to bisect a divergence.
+        if case.has(&format!("{tag}_layer{i}")) {
             check(case, ctx, &format!("{tag}_layer{i}"), &h);
         }
     }

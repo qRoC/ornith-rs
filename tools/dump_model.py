@@ -12,12 +12,26 @@ fused vs unfused attention split at query length 8, the MoE sort threshold at
 kernel at T and at 1.
 """
 
+import os
+
 import mlx.core as mx
 
 import ref
 
 T = 24
 DECODE_STEPS = 3
+
+# The default case is the golden reference `tests/model.rs` reads, and it is
+# frozen. `ORNITH_MODEL_PROMPT` dumps the same walk over another text instead:
+# the prompt's own tokens, all but the last as the prefill and the last as the
+# one decode step -- which is exactly the path `dump_probes.py` puts a probe
+# through, so a probe that disagrees between mlx and the port can be bisected
+# layer by layer with the test that already exists.
+PROMPT = os.environ.get("ORNITH_MODEL_PROMPT")
+# The frozen case keeps eight layers -- enough to bracket each layer kind.
+# `ORNITH_MODEL_LAYERS=all` keeps every one, which is what finds *which* layer
+# a divergence starts in.
+ALL_LAYERS = os.environ.get("ORNITH_MODEL_LAYERS") == "all"
 
 
 def main():
@@ -30,12 +44,24 @@ def main():
     case = ref.Case("model")
     mx.random.seed(5)
 
-    prompt = "The capital of France is Paris, and the capital of Japan is"
-    ids = mx.array(tokenizer.encode(prompt))[None, :T]
-    if ids.shape[1] < T:
-        ids = mx.concatenate([ids, mx.zeros((1, T - ids.shape[1]), dtype=ids.dtype)], axis=1)
+    prompt = PROMPT or "The capital of France is Paris, and the capital of Japan is"
+    if PROMPT:
+        # `dump_probes.py`'s call, and the probe's own path: every token is the
+        # prompt's, and the last one is the step that produces the logits --
+        # no padding, no argmax continuation.
+        encoded = tokenizer.encode(prompt, add_special_tokens=False)
+        ids = mx.array(encoded)[None, :-1]
+        forced = [encoded[-1]]
+    else:
+        # The frozen case, unchanged: the reference in `refs/model` was written
+        # by this branch and nothing here may move it.
+        ids = mx.array(tokenizer.encode(prompt))[None, :T]
+        forced = None
+        if ids.shape[1] < T:
+            ids = mx.concatenate([ids, mx.zeros((1, T - ids.shape[1]), dtype=ids.dtype)], axis=1)
     case.put("ids", ids.astype(mx.uint32))
-    case.note(n_layers=len(inner.layers), seq=int(ids.shape[1]), decode_steps=DECODE_STEPS)
+    steps = len(forced) if forced else DECODE_STEPS
+    case.note(n_layers=len(inner.layers), seq=int(ids.shape[1]), decode_steps=steps)
 
     cache = lm.make_cache()
 
@@ -51,7 +77,7 @@ def main():
             h = layer(h, mask=mask, cache=c)
             # Dumping all 40 would be 40 x seq x 2048; keep the ones that
             # bracket each layer kind plus the last.
-            if i in (0, 1, 2, 3, 4, 7, 8, 39):
+            if ALL_LAYERS or i in (0, 1, 2, 3, 4, 7, 8, 39):
                 case.put(f"{tag}_layer{i}", h)
         pre_norm = h
         h = inner.norm(h)
@@ -63,7 +89,9 @@ def main():
 
     logits = run("prefill", ids)
     tok = mx.argmax(logits[:, -1, :], axis=-1)
-    for step in range(DECODE_STEPS):
+    for step in range(steps):
+        if forced:
+            tok = mx.array([forced[step]])
         case.put(f"decode{step}_id", tok.astype(mx.uint32))
         logits = run(f"decode{step}", tok[:, None])
         tok = mx.argmax(logits[:, -1, :], axis=-1)

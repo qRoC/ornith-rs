@@ -54,6 +54,15 @@ impl RefCase {
             .unwrap_or_else(|| panic!("meta.{dotted} missing"))
     }
 
+    /// Whether the reference carries this tensor.
+    ///
+    /// `dump_model.py` can be asked for every layer instead of the eight the
+    /// frozen case holds, and a test that checks whatever is there needs no
+    /// second list to keep in step with the dumper's.
+    pub fn has(&self, name: &str) -> bool {
+        self.manifest.path(&format!("tensors.{name}")).is_some()
+    }
+
     pub fn get(&self, name: &str) -> RefTensor {
         let t = self
             .manifest

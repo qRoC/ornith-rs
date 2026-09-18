@@ -210,9 +210,34 @@ kernel, not after.**
 
 - **No mlx change.** The artifact carries a mode mlx does not know, so
   `mlx_lm` cannot load it -- which costs the *MLX* oracle and nothing else. The
-  golden tests for every other op are untouched, and `dump_probes.py` will need
-  a port-side equivalent to capture distributions. That is the real hidden cost
-  of this phase and it should be priced before step 3, not after.
+  golden tests for every other op are untouched, and `dump_probes.py` needs a
+  port-side equivalent to capture distributions. That is the real hidden cost
+  of this phase and it was to be priced before step 3.
+
+  **PRICED, 2026-09-18, and it is small.** Three files, ~250 lines:
+  `tools/export_probes.py` writes the set the port reads, `src/bin/probes.rs`
+  runs the 64 contexts through the port at `dump_probes.py`'s own chunk width
+  and writes raw logits, and `tools/probes_from_logits.py` applies mlx's
+  `logsumexp` to them and emits an ordinary `probes.bin`. The normalisation is
+  left to mlx deliberately: the port is then only ever asked for the thing it
+  is bit-exact at, and `compare_probes.py` reads the result without knowing
+  which instrument produced it.
+
+  **And it was checked rather than assumed.** Run against an artifact mlx
+  *can* load, the port's capture is bit-identical on **58 of 64 probes**. The
+  other six are a bfloat16 rounding tie in one attention dot product -- see
+  HANDOFF's "The divergence the probe set found" for the bisection; it is a
+  toolchain difference, not a port bug, and it survives every flag tested.
+  What it does to a verdict is nothing:
+
+        KL(parent || gptq-head-linattn)   median      p90      max
+        captured by mlx                   0.0297   0.2491   1.0122
+        captured by the port              0.0297   0.2491   1.0122
+        captured by mlx again             0.0297   0.2491   1.0122
+
+  So the instrument transfers, the hidden cost is an afternoon rather than a
+  phase, and **it is cheaper than the kernel it was blocking.** Proceed to
+  step 3.
 - **No change to `gptq.py`'s grid logic** for a first cut. GPTQ and the format
   are orthogonal; combine them only once the kernel is measured alone.
 
