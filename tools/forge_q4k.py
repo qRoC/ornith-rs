@@ -286,13 +286,13 @@ def main():
             tensors[f"{mod}.dm"] = mx.array(dm)
             tm.append(time.time())
             del w, qs, scales, dm
-            # No `mx.clear_cache()` here, and that is a measured decision
-            # rather than an omission: adding one took the loop from 13 s a
-            # module to over twelve minutes. The per-module timings below stay
-            # flat while the wall clock does not, which is what says the cost
-            # is outside the work -- releasing ~1 GB of device buffers and
-            # re-acquiring them, on a machine whose swap is full, is page
-            # faults rather than housekeeping.
+            # No `mx.clear_cache()` here, and it is not needed: the loop runs
+            # at the quantizer's own throughput -- 10 modules in 131 s against
+            # 128.5 s of `quantize_q4_K` summed -- so there is nothing outside
+            # the work to reclaim. (A version of this file had one, on a
+            # suspicion of buffer-cache growth that the timings below do not
+            # support. The suspicion came from reading wall clock badly, which
+            # is why the timings are printed at all.)
             done += 1
             d = [tm[i + 1] - tm[i] for i in range(len(tm) - 1)]
             print(f"  [{done:3d}/{len(convert)}] {mod}"
