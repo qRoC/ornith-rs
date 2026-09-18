@@ -1,0 +1,654 @@
+{
+ "model_dir": "/Users/qroc/.mtplx/models/ornith-1.5-35b-a3b-int4-head-linattn",
+ "probes": {
+  "file": "probes.bin",
+  "dtype": "float32",
+  "shape": [
+   64,
+   248320
+  ],
+  "chunk": 128
+ },
+ "set": [
+  {
+   "group": "arith",
+   "id": "ru-2x2",
+   "text": "Дважды два равно",
+   "tokens": 5,
+   "entropy": 3.5887670516967773,
+   "top1_p": 0.4646686017513275,
+   "top1_id": 174669,
+   "top1_text": " четыре"
+  },
+  {
+   "group": "arith",
+   "id": "ru-3x3",
+   "text": "Трижды три равно",
+   "tokens": 5,
+   "entropy": 3.4978222846984863,
+   "top1_p": 0.29520952701568604,
+   "top1_id": 150822,
+   "top1_text": " дев"
+  },
+  {
+   "group": "arith",
+   "id": "ru-7x8",
+   "text": "Семью восемь равно",
+   "tokens": 5,
+   "entropy": 4.216216087341309,
+   "top1_p": 0.34371232986450195,
+   "top1_id": 149056,
+   "top1_text": "бе"
+  },
+  {
+   "group": "arith",
+   "id": "zh-2x2",
+   "text": "二二得",
+   "tokens": 3,
+   "entropy": 2.18520188331604,
+   "top1_p": 0.7110978364944458,
+   "top1_id": 96301,
+   "top1_text": "四"
+  },
+  {
+   "group": "arith",
+   "id": "de-2x2",
+   "text": "Zwei mal zwei ist",
+   "tokens": 5,
+   "entropy": 4.821845054626465,
+   "top1_p": 0.12221254408359528,
+   "top1_id": 55182,
+   "top1_text": " vier"
+  },
+  {
+   "group": "arith",
+   "id": "es-2x2",
+   "text": "Dos por dos son",
+   "tokens": 4,
+   "entropy": 3.775197744369507,
+   "top1_p": 0.35115760564804077,
+   "top1_id": 73407,
+   "top1_text": " cuatro"
+  },
+  {
+   "group": "arith",
+   "id": "ar-2p2",
+   "text": "اثنان زائد اثنان يساوي",
+   "tokens": 11,
+   "entropy": 3.0064220428466797,
+   "top1_p": 0.2898615896701813,
+   "top1_id": 204068,
+   "top1_text": " خمسة"
+  },
+  {
+   "group": "arith",
+   "id": "fib",
+   "text": "1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89,",
+   "tokens": 37,
+   "entropy": 0.8937034606933594,
+   "top1_p": 0.6503724455833435,
+   "top1_id": 220,
+   "top1_text": " "
+  },
+  {
+   "group": "script",
+   "id": "ja-capital",
+   "text": "日本の首都は",
+   "tokens": 3,
+   "entropy": 2.458311080932617,
+   "top1_p": 0.6387730836868286,
+   "top1_id": 115197,
+   "top1_text": "東京"
+  },
+  {
+   "group": "script",
+   "id": "ko-capital",
+   "text": "대한민국의 수도는",
+   "tokens": 5,
+   "entropy": 2.5002284049987793,
+   "top1_p": 0.4245077967643738,
+   "top1_id": 162634,
+   "top1_text": " 어디"
+  },
+  {
+   "group": "script",
+   "id": "ru-capital",
+   "text": "Столица Российской Федерации —",
+   "tokens": 5,
+   "entropy": 2.2228102684020996,
+   "top1_p": 0.46702897548675537,
+   "top1_id": 173787,
+   "top1_text": " Москва"
+  },
+  {
+   "group": "script",
+   "id": "el-capital",
+   "text": "Η πρωτεύουσα της Ελλάδας είναι η",
+   "tokens": 10,
+   "entropy": 0.3042061924934387,
+   "top1_p": 0.9704911112785339,
+   "top1_id": 150301,
+   "top1_text": " Α"
+  },
+  {
+   "group": "script",
+   "id": "hi-capital",
+   "text": "भारत की राजधानी है",
+   "tokens": 13,
+   "entropy": 2.4469146728515625,
+   "top1_p": 0.4448082447052002,
+   "top1_id": 154845,
+   "top1_text": "।"
+  },
+  {
+   "group": "script",
+   "id": "he-capital",
+   "text": "בירת ישראל היא",
+   "tokens": 4,
+   "entropy": 2.014561891555786,
+   "top1_p": 0.6141018271446228,
+   "top1_id": 150999,
+   "top1_text": " י"
+  },
+  {
+   "group": "script",
+   "id": "th-capital",
+   "text": "เมืองหลวงของประเทศไทยคือ",
+   "tokens": 7,
+   "entropy": 1.510462999343872,
+   "top1_p": 0.6746454238891602,
+   "top1_id": 86645,
+   "top1_text": "กร"
+  },
+  {
+   "group": "script",
+   "id": "hy-capital",
+   "text": "Հայաստանի մայրաքաղաքն է",
+   "tokens": 17,
+   "entropy": 2.985848903656006,
+   "top1_p": 0.19107699394226074,
+   "top1_id": 25,
+   "top1_text": ":"
+  },
+  {
+   "group": "morph",
+   "id": "ru-dat",
+   "text": "Он медленно подошёл к большому деревянному",
+   "tokens": 9,
+   "entropy": 3.476271390914917,
+   "top1_p": 0.38196468353271484,
+   "top1_id": 156069,
+   "top1_text": " стол"
+  },
+  {
+   "group": "morph",
+   "id": "ru-prep",
+   "text": "Вчера мы долго говорили о новых научных",
+   "tokens": 8,
+   "entropy": 3.9593758583068848,
+   "top1_p": 0.2635180652141571,
+   "top1_id": 151002,
+   "top1_text": " откры"
+  },
+  {
+   "group": "morph",
+   "id": "pl-gen",
+   "text": "Nigdy wcześniej nie widziałem tej wysokiej",
+   "tokens": 10,
+   "entropy": 3.1315457820892334,
+   "top1_p": 0.44120195508003235,
+   "top1_id": 11,
+   "top1_text": ","
+  },
+  {
+   "group": "morph",
+   "id": "fi-abl",
+   "text": "Sain kirjeen vanhalta suomalaiselta",
+   "tokens": 10,
+   "entropy": 5.134531497955322,
+   "top1_p": 0.2003439962863922,
+   "top1_id": 374,
+   "top1_text": " y"
+  },
+  {
+   "group": "morph",
+   "id": "tr-agg",
+   "text": "Arkadaşımın evindeki kitaplarımı masanın üstüne",
+   "tokens": 14,
+   "entropy": 4.790627479553223,
+   "top1_p": 0.11206536740064621,
+   "top1_id": 237411,
+   "top1_text": " koy"
+  },
+  {
+   "group": "morph",
+   "id": "hu-acc",
+   "text": "Az ablakon keresztül jól láttam a kicsi",
+   "tokens": 11,
+   "entropy": 5.368194580078125,
+   "top1_p": 0.1345234513282776,
+   "top1_id": 40728,
+   "top1_text": " há"
+  },
+  {
+   "group": "morph",
+   "id": "de-part",
+   "text": "Ich habe dem kleinen Mädchen gestern ein Buch",
+   "tokens": 8,
+   "entropy": 1.8032045364379883,
+   "top1_p": 0.7101362347602844,
+   "top1_id": 13997,
+   "top1_text": " ges"
+  },
+  {
+   "group": "morph",
+   "id": "uk-inst",
+   "text": "Вона пишалася своєю старшою",
+   "tokens": 11,
+   "entropy": 1.737034797668457,
+   "top1_p": 0.5731825828552246,
+   "top1_id": 7550,
+   "top1_text": " д"
+  },
+  {
+   "group": "longrange",
+   "id": "kv-table",
+   "text": "key 8f3a -> 41\nkey c7d1 -> 92\nkey 0b5e -> 17\nkey 9a2f -> 63\nkey 4e18 -> 28\nkey bd60 -> 75\nkey 2c93 -> 50\nkey 7a4d -> 36\n\nThe build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read.\n\nLooking up key c7d1 gives the value",
+   "tokens": 366,
+   "entropy": 0.7474858164787292,
+   "top1_p": 0.8904894590377808,
+   "top1_id": 220,
+   "top1_text": " "
+  },
+  {
+   "group": "longrange",
+   "id": "password",
+   "text": "The access code for the east gate is Zyx-4471-Qav.\n\nThe build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read.\n\nAsked for it again, the guard repeated the access code: Zyx-",
+   "tokens": 395,
+   "entropy": 0.01795278862118721,
+   "top1_p": 0.9986257553100586,
+   "top1_id": 19,
+   "top1_text": "4"
+  },
+  {
+   "group": "longrange",
+   "id": "numbered-item",
+   "text": " 1. anchor\n 2. basalt\n 3. cinder\n 4. dolmen\n 5. ember\n 6. fathom\n 7. girder\n 8. harrow\n 9. isthmus\n10. jetty\n11. keel\n12. lintel\n13. mortise\n14. nadir\n15. obelisk\n16. plinth\n17. quarry\n18. rafter\n19. sluice\n20. tundra\n\nThe build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read.\n\nItem 13 on the list above is the word",
+   "tokens": 356,
+   "entropy": 2.0561716556549072,
+   "top1_p": 0.6231291890144348,
+   "top1_id": 328,
+   "top1_text": " \""
+  },
+  {
+   "group": "longrange",
+   "id": "story-name",
+   "text": "Ingrid Solberg arrived at the station before dawn and paid for her ticket in cash.\n\nThe build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read.\n\nNobody at the station could later recall the name of the woman who paid in cash, except the clerk, who wrote down: Ingrid",
+   "tokens": 362,
+   "entropy": 0.07844854891300201,
+   "top1_p": 0.9917240738868713,
+   "top1_id": 11144,
+   "top1_text": " Sol"
+  },
+  {
+   "group": "longrange",
+   "id": "code-binding",
+   "text": "let stride_bytes = 248320 * 4;  // one row of the lm_head, f32\n\nThe build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read.\n\n// and the final read multiplies the row count by\n    let total = rows * stride_",
+   "tokens": 319,
+   "entropy": 3.0464916229248047,
+   "top1_p": 0.35071781277656555,
+   "top1_id": 271,
+   "top1_text": "\n\n"
+  },
+  {
+   "group": "longrange",
+   "id": "json-field",
+   "text": "{\"artifact\": \"ornith-1.5-35b-a3b\", \"group_size\": 32, \"body_mode\": \"affine\"}\n\nThe build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read.\n\nThe value of the body_mode field in the record above is",
+   "tokens": 318,
+   "entropy": 3.173964738845825,
+   "top1_p": 0.26639100909233093,
+   "top1_id": 25,
+   "top1_text": ":"
+  },
+  {
+   "group": "longrange",
+   "id": "russian-decl",
+   "text": "Экспедицию возглавил капитан Челюскин, и мыс назвали его именем.\n\nThe build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read.\n\nСамая северная точка материка носит имя капитана",
+   "tokens": 349,
+   "entropy": 1.9095734357833862,
+   "top1_p": 0.6145376563072205,
+   "top1_id": 165785,
+   "top1_text": " Чел"
+  },
+  {
+   "group": "longrange",
+   "id": "two-facts",
+   "text": "Rule A: every request carries a trace id. Rule B: every response carries a span id.\n\nThe build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read. The build system compiles each module in dependency order. Artifacts are cached by content hash and reused across runs. Logs are written to the session directory and rotated daily. Configuration is read once at startup and never re-read.\n\nA response, by rule B, must therefore carry a",
+   "tokens": 303,
+   "entropy": 0.3107216954231262,
+   "top1_p": 0.9623144268989563,
+   "top1_id": 9111,
+   "top1_text": " span"
+  },
+  {
+   "group": "format",
+   "id": "json",
+   "text": "{\"name\": \"ornith\", \"version\": \"1.5\", \"quantization\":",
+   "tokens": 19,
+   "entropy": 1.7524938583374023,
+   "top1_p": 0.505092442035675,
+   "top1_id": 328,
+   "top1_text": " \""
+  },
+  {
+   "group": "format",
+   "id": "sql-order",
+   "text": "SELECT name, email FROM users WHERE id = 42 ORDER BY",
+   "tokens": 14,
+   "entropy": 2.474993944168091,
+   "top1_p": 0.5117466449737549,
+   "top1_id": 803,
+   "top1_text": " name"
+  },
+  {
+   "group": "format",
+   "id": "rust-assoc",
+   "text": "impl<T: Clone + Send> Iterator for MyIter<T> {\n    type Item =",
+   "tokens": 19,
+   "entropy": 0.6333411931991577,
+   "top1_p": 0.9037486910820007,
+   "top1_id": 345,
+   "top1_text": " T"
+  },
+  {
+   "group": "format",
+   "id": "xml-close",
+   "text": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root>\n  <item id=\"1\">value</",
+   "tokens": 29,
+   "entropy": 0.018563657999038696,
+   "top1_p": 0.9986790418624878,
+   "top1_id": 1163,
+   "top1_text": "item"
+  },
+  {
+   "group": "format",
+   "id": "c-return",
+   "text": "#include <stdio.h>\n\nint main(void) {\n    printf(\"hello\\n\");\n    return",
+   "tokens": 21,
+   "entropy": 0.08861128985881805,
+   "top1_p": 0.9880895018577576,
+   "top1_id": 220,
+   "top1_text": " "
+  },
+  {
+   "group": "format",
+   "id": "rust-result",
+   "text": "fn main() -> Result<(), Box<dyn std::error::",
+   "tokens": 12,
+   "entropy": 0.007141338661313057,
+   "top1_p": 0.9992544651031494,
+   "top1_id": 1401,
+   "top1_text": "Error"
+  },
+  {
+   "group": "format",
+   "id": "yaml-ci",
+   "text": "---\nname: probe\non:\n  push:\n    branches: [main]\njobs:\n  build:\n    runs-on:",
+   "tokens": 31,
+   "entropy": 0.34252291917800903,
+   "top1_p": 0.9609827995300293,
+   "top1_id": 81307,
+   "top1_text": " ubuntu"
+  },
+  {
+   "group": "format",
+   "id": "toml-dep",
+   "text": "[dependencies]\nserde = { version = \"1.0\", features = [",
+   "tokens": 17,
+   "entropy": 0.7631672024726868,
+   "top1_p": 0.8591017723083496,
+   "top1_id": 328,
+   "top1_text": " \""
+  },
+  {
+   "group": "rare",
+   "id": "helicase",
+   "text": "The enzyme that unwinds the DNA double helix ahead of the replication fork is called",
+   "tokens": 17,
+   "entropy": 1.8847886323928833,
+   "top1_p": 0.5482224225997925,
+   "top1_id": 25,
+   "top1_text": ":"
+  },
+  {
+   "group": "rare",
+   "id": "topaz",
+   "text": "The mineral with the chemical formula Al2SiO4(F,OH)2 is called",
+   "tokens": 18,
+   "entropy": 1.8584818840026855,
+   "top1_p": 0.39022478461265564,
+   "top1_id": 1259,
+   "top1_text": " __"
+  },
+  {
+   "group": "rare",
+   "id": "schwarzschild",
+   "text": "The Schwarzschild radius of a body of mass M equals 2GM divided by the square of the speed of",
+   "tokens": 23,
+   "entropy": 0.02777847647666931,
+   "top1_p": 0.9972628951072693,
+   "top1_id": 3000,
+   "top1_text": " light"
+  },
+  {
+   "group": "rare",
+   "id": "e4m3",
+   "text": "In the OCP microscaling specification, E4M3 has four exponent bits and three bits of",
+   "tokens": 20,
+   "entropy": 1.474503755569458,
+   "top1_p": 0.6717371344566345,
+   "top1_id": 25063,
+   "top1_text": " mant"
+  },
+  {
+   "group": "rare",
+   "id": "belisarius",
+   "text": "The Byzantine general Belisarius reconquered North Africa under the emperor",
+   "tokens": 15,
+   "entropy": 0.07413022965192795,
+   "top1_p": 0.9920968413352966,
+   "top1_id": 21768,
+   "top1_text": " Justin"
+  },
+  {
+   "group": "rare",
+   "id": "chelyuskin",
+   "text": "Мыс Челюскин — самая северная точка материковой части",
+   "tokens": 15,
+   "entropy": 0.8391101360321045,
+   "top1_p": 0.678450882434845,
+   "top1_id": 224086,
+   "top1_text": " Азии"
+  },
+  {
+   "group": "rare",
+   "id": "halite",
+   "text": "Кристаллическая решётка поваренной соли имеет форму",
+   "tokens": 16,
+   "entropy": 0.6288772821426392,
+   "top1_p": 0.9344058632850647,
+   "top1_id": 167625,
+   "top1_text": " куб"
+  },
+  {
+   "group": "rare",
+   "id": "cauchy",
+   "text": "The inequality |⟨u, v⟩| ≤ ‖u‖‖v‖ is known as the inequality of Cauchy and",
+   "tokens": 30,
+   "entropy": 0.30429700016975403,
+   "top1_p": 0.9459055066108704,
+   "top1_id": 83059,
+   "top1_text": " Schwarz"
+  },
+  {
+   "group": "code",
+   "id": "py-quicksort",
+   "text": "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr) // 2]\n    left = [x for x in arr if x <",
+   "tokens": 44,
+   "entropy": 0.014581279829144478,
+   "top1_p": 0.9988047480583191,
+   "top1_id": 25212,
+   "top1_text": " pivot"
+  },
+  {
+   "group": "code",
+   "id": "rust-derive",
+   "text": "#[derive(Debug, Clone, Copy, PartialEq)]\npub struct Quant {\n    pub bits: u8,\n    pub group_size:",
+   "tokens": 29,
+   "entropy": 0.48891162872314453,
+   "top1_p": 0.896797776222229,
+   "top1_id": 560,
+   "top1_text": " u"
+  },
+  {
+   "group": "code",
+   "id": "rust-ru-comment",
+   "text": "// Считаем сумму элементов среза и возвращаем её.\nfn sum(xs: &[f32]) -> f32 {\n    xs.iter().",
+   "tokens": 33,
+   "entropy": 0.5462046265602112,
+   "top1_p": 0.8531293869018555,
+   "top1_id": 19352,
+   "top1_text": "fold"
+  },
+  {
+   "group": "code",
+   "id": "py-aiohttp",
+   "text": "async def fetch(url: str) -> bytes:\n    async with aiohttp.ClientSession() as session:\n        async with session.get(url) as resp:\n            return await resp.",
+   "tokens": 39,
+   "entropy": 2.287874221801758,
+   "top1_p": 0.3739921450614929,
+   "top1_id": 1301,
+   "top1_text": " read"
+  },
+  {
+   "group": "code",
+   "id": "cpp-dtor",
+   "text": "template <typename T>\nclass Vector {\npublic:\n    explicit Vector(size_t n) : size_(n), data_(new T[n]) {}\n    ~Vector() { delete[]",
+   "tokens": 40,
+   "entropy": 0.07610564678907394,
+   "top1_p": 0.9926466345787048,
+   "top1_id": 795,
+   "top1_text": " data"
+  },
+  {
+   "group": "code",
+   "id": "metal-kernel",
+   "text": "kernel void add(device const float* a [[buffer(0)]],\n                device const float* b [[buffer(1)]],\n                device float* out [[buffer(2)]],\n                uint gid [[thread_position_in_",
+   "tokens": 48,
+   "entropy": 4.077500820159912,
+   "top1_p": 0.34959444403648376,
+   "top1_id": 17,
+   "top1_text": "2"
+  },
+  {
+   "group": "code",
+   "id": "sql-having",
+   "text": "SELECT u.name, COUNT(o.id) AS n\nFROM users u\nJOIN orders o ON o.user_id = u.id\nGROUP BY u.name\nHAVING COUNT(o.id) >",
+   "tokens": 38,
+   "entropy": 0.6578450798988342,
+   "top1_p": 0.8095590472221375,
+   "top1_id": 220,
+   "top1_text": " "
+  },
+  {
+   "group": "code",
+   "id": "zh-comment",
+   "text": "# 计算数组中所有元素的平均值\ndef mean(xs):\n    return sum(xs) / len(",
+   "tokens": 22,
+   "entropy": 2.4122910499572754,
+   "top1_p": 0.45434412360191345,
+   "top1_id": 198,
+   "top1_text": "\n"
+  },
+  {
+   "group": "mixed",
+   "id": "ru-rust-ownership",
+   "text": "В Rust владение (ownership) означает, что у каждого значения есть ровно один",
+   "tokens": 17,
+   "entropy": 0.39334312081336975,
+   "top1_p": 0.9400421977043152,
+   "top1_id": 221207,
+   "top1_text": " владелец"
+  },
+  {
+   "group": "mixed",
+   "id": "ja-pytorch",
+   "text": "PyTorch の nn.Module を継承したクラスでは、順伝播を forward メソッドに",
+   "tokens": 22,
+   "entropy": 1.9557071924209595,
+   "top1_p": 0.2749300003051758,
+   "top1_id": 97778,
+   "top1_text": "記"
+  },
+  {
+   "group": "mixed",
+   "id": "es-ml",
+   "text": "El término «machine learning» se traduce al español como aprendizaje",
+   "tokens": 13,
+   "entropy": 0.07358428090810776,
+   "top1_p": 0.9920229911804199,
+   "top1_id": 203891,
+   "top1_text": " automático"
+  },
+  {
+   "group": "mixed",
+   "id": "zh-complexity",
+   "text": "快速排序的平均时间复杂度是 O(n log",
+   "tokens": 9,
+   "entropy": 0.4064032733440399,
+   "top1_p": 0.916287362575531,
+   "top1_id": 307,
+   "top1_text": " n"
+  },
+  {
+   "group": "mixed",
+   "id": "ru-mlx",
+   "text": "Функция `quantized_matmul` принимает упакованные веса, scales и",
+   "tokens": 16,
+   "entropy": 3.8234033584594727,
+   "top1_p": 0.17404960095882416,
+   "top1_id": 15016,
+   "top1_text": " bias"
+  },
+  {
+   "group": "mixed",
+   "id": "ar-python",
+   "text": "في لغة البرمجة بايثون، تُستخدم الدالة print من أجل",
+   "tokens": 17,
+   "entropy": 1.8316879272460938,
+   "top1_p": 0.5588261485099792,
+   "top1_id": 154578,
+   "top1_text": " طب"
+  },
+  {
+   "group": "mixed",
+   "id": "fr-quicksort",
+   "text": "L'algorithme de tri rapide a une complexité moyenne en O(n log",
+   "tokens": 16,
+   "entropy": 0.02237934246659279,
+   "top1_p": 0.9976453185081482,
+   "top1_id": 307,
+   "top1_text": " n"
+  },
+  {
+   "group": "mixed",
+   "id": "ja-mlx-eval",
+   "text": "MLX の mx.array は遅延評価なので、実際に値を求めるには mx.",
+   "tokens": 17,
+   "entropy": 3.330547571182251,
+   "top1_p": 0.5872986912727356,
+   "top1_id": 389,
+   "top1_text": "ass"
+  }
+ ]
+}

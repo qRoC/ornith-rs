@@ -1,0 +1,45 @@
+control: new  (/Users/qroc/.mtplx/models/ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx)
+64 probes, 8 groups; 60 live (some variant pays >= 0.001 nats)
+
+KL(control || variant), nats, over the live probes
+variant               median      p90      max    best on  worst on  top-1 moved
+fp8scale-twin         0.0340   0.2612   0.4890    14 of 60   11 of 60    8 of 64
+int4-except-gates     0.0549   0.2462   1.5938     8 of 60   13 of 60    9 of 64
+int4-head-linattn     0.0272   0.1953   0.5029    28 of 60    6 of 60    6 of 64
+nvfp4-head-linattn    0.0649   0.3172   6.6391    10 of 60   30 of 60    9 of 64
+
+median KL by group (live probes; n = live of 8)
+group       n      fp8scale-twin  int4-except-gates  int4-head-linattn  nvfp4-head-linatt
+arith       8             0.2219             0.1528             0.0887             0.2882
+script      8             0.0274             0.0528             0.0379             0.1136
+morph       8             0.0688             0.0685             0.0481             0.1089
+longrange   8             0.0678             0.0810             0.0641             0.0560
+format      6             0.0238             0.0134             0.0119             0.0174
+rare        8             0.0249             0.0398             0.0083             0.0338
+code        7             0.0282             0.0862             0.0121             0.0353
+mixed       7             0.0214             0.0345             0.0203             0.0278
+
+probes that rank the variants, by spread (max KL / min KL)
+  # probe                        H  spread      fp8scale-twin  int4-except-gates  int4-head-linattn  nvfp4-head-linatt
+  1 arith/ru-7x8              3.23    72.1             0.3726             0.0921             0.1361             6.6391
+  2 code/rust-ru-comment      0.52    36.8             0.0052             0.0016             0.0010             0.0353
+  3 arith/fib                 0.88    30.5             0.0191             0.0045             0.0095             0.1364
+  4 code/sql-having           0.60    27.7             0.0282             0.0862             0.0121             0.0031
+  5 rare/chelyuskin           0.79    23.4             0.3088             0.0656             0.0132             0.1834
+  6 longrange/russian-decl    1.33    21.3             0.1029             1.5938             0.1059             2.1898
+  7 mixed/zh-complexity       0.37    20.7             0.0313             0.0345             0.0017             0.0104
+  8 script/ru-capital         1.93    16.8             0.0130             0.0194             0.0329             0.2192
+  9 rare/cauchy               0.28    13.9             0.0167             0.0362             0.0034             0.0470
+ 10 longrange/password        0.02    11.2             0.0008             0.0003             0.0002             0.0021
+ 11 arith/de-2x2              4.71     8.9             0.4890             0.3753             0.0835             0.7438
+ 12 arith/ru-2x2              3.29     8.4             0.3588             0.4023             0.0507             0.4237
+ 13 rare/schwarzschild        0.04     7.7             0.0012             0.0004             0.0011             0.0029
+ 14 code/rust-derive          0.51     5.7             0.0074             0.0169             0.0081             0.0030
+ 15 code/metal-kernel         1.38     5.6             0.2606             0.1944             0.5029             0.0891
+
+head to head, the two least-damaged: int4-head-linattn vs fp8scale-twin
+  int4-head-linattn lower on 40 of 60 live probes
+  median ratio fp8scale-twin/int4-head-linattn  1.43x
+  largest single gap  +0.4055 nats on arith/de-2x2
+
+dead probes (4, no variant reaches 0.001 nats): format/xml-close, format/rust-result, code/py-quicksort, mixed/fr-quicksort
