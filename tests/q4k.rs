@@ -19,10 +19,17 @@
 //! bound, and against a one-hot activation, where the sum has exactly one
 //! nonzero term per output and an addressing error cannot hide inside a
 //! tolerance.
+//!
+//! The tiled gemm (`kquant::qmm_t`) carries those two and a third, because it
+//! *replaces* a kernel that is already checked: it must agree with the mat-vec
+//! to within the difference in summation order. The cases for it are at the
+//! bottom of this file.
 
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
-use ornith_rs::ops::kquant::{KMatrix, KQuant, dequantize, gather_qmv, qmv};
+use ornith_rs::ops::kquant::{
+    KMatrix, KQuant, dequantize, gather_qmm_t, gather_qmv, qmm_t, qmv,
+};
 use ornith_rs::refs::{RefCase, compare, refs_root};
 use ornith_rs::weights::WeightStore;
 
@@ -320,4 +327,260 @@ fn the_routed_gather_picks_the_right_expert() {
     let d = compare(&got, &want);
     eprintln!("routed one-hot, column {j}: {d}");
     assert!(d.max_rel <= ONE_HOT_MAX_REL, "routed one-hot: {d}");
+}
+
+// ---------------------------------------------------------------------------
+// `qmm_t`: the tile, and the three things it has to be
+// ---------------------------------------------------------------------------
+//
+// The mat-vec's contract cannot be reused wholesale here. `q4k_dequantize` is
+// pinned bit-exactly because ggml performs the same operations in the same
+// order; a product cannot be, because the order is the kernel's. For the gemm
+// there is one more: it replaces a kernel that is already checked, so it must
+// **agree with that kernel** -- and only to within the difference in summation
+// order, which is why its accumulator tile is float and not ggml's half.
+//
+//   1. a float64 reference, as for the mat-vec, with a stated bound
+//   2. a one-hot activation per row, where each output is one term and an
+//      addressing error in either axis cannot hide inside a tolerance
+//   3. the mat-vec itself, on the same rows
+
+/// Two float32 sums over the same 2048 terms in different orders. Both walk K
+/// in 32-wide steps; the gemm accumulates through `simdgroup_float8x8` and the
+/// mat-vec through `simd_sum`, so this is reassociation and nothing else.
+const REASSOCIATION_MAX_REL: f32 = 1e-5;
+
+fn mrows(case: &RefCase, name: &str) -> usize {
+    case.meta_usize(&format!("{name}_m"))
+}
+
+/// The prefill shape against a float64 reference, in both activation dtypes.
+///
+/// `MROWS` is 37 -- not a multiple of the tile's 32 -- and `tail` is 100 rows,
+/// not a multiple of its 64, so between them the two partial-tile bounds are
+/// both exercised.
+#[test]
+fn qmm_t_matches_a_float64_reference() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    if !case.has("head_xm") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q4k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    for name in ["head", "qkv", "tail"] {
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        let m = mrows(&case, name);
+        let want = case.f32(&format!("{name}_ym"));
+
+        let x32 = Array::from_f32(&ctx, &case.get(&format!("{name}_xm")).to_f32(), &[m, cols]);
+        let d = compare(&qmm_t(&ctx, &x32, &w).to_vec_f32(&ctx), &want);
+        eprintln!("{name} gemm, {m} rows, float32 activations: {d}");
+        assert!(
+            d.max_rel <= MATVEC_MAX_REL,
+            "{name} float32 gemm: max_rel {:.3e}\n  {d}",
+            d.max_rel
+        );
+
+        let xb = case.array(&ctx, &format!("{name}_xm")).reshape(&[m, cols]);
+        let d = compare(&qmm_t(&ctx, &xb, &w).to_vec_f32(&ctx), &want);
+        eprintln!("{name} gemm, {m} rows, bfloat16 activations: {d}");
+        assert!(
+            d.max_rel <= 1.0 / 256.0,
+            "{name} bfloat16 gemm: max_rel {:.3e}\n  {d}",
+            d.max_rel
+        );
+    }
+}
+
+/// A different one-hot per row, so the answer is a different column of the
+/// dequantized matrix in every row of the output.
+///
+/// The mat-vec's one-hot case moves one column; this one moves 37 of them
+/// through a kernel that addresses rows and columns on different axes of the
+/// grid, which is where a tiled gemm goes wrong. It measures exactly zero.
+#[test]
+fn qmm_t_on_one_hot_rows_returns_columns() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    if !case.has("head_xm") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q4k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    for name in ["head", "qkv", "tail"] {
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        let rows = case.meta_usize(&format!("{name}_rows"));
+        let m = mrows(&case, name);
+        let deq = case.f32(&format!("{name}_deq"));
+
+        // Columns spread over the whole input, one per output row.
+        let js: Vec<usize> = (0..m).map(|r| (r * 61 + 7) % cols).collect();
+        let mut xs = vec![0.0f32; m * cols];
+        for (r, j) in js.iter().enumerate() {
+            xs[r * cols + j] = 1.0;
+        }
+        let xs = Array::from_f32(&ctx, &xs, &[m, cols]);
+        let got = qmm_t(&ctx, &xs, &w).to_vec_f32(&ctx);
+
+        let mut want = Vec::with_capacity(m * rows);
+        for j in &js {
+            want.extend((0..rows).map(|o| deq[o * cols + j]));
+        }
+        let d = compare(&got, &want);
+        eprintln!("{name} gemm one-hot, {m} rows: {d}");
+        assert!(
+            d.max_rel <= ONE_HOT_MAX_REL,
+            "{name} gemm one-hot: max_rel {:.3e}\n  {d}",
+            d.max_rel
+        );
+    }
+}
+
+/// The contract that makes the gemm a replacement rather than a second model:
+/// on the same rows it must answer what the mat-vec answers.
+///
+/// Float32 activations, so the comparison is not swallowed by the bfloat16
+/// output rounding both kernels would otherwise share. What is left is the
+/// association -- the mat-vec factors `d` out of a block's sum where the gemm
+/// dequantizes each weight first -- and it measures a few float32 ULPs.
+#[test]
+fn qmm_t_agrees_with_the_matvec() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    if !case.has("head_xm") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q4k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    for name in ["head", "qkv"] {
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        let m = mrows(&case, name);
+        let x = Array::from_f32(&ctx, &case.get(&format!("{name}_xm")).to_f32(), &[m, cols]);
+
+        let vec = qmv(&ctx, &x, &w).to_vec_f32(&ctx);
+        let tile = qmm_t(&ctx, &x, &w).to_vec_f32(&ctx);
+        let d = compare(&tile, &vec);
+        eprintln!("{name} gemm against the mat-vec it replaces, {m} rows: {d}");
+        assert!(
+            d.max_rel <= REASSOCIATION_MAX_REL,
+            "{name} gemm vs mat-vec: max_rel {:.3e} -- that is more than a \
+             summation order apart\n  {d}",
+            d.max_rel
+        );
+    }
+}
+
+/// The routed gemm: `kernel_mul_mm_id`, on rows grouped by expert.
+///
+/// The reference's run lengths are 5, 40, 3 and 22 over 70 rows, so the three
+/// 32-row tiles straddle expert boundaries in three different ways -- the
+/// first holds two experts, the second three, the third one. That is the whole
+/// difference between this and the mat-vec, which reads one expert per row and
+/// cannot get a run wrong.
+#[test]
+fn the_routed_gemm_picks_the_right_experts() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    if !case.has("moes_x") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q4k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    let w = KMatrix::new(
+        KQuant::Q4K,
+        case.array(&ctx, "moe_qs"),
+        case.array(&ctx, "moe_scales"),
+        case.array(&ctx, "moe_dm"),
+    );
+    let rows = case.meta_usize("moe_rows");
+    let cols = case.meta_usize("moe_cols");
+    let n = case.meta_usize("moes_n");
+
+    let lhs = case.array(&ctx, "moes_lhs");
+    let rhs = case.array(&ctx, "moes_rhs");
+    let x = case.array(&ctx, "moes_x");
+
+    let got = gather_qmm_t(&ctx, &x, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    let d = compare(&got, &case.f32("moes_y"));
+    eprintln!("routed gemm, {n} sorted rows: {d}");
+    assert!(d.max_rel <= MATVEC_MAX_REL, "routed gemm: {d}");
+
+    // And against the mat-vec on the same rows, which is the same contract the
+    // plain gemm carries.
+    let vec = gather_qmv(&ctx, &x, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    let d = compare(&got, &vec);
+    eprintln!("routed gemm against the routed mat-vec: {d}");
+    assert!(
+        d.max_rel <= REASSOCIATION_MAX_REL,
+        "routed gemm vs mat-vec: max_rel {:.3e}\n  {d}",
+        d.max_rel
+    );
+
+    // One-hot per row: output row `r` is column `j_r` of expert `rhs[r]`, so a
+    // run boundary read one row early lands on the wrong expert's column.
+    let deq = case.f32("moe_deq");
+    let rhs_ids = case.get("moes_rhs").to_u32();
+    let js: Vec<usize> = (0..n).map(|r| (r * 61 + 7) % cols).collect();
+    let lhs_ids = case.get("moes_lhs").to_u32();
+    let mut xs = vec![0.0f32; n * cols];
+    for r in 0..n {
+        // Row `r` of the output reads row `lhs[r]` of `x`, so the one-hot has
+        // to be planted there rather than at `r`.
+        xs[lhs_ids[r] as usize * cols + js[r]] = 1.0;
+    }
+    let xs = Array::from_f32(&ctx, &xs, &[n, cols]);
+    let got = gather_qmm_t(&ctx, &xs, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    let mut want = Vec::with_capacity(n * rows);
+    for r in 0..n {
+        let e = rhs_ids[r] as usize;
+        want.extend((0..rows).map(|o| deq[(e * rows + o) * cols + js[r]]));
+    }
+    let d = compare(&got, &want);
+    eprintln!("routed gemm one-hot, {n} rows: {d}");
+    assert!(d.max_rel <= ONE_HOT_MAX_REL, "routed gemm one-hot: {d}");
+}
+
+/// The run loop is an optimization, not a precondition.
+///
+/// mlx's `gather_qmm_rhs` requires the rows to be sorted by expert; this
+/// kernel finds its own runs, so an unsorted batch is slower and not wrong.
+/// That claim is worth a test rather than a comment: shuffle the same 70 rows
+/// and the answers must follow the shuffle.
+#[test]
+fn the_routed_gemm_does_not_need_sorted_rows() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    if !case.has("moes_x") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q4k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    let w = KMatrix::new(
+        KQuant::Q4K,
+        case.array(&ctx, "moe_qs"),
+        case.array(&ctx, "moe_scales"),
+        case.array(&ctx, "moe_dm"),
+    );
+    let rows = case.meta_usize("moe_rows");
+    let n = case.meta_usize("moes_n");
+    let x = case.array(&ctx, "moes_x");
+    let lhs = case.get("moes_lhs").to_u32();
+    let rhs = case.get("moes_rhs").to_u32();
+
+    // A fixed shuffle, so every tile holds a different expert in nearly every
+    // row and the run loop degenerates to one pass per row.
+    let perm: Vec<usize> = (0..n).map(|r| (r * 37 + 5) % n).collect();
+    let plhs: Vec<u32> = perm.iter().map(|&r| lhs[r]).collect();
+    let prhs: Vec<u32> = perm.iter().map(|&r| rhs[r]).collect();
+    let plhs = Array::from_slice(&ctx, &plhs, &[n], Dtype::U32);
+    let prhs = Array::from_slice(&ctx, &prhs, &[n], Dtype::U32);
+    let got = gather_qmm_t(&ctx, &x, &w, &plhs, &prhs).to_vec_f32(&ctx);
+
+    let want = case.f32("moes_y");
+    let mut permuted = Vec::with_capacity(n * rows);
+    for &r in &perm {
+        permuted.extend_from_slice(&want[r * rows..(r + 1) * rows]);
+    }
+    let d = compare(&got, &permuted);
+    eprintln!("routed gemm, {n} shuffled rows: {d}");
+    assert!(d.max_rel <= MATVEC_MAX_REL, "routed gemm, unsorted: {d}");
 }

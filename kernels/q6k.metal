@@ -29,6 +29,8 @@
 
 #include "mlx/backend/metal/kernels/utils.h"
 
+#include "kquant_mm.h"
+
 #define QK_K 256
 #define Q6K_QL_BYTES 128
 #define Q6K_QH_BYTES 64
@@ -75,7 +77,9 @@ template <typename T>
 }
 
 // `kernel_mul_mv_q6_K_f32_impl`, with the pointers resolved by the caller --
-// the same split `q4k.metal` uses, so the routed wrapper is a wrapper.
+// the same split `q4k.metal` uses, so the routed wrapper is a wrapper. It is a
+// mat-vec at every M, and `kquant_mm.h` is the tile that takes over past
+// `kquant::MM_ROW_LIMIT` rows.
 //
 // Two lanes share a block (`ix = tiisg % 2`) and the other sixteen ways split
 // the block's 256 weights, so each lane holds 16 of them and the row loop
@@ -222,10 +226,71 @@ template <typename T, short nr0, short NSG>
       sgitg);
 }
 
+// The format for `kquant_mm.h`'s tile, as `Q4KFmt` is for Q4_K.
+//
+// ggml's `dequantize_q6_K`, with `xb->ql` / `xb->qh` resolved out of the one
+// `.weight` tensor the artifact stores -- 128 bytes of low nibbles followed by
+// 64 of high pairs -- and `xb->scales` and `xb->d` out of the other two. Its
+// packing trick is kept verbatim: four codes are assembled inside one uint32
+// and unpacked by dividing the super-scale by successive powers of 256, which
+// is exact, and the bias of 32 is folded into `ml = d * sc * 32` and
+// subtracted rather than applied to each code.
+//
+// `il` means what it means in `Q4KFmt`: the il-th run of 16 weights. Q6_K has
+// one signed scale per 16, so that run is exactly `scales[il]`.
+struct Q6KFmt {
+  static constant constexpr const short QK = QK_K;
+  static constant constexpr const short NL = 16;
+  static constant constexpr const int CODES = Q6K_W_BYTES; // ql then qh
+  static constant constexpr const int SCALES = Q6K_SC; // one int8 per 16
+  static constant constexpr const int DM = Q6K_D; // d alone; no minimum
+
+  static inline void dequantize(
+      const device uint8_t* w,
+      const device uint8_t* scales,
+      const device half* dm,
+      short il,
+      thread float4x4& reg) {
+    const half d_all = dm[0];
+    const device uint16_t* ql = (const device uint16_t*)w;
+    const device uint16_t* qh = (const device uint16_t*)(w + Q6K_QL_BYTES);
+    const device int8_t* sc = (const device int8_t*)scales;
+
+    ql = ql + 32 * (il / 8) + 16 * ((il / 2) & 1) + 8 * (il & 1);
+    qh = qh + 16 * (il / 8) + 8 * (il & 1);
+    const float scale = sc[(il % 2) + 2 * ((il / 2))];
+    il = (il / 2) & 3;
+
+    const uint32_t kmask1 =
+        il > 1 ? (il > 2 ? 0xC0C0C0C0 : 0x30303030) : (il > 0 ? 0x0C0C0C0C : 0x03030303);
+    const uint32_t kmask2 = il > 1 ? 0xF0F0F0F0 : 0x0F0F0F0F;
+    const float ml = float(d_all) * scale * 32.f;
+    const float dl0 = float(d_all) * scale;
+    const float dl1 = dl0 / 256.f;
+    const float dl2 = dl0 / (256.f * 256.f);
+    const float dl3 = dl0 / (256.f * 256.f * 256.f);
+    const uint8_t shr_h = il > 2 ? 2 : 0;
+    const uint8_t shl_h = il > 1 ? 0 : (il > 0 ? 2 : 4);
+    const uint8_t shr_l = il > 1 ? 4 : 0;
+    for (short i = 0; i < 4; ++i) {
+      const uint32_t low = (ql[2 * i] | (uint32_t)(ql[2 * i + 1] << 16)) & kmask2;
+      const uint32_t high = (qh[2 * i] | (uint32_t)(qh[2 * i + 1] << 16)) & kmask1;
+      const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+      reg[i][0] = dl0 * ((float)(q & 0xFF)) - ml;
+      reg[i][1] = dl1 * ((float)(q & 0xFF00)) - ml;
+      reg[i][2] = dl2 * ((float)(q & 0xFF0000)) - ml;
+      reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+    }
+  }
+};
+
 // ggml's `N_SG_Q6_K` / `N_R0_Q6_K`.
-#define instantiate_q6k(tname, type)                                  \
-  instantiate_kernel("q6k_dequantize_" #tname, q6k_dequantize, type)  \
-  instantiate_kernel("q6k_qmv_" #tname, q6k_qmv, type, 2, 2)          \
-  instantiate_kernel("q6k_gather_qmv_" #tname, q6k_gather_qmv, type, 2, 2)
+#define instantiate_q6k(tname, type)                                           \
+  instantiate_kernel("q6k_dequantize_" #tname, q6k_dequantize, type)           \
+  instantiate_kernel("q6k_qmv_" #tname, q6k_qmv, type, 2, 2)                   \
+  instantiate_kernel("q6k_gather_qmv_" #tname, q6k_gather_qmv, type, 2, 2)     \
+  instantiate_kernel("q6k_qmm_t_" #tname, kquant_qmm_t, type, Q6KFmt, float)   \
+  instantiate_kernel(                                                          \
+      "q6k_gather_qmm_t_" #tname, kquant_gather_qmm_t, type, Q6KFmt, float)
 
 instantiate_q6k(bfloat16, bfloat16_t) instantiate_q6k(float32, float)

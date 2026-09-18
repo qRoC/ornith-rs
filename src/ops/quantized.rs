@@ -257,14 +257,33 @@ pub fn quantized_matmul(ctx: &Context, x: &Array, qw: &QuantMatrix) -> Array {
     let out = Array::empty(ctx, &out_shape, x.dtype);
 
     let limit = qmv_batch_limit(ctx, k, n);
-    if m >= limit {
+    if m >= limit && affine_gemm_enabled() {
         // B == 1 here (2-D weights), and every linear in this model is
         // transposed, so mlx takes the split-K path.
         qmm_splitk(ctx, x, qw, &out, m, n, k);
+    } else if m >= limit {
+        // The override below: a mat-vec per token, which is the shape the
+        // k-quants had before `kquant::qmm_t` existed.
+        qmv(ctx, x, qw, &out, m, n, k);
     } else {
         dispatch_qmv(ctx, x, qw, &out, m, n, k);
     }
     out
+}
+
+/// `ORNITH_AFFINE_GEMM=0` sends a prefill-width batch through mlx's mat-vec
+/// instead of its tiled gemm. **A measurement escape hatch, inert by default.**
+///
+/// It exists for one question. `kquant::qmm_t` moved the k-quant modules off a
+/// mat-vec per token and the probe capture's median KL moved with them, which
+/// is either a bug in the new kernel or a property of tiled prefill. The way to
+/// tell is to make the same move on a path nobody here wrote: this flag runs an
+/// all-affine artifact both ways, and whatever it does to *that* median is what
+/// a gemm does to a capture, independent of the k-quants.
+fn affine_gemm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ORNITH_AFFINE_GEMM").as_deref() != Ok("0"))
 }
 
 /// `dispatch_qmv` from quantized.cpp.

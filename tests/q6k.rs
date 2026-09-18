@@ -4,7 +4,8 @@
 //! k-quant, so `ggml` takes the oracle's place: `q6k_dequantize` is held to
 //! `max_abs == 0.0` against `dequantize_row_q6_K` on bytes `quantize_q6_K`
 //! wrote, and the matvec, whose summation order belongs to the kernel, is
-//! checked against a float64 reference and against a one-hot activation.
+//! checked against a float64 reference and against a one-hot activation. The
+//! tiled gemm adds a third check -- that it answers what the mat-vec answers.
 //!
 //! **What is different from Q4_K, and it is what this file is for.** Q6_K's
 //! sub-block scale is **signed** and its code is **biased by 32**, so
@@ -15,7 +16,9 @@
 
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
-use ornith_rs::ops::kquant::{KMatrix, KQuant, dequantize, gather_qmv, qmv};
+use ornith_rs::ops::kquant::{
+    KMatrix, KQuant, dequantize, gather_qmm_t, gather_qmv, qmm_t, qmv,
+};
 use ornith_rs::refs::{RefCase, compare};
 
 /// `sqrt(K) * 2^-24` with room; the cases print what they measured.
@@ -124,4 +127,204 @@ fn the_routed_gather_picks_the_right_expert() {
     );
     eprintln!("routed gather over {experts} experts: {d}");
     assert!(d.max_rel <= MATVEC_MAX_REL, "routed gather: {d}");
+}
+
+// ---------------------------------------------------------------------------
+// `qmm_t`: the tile, on the format whose scale is signed
+// ---------------------------------------------------------------------------
+//
+// `tests/q4k.rs` states the three checks and why the mat-vec's bit-exact
+// contract is not available to a product. The one thing this file adds is the
+// format: `Q6KFmt::dequantize` assembles four codes inside a uint32 and
+// recovers them by dividing the super-scale by powers of 256, with the bias of
+// 32 folded into a single subtracted `ml`. Get the sign of `scales` wrong and
+// the one-hot case reads a negated column; get the bias wrong and it reads a
+// shifted one.
+//
+// `shared` is [1024, 512] -- two super-blocks a row -- so the K loop runs 16
+// times rather than 64, which is the shortest K any converted module has.
+
+/// Two float32 sums over the same terms in different orders.
+const REASSOCIATION_MAX_REL: f32 = 1e-5;
+
+fn mrows(case: &RefCase, name: &str) -> usize {
+    case.meta_usize(&format!("{name}_m"))
+}
+
+#[test]
+fn qmm_t_matches_a_float64_reference() {
+    let Some(case) = RefCase::open_or_skip("q6k") else { return };
+    if !case.has("attn_xm") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q6k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    for name in CASES {
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        let m = mrows(&case, name);
+        let want = case.f32(&format!("{name}_ym"));
+
+        let x32 = Array::from_f32(&ctx, &case.get(&format!("{name}_xm")).to_f32(), &[m, cols]);
+        let d = compare(&qmm_t(&ctx, &x32, &w).to_vec_f32(&ctx), &want);
+        eprintln!("{name} gemm, {m} rows, float32 activations: {d}");
+        assert!(d.max_rel <= MATVEC_MAX_REL, "{name} float32 gemm: {d}");
+
+        let xb = case.array(&ctx, &format!("{name}_xm")).reshape(&[m, cols]);
+        let d = compare(&qmm_t(&ctx, &xb, &w).to_vec_f32(&ctx), &want);
+        eprintln!("{name} gemm, {m} rows, bfloat16 activations: {d}");
+        assert!(d.max_rel <= 1.0 / 256.0, "{name} bfloat16 gemm: {d}");
+    }
+}
+
+#[test]
+fn qmm_t_on_one_hot_rows_returns_columns() {
+    let Some(case) = RefCase::open_or_skip("q6k") else { return };
+    if !case.has("attn_xm") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q6k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    for name in CASES {
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        let rows = case.meta_usize(&format!("{name}_rows"));
+        let m = mrows(&case, name);
+        let deq = case.f32(&format!("{name}_deq"));
+
+        let js: Vec<usize> = (0..m).map(|r| (r * 61 + 7) % cols).collect();
+        let mut xs = vec![0.0f32; m * cols];
+        for (r, j) in js.iter().enumerate() {
+            xs[r * cols + j] = 1.0;
+        }
+        let xs = Array::from_f32(&ctx, &xs, &[m, cols]);
+        let got = qmm_t(&ctx, &xs, &w).to_vec_f32(&ctx);
+
+        let mut want = Vec::with_capacity(m * rows);
+        for j in &js {
+            want.extend((0..rows).map(|o| deq[o * cols + j]));
+        }
+        let d = compare(&got, &want);
+        eprintln!("{name} gemm one-hot, {m} rows: {d}");
+        assert!(d.max_rel <= ONE_HOT_MAX_REL, "{name} gemm one-hot: {d}");
+    }
+}
+
+#[test]
+fn qmm_t_agrees_with_the_matvec() {
+    let Some(case) = RefCase::open_or_skip("q6k") else { return };
+    if !case.has("attn_xm") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q6k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    for name in CASES {
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        let m = mrows(&case, name);
+        let x = Array::from_f32(&ctx, &case.get(&format!("{name}_xm")).to_f32(), &[m, cols]);
+
+        let d = compare(
+            &qmm_t(&ctx, &x, &w).to_vec_f32(&ctx),
+            &qmv(&ctx, &x, &w).to_vec_f32(&ctx),
+        );
+        eprintln!("{name} gemm against the mat-vec it replaces, {m} rows: {d}");
+        assert!(
+            d.max_rel <= REASSOCIATION_MAX_REL,
+            "{name} gemm vs mat-vec: max_rel {:.3e} -- more than a summation \
+             order apart\n  {d}",
+            d.max_rel
+        );
+    }
+}
+
+/// The routed gemm, with the run lengths 5, 40, 3, 22 that make the three
+/// 32-row tiles straddle expert boundaries three different ways.
+#[test]
+fn the_routed_gemm_picks_the_right_experts() {
+    let Some(case) = RefCase::open_or_skip("q6k") else { return };
+    if !case.has("moes_x") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q6k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    let w = KMatrix::new(
+        KQuant::Q6K,
+        case.array(&ctx, "moe_qs"),
+        case.array(&ctx, "moe_scales"),
+        case.array(&ctx, "moe_dm"),
+    );
+    let rows = case.meta_usize("moe_rows");
+    let cols = case.meta_usize("moe_cols");
+    let n = case.meta_usize("moes_n");
+    let lhs = case.array(&ctx, "moes_lhs");
+    let rhs = case.array(&ctx, "moes_rhs");
+    let x = case.array(&ctx, "moes_x");
+
+    let got = gather_qmm_t(&ctx, &x, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    let d = compare(&got, &case.f32("moes_y"));
+    eprintln!("routed gemm, {n} sorted rows: {d}");
+    assert!(d.max_rel <= MATVEC_MAX_REL, "routed gemm: {d}");
+
+    let vec = gather_qmv(&ctx, &x, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    let d = compare(&got, &vec);
+    eprintln!("routed gemm against the routed mat-vec: {d}");
+    assert!(d.max_rel <= REASSOCIATION_MAX_REL, "routed gemm vs mat-vec: {d}");
+
+    let deq = case.f32("moe_deq");
+    let rhs_ids = case.get("moes_rhs").to_u32();
+    let lhs_ids = case.get("moes_lhs").to_u32();
+    let js: Vec<usize> = (0..n).map(|r| (r * 61 + 7) % cols).collect();
+    let mut xs = vec![0.0f32; n * cols];
+    for r in 0..n {
+        xs[lhs_ids[r] as usize * cols + js[r]] = 1.0;
+    }
+    let xs = Array::from_f32(&ctx, &xs, &[n, cols]);
+    let got = gather_qmm_t(&ctx, &xs, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    let mut want = Vec::with_capacity(n * rows);
+    for r in 0..n {
+        let e = rhs_ids[r] as usize;
+        want.extend((0..rows).map(|o| deq[(e * rows + o) * cols + js[r]]));
+    }
+    let d = compare(&got, &want);
+    eprintln!("routed gemm one-hot, {n} rows: {d}");
+    assert!(d.max_rel <= ONE_HOT_MAX_REL, "routed gemm one-hot: {d}");
+}
+
+/// Unsorted rows are slower, not wrong -- see `tests/q4k.rs`.
+#[test]
+fn the_routed_gemm_does_not_need_sorted_rows() {
+    let Some(case) = RefCase::open_or_skip("q6k") else { return };
+    if !case.has("moes_x") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q6k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    let w = KMatrix::new(
+        KQuant::Q6K,
+        case.array(&ctx, "moe_qs"),
+        case.array(&ctx, "moe_scales"),
+        case.array(&ctx, "moe_dm"),
+    );
+    let rows = case.meta_usize("moe_rows");
+    let n = case.meta_usize("moes_n");
+    let x = case.array(&ctx, "moes_x");
+    let lhs = case.get("moes_lhs").to_u32();
+    let rhs = case.get("moes_rhs").to_u32();
+
+    let perm: Vec<usize> = (0..n).map(|r| (r * 37 + 5) % n).collect();
+    let plhs: Vec<u32> = perm.iter().map(|&r| lhs[r]).collect();
+    let prhs: Vec<u32> = perm.iter().map(|&r| rhs[r]).collect();
+    let plhs = Array::from_slice(&ctx, &plhs, &[n], Dtype::U32);
+    let prhs = Array::from_slice(&ctx, &prhs, &[n], Dtype::U32);
+    let got = gather_qmm_t(&ctx, &x, &w, &plhs, &prhs).to_vec_f32(&ctx);
+
+    let want = case.f32("moes_y");
+    let mut permuted = Vec::with_capacity(n * rows);
+    for &r in &perm {
+        permuted.extend_from_slice(&want[r * rows..(r + 1) * rows]);
+    }
+    let d = compare(&got, &permuted);
+    eprintln!("routed gemm, {n} shuffled rows: {d}");
+    assert!(d.max_rel <= MATVEC_MAX_REL, "routed gemm, unsorted: {d}");
 }

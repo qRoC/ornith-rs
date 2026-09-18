@@ -28,14 +28,16 @@
 //! A routed expert module carries the same three with an `[E, ...]` axis in
 //! front, exactly as the affine ones do, and [`gather_qmv`] indexes it.
 //!
-//! **One kernel each, and it is a mat-vec.** `Q4K.md` scopes the first cut to
-//! M = 1, because `affine_qmv_fast` is 38% of a decode step and that alone is
-//! enough to measure GB/token and GPU busy for real. ggml's kernels also carry
-//! a token axis, and [`qmv`] keeps it: at M > 1 it is a mat-vec per token,
-//! re-reading the weights once each rather than tiling them. That is the wrong
-//! shape for prefill and the reason a k-quant artifact can be *run* at all
-//! before `qmm_t` exists -- without it there is no prefill, and without a
-//! prefill there is no probe capture and no verdict.
+//! **Two kernels each: a mat-vec and a tiled gemm.** [`qmv`] is ggml's
+//! `kernel_mul_mv_*_f32_impl` and it is the decode shape -- one output row,
+//! the weights read once. It also carries ggml's token axis, so it *can* run
+//! at M > 1, as a mat-vec per token that re-reads the whole matrix for each
+//! one; that is what let a k-quant artifact be measured at all before a gemm
+//! existed, and `HANDOFF.md` put a number on what it cost at prefill.
+//! [`qmm_t`] is ggml's `kernel_mul_mm`, the 64x32 tile, and [`matmul`] picks
+//! between them. The two are held to each other: the gemm's contract is that
+//! it agrees with the mat-vec to within the difference in summation order,
+//! which is why its accumulator tile is float rather than ggml's half.
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
@@ -46,6 +48,18 @@ pub const QK_K: usize = 256;
 /// and output rows per simdgroup. Both formats use 2 and 2.
 const NSG: usize = 2;
 const NR0: usize = 2;
+
+/// The gemm tile, from the legacy branch of ggml's `kernel_mul_mm`: 64 output
+/// features by 32 rows, four simdgroups, 128 threads. `kernels/kquant_mm.h`
+/// holds the same numbers and the two must agree.
+const MM_NR0: usize = 64;
+const MM_NR1: usize = 32;
+const MM_NK: usize = 32;
+const MM_THREADS: usize = 128;
+/// A tile of A plus a tile of B, both in the float the kernel multiplies in.
+/// The output staging reuses the same allocation and is smaller (64 x 32
+/// floats), so this is the maximum of the two.
+const MM_SHMEM: usize = 4 * (MM_NR0 * MM_NK + MM_NR1 * MM_NK);
 
 /// Which k-quant a weight is stored in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -266,6 +280,166 @@ pub fn gather_qmv(
         .arr(rhs_indices)
         .groups((o / (NSG * NR0), rows, 1), (32, NSG, 1));
     out
+}
+
+/// `x @ w.T` at M > 1: ggml's `kernel_mul_mm`, the 64x32 tile.
+///
+/// This is the kernel [`qmv`]'s doc comment owes an apology to. A mat-vec per
+/// token re-reads the whole weight matrix once per token; a tile reads it once
+/// per 32 of them, which is invisible while the matrix fits in L2 and is not
+/// once it does not -- `HANDOFF.md` measured level at 600 prompt tokens and
+/// -8% / -21% at 3060.
+///
+/// `x` is `[.., M, I]` and the result `[.., M, O]`, the same contract [`qmv`]
+/// has. Every shape is bounds-checked inside the tile, so unlike [`qmv`] this
+/// wants no divisibility of `O`.
+pub fn qmm_t(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
+    let (o, k) = (w.out_dims(), w.in_dims());
+    assert_eq!(x.shape[x.ndim() - 1], k, "{} qmm_t: x is {k}-wide?", w.kind.name());
+    assert_eq!(k % QK_K, 0, "{} qmm_t: {k} is not a multiple of {QK_K}", w.kind.name());
+    assert_eq!(
+        w.num_experts(),
+        1,
+        "{} qmm_t: a routed weight goes through the gather",
+        w.kind.name()
+    );
+    let m = x.numel() / k;
+
+    let mut shape = x.shape.clone();
+    let n = shape.len();
+    shape[n - 1] = o;
+    let out = Array::empty(ctx, &shape, x.dtype);
+    ctx.kernel(&w.kernel("qmm_t", x.dtype))
+        .arr(&w.qs)
+        .arr(&w.scales)
+        .arr(&w.dm)
+        .arr(x)
+        .out(&out)
+        .bytes(&(k as i32))
+        .bytes(&(o as i32))
+        .bytes(&(m as i32))
+        .threadgroup_memory(MM_SHMEM, 0)
+        .groups((m.div_ceil(MM_NR1), o.div_ceil(MM_NR0), 1), (MM_THREADS, 1, 1));
+    out
+}
+
+/// `mx.gather_qmm(..., transpose=True)` at M > 1: ggml's `kernel_mul_mm_id`,
+/// tiled the way mlx's `gather_qmm_rhs` is.
+///
+/// Output row `r` is `x[lhs[r]] @ w[rhs[r]].T`, which is [`gather_qmv`]'s
+/// contract unchanged. The tile walks its own 32 rows of `rhs`, finds each run
+/// of one expert and runs the whole K loop once per run, so the weight traffic
+/// is one read per *run* where the mat-vec pays one per row. It is therefore
+/// never worse than the mat-vec in weight traffic and is much better when the
+/// rows are grouped -- which `switch_glu_sorted` makes them, at every batch of
+/// 64 rows or more.
+pub fn gather_qmm_t(
+    ctx: &Context,
+    x: &Array,
+    w: &KMatrix,
+    lhs_indices: &Array,
+    rhs_indices: &Array,
+) -> Array {
+    let (o, k) = (w.out_dims(), w.in_dims());
+    assert_eq!(x.dim(-1), k, "{} gather gemm: x is {k}-wide?", w.kind.name());
+    assert_eq!(k % QK_K, 0, "{} gather gemm: {k} is not a multiple of {QK_K}", w.kind.name());
+    let rows = rhs_indices.numel();
+    assert_eq!(lhs_indices.numel(), rows, "{} gather gemm: index arrays disagree", w.kind.name());
+
+    let out = Array::empty(ctx, &[rows, o], x.dtype);
+    ctx.kernel(&w.kernel("gather_qmm_t", x.dtype))
+        .arr(&w.qs)
+        .arr(&w.scales)
+        .arr(&w.dm)
+        .arr(x)
+        .out(&out)
+        .bytes(&(k as i32))
+        .bytes(&(o as i32))
+        .bytes(&(rows as i32))
+        .arr(lhs_indices)
+        .arr(rhs_indices)
+        .threadgroup_memory(MM_SHMEM, 0)
+        .groups((rows.div_ceil(MM_NR1), o.div_ceil(MM_NR0), 1), (MM_THREADS, 1, 1));
+    out
+}
+
+/// How many rows it takes before the tile beats the mat-vec.
+///
+/// mlx decides this per shape (`qmv_batch_limit` weighs the weight read
+/// against the activation read and lands at 13-15 for this model's linears).
+/// The k-quants have no such calibration behind them, so this is one number,
+/// and it is measured rather than guessed -- `src/bin/kquant_mm.rs` times both
+/// kernels at M = 1..64 on the four shapes the two formats are used at, best
+/// of forty windows of thirty dispatches:
+///
+///   shape                     M=1    M=4    M=6    M=8   M=16   crossover
+///   in_proj_qkv [8192, 2048]  3.91   1.65   1.13   0.86   0.44    6 -> 8
+///   out_proj    [2048, 4096]  4.62   1.74   1.22   0.94   0.50    6 -> 8
+///   q_proj      [2048, 2048]  2.89   1.11   0.80   0.63   0.33    4 -> 6
+///   down_proj   [2048,  512]  1.81   0.93   0.84   0.67   0.40    2 -> 4
+///
+/// (tile time over mat-vec time; below 1 the tile wins.) The tile's own time
+/// is *flat* from M = 1 to M = 32 -- it does a 32-row tile's work whether or
+/// not the rows are there -- so the ratio is the mat-vec's linear growth
+/// divided by a constant, and the crossover is where that line passes it.
+///
+/// **8, which is deliberately the conservative end of 4 to 8.** It is right
+/// for the two widest shapes and leaves the two narrow ones a little on the
+/// mat-vec, and it keeps the speculative verify window (`depth + 1` = 4 rows)
+/// exactly where it was, on a path this change has no business moving.
+const MM_ROW_LIMIT: usize = 8;
+
+/// `ORNITH_KQUANT_GEMM=0` sends every shape back through the mat-vec.
+///
+/// The gemm replaces a kernel that works, so the question it has to answer is
+/// not "is it fast" but "is it faster than what it replaced, on this machine,
+/// in this thermal state". A flag makes that an A/B inside one process instead
+/// of two runs an hour apart -- which matters here, where `HANDOFF.md` records
+/// identical traffic measuring 110.4 and 124.2 tok/s on different days.
+fn gemm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ORNITH_KQUANT_GEMM").as_deref() != Ok("0"))
+}
+
+/// `x @ w.T` for whatever M the caller has: [`qmv`] at a decode step's one
+/// row, [`qmm_t`] at a prefill chunk's thousands.
+pub fn matmul(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
+    let m = x.numel() / w.in_dims();
+    // `qmv` fixes four output rows per threadgroup, so a matrix whose O is not
+    // a multiple of four has to take the tile, which bounds-checks. No module
+    // in this artifact is such a shape, but the fallback is free to state.
+    if (m >= MM_ROW_LIMIT && gemm_enabled()) || w.out_dims() % (NSG * NR0) != 0 {
+        qmm_t(ctx, x, w)
+    } else {
+        qmv(ctx, x, w)
+    }
+}
+
+/// The routed pair of [`matmul`].
+///
+/// `sorted` is the caller's claim that the rows are grouped by expert. Unlike
+/// mlx's it is not a correctness precondition -- [`gather_qmm_t`] finds its own
+/// runs and is right either way -- it only says whether the runs will be long
+/// enough to be worth the tile. The thresholds are mlx's own, from
+/// `GatherQMM::eval_gpu`.
+pub fn gather_matmul(
+    ctx: &Context,
+    x: &Array,
+    w: &KMatrix,
+    lhs_indices: &Array,
+    rhs_indices: &Array,
+    sorted: bool,
+) -> Array {
+    let rows = rhs_indices.numel();
+    let experts = w.num_experts();
+    if (rows >= 16 && sorted && rows / experts >= 4 && gemm_enabled())
+        || w.out_dims() % (NSG * NR0) != 0
+    {
+        gather_qmm_t(ctx, x, w, lhs_indices, rhs_indices)
+    } else {
+        gather_qmv(ctx, x, w, lhs_indices, rhs_indices)
+    }
 }
 
 fn type_name(d: Dtype) -> &'static str {

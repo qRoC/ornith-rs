@@ -263,8 +263,8 @@ dispatch diverged.
 | Test | Covers |
 |---|---|
 | `quantized.rs` | `quantized_matmul` on real weights, **affine** 4-bit/g32 and 8-bit/g64, M = 1/2/4/8/16/64/256 (qmv_fast, qmv_wide, qmm_t_splitk + reduce) |
-| `q4k.rs` | ggml's **Q4_K**, one of two cases with no MLX behind it: `q4k_dequantize` against ggml's own `dequantize_row_q4_K` at `max_abs == 0.0`, the matvec against a float64 reference and against a one-hot activation, the routed gather over four experts, the three-tensor loader against a forged one-module artifact, and (`--ignored`) every module of a real artifact against ggml digest for digest |
-| `q6k.rs` | the same four checks for **Q6_K**, whose traps are its own: a *signed* sub-block scale and a code biased by 32, so `w = d*sc*(q - 32)` with no minimum |
+| `q4k.rs` | ggml's **Q4_K**, one of two cases with no MLX behind it: `q4k_dequantize` against ggml's own `dequantize_row_q4_K` at `max_abs == 0.0`, the matvec against a float64 reference and against a one-hot activation, the routed gather over four experts, the three-tensor loader against a forged one-module artifact, and (`--ignored`) every module of a real artifact against ggml digest for digest. Then the **tile**: the same float64 and one-hot checks at M = 37 and at a 100-row matrix (both partial-tile bounds), the routed tile over runs of 5/40/3/22 rows that straddle the 32-row tile three different ways, the same rows shuffled (unsorted is slow, not wrong), and -- the check a replacement owes -- agreement with the matvec it replaces, at 2.0e-6 |
+| `q6k.rs` | the same checks for **Q6_K**, whose traps are its own: a *signed* sub-block scale and a code biased by 32, so `w = d*sc*(q - 32)` with no minimum |
 | `quantized_nvfp4.rs` | the same, in **nvfp4 g16**, plus both gathered branches and `dequantize`. Carries its own weights -- the control artifact's, recut -- so it runs whatever model is on disk and could check the kernels before a build was spent on them |
 | `ops.rs` | rms_norm (weighted, weightless, head_dim), rope (decode + prefill, offsets), fused elementwise |
 | `activations.rs` | silu / swiglu / precise_swiglu / sigmoid over **every** bfloat16 input |
@@ -417,6 +417,20 @@ method; this is the table.
     q6k-all               + 128 Q6_K        1.8051 GB          0.0342
     q6k-full              same, all weighted 1.8051 GB         0.0244
 
+Those six were captured through the mat-vec prefill, which is no longer the
+prefill (Phase 19). Re-captured on the tile, the four that were re-run keep
+their order -- `q4k-all` 0.0301, `q6k-full` 0.0344, `q6k-all` 0.0370,
+`int4-head-linattn` 0.0422 -- and `max` is unchanged to four decimals on the
+k-quants. The median is the unstable statistic here, as Phase 15 found; the
+sign tests are coin flips, and mlx's own affine gemm moves a capture by more
+than this tile does.
+
+**One recorded verdict does not survive the move.** Phase 17's `q6k-all` vs
+`q4k-all`, the only significant result in nineteen phases, is 20 of 57
+(p = 0.033) on the mat-vec and **23 of 58 (p = 0.148) on the tile**. Phase
+18's finding -- that weighting the conversion is what makes it viable -- is
+unchanged on either instrument; the loss it explained is not.
+
 **-13.1% of a decode step at no quality difference this instrument can see.**
 Every pairwise sign test over the 64 probes is a coin flip except one, and
 that one -- `q6k-all`, 22 of 64 -- was 48 modules quantized without an
@@ -436,20 +450,51 @@ Regenerating the pieces, none of which are in git:
 and `vendor/ggml` must be built first -- see the header of `tools/q4k_oracle.c`
 for the cmake line. `tools/forge_q4k.py --help` is its own docstring.
 
-**The debt is prefill, and it has a number.** M > 1 goes through ggml's token
-axis -- a mat-vec per token, so the weights are re-read once each instead of
-being tiled. What that costs depends on whether the matrix fits in cache, so
-it is invisible on a short prompt and not on a long one:
+Two measurement escape hatches, both inert by default, both there because a
+kernel that replaces a working kernel has to be compared against it in one
+sitting on a machine whose wall clock swings 3x between sittings:
 
-    prompt tokens      int4 (affine)   q4k-all   q6k-full
-    600                    184.1        188.2       --
-    3060                   397.7        366.5      313.6   tok/s
+    ORNITH_KQUANT_GEMM=0    k-quants take the mat-vec at every M
+    ORNITH_AFFINE_GEMM=0    mlx's affine modules take *its* mat-vec at every M
 
-Level at 600 -- the L2 absorbs a 9 MB matrix read 599 times -- and **-8% and
--21%** at 3060, growing with the k-quantized share. `qmm_t` is the kernel that
-would fix it (ggml's `kernel_mul_mm_q4_K_f32` and `kernel_mul_mm_id_q4_K_f32`
-in `vendor/ggml/src/ggml-metal/kernels/mul_mm.metal`) and it is not written.
-It changes no verdict: every number above was measured through the mat-vec.
+The second is the control for the first: it makes the same move on a path
+nobody here wrote, which is how Phase 19 established that a tiled prefill
+perturbs a probe capture regardless of the format, and that this tile perturbs
+it less than mlx's own does.
+
+    cargo run --release --bin kquant_mm     # where the two kernels cross, per M
+
+**The debt was prefill, and `REBUILD.md` Phase 19 paid it.** M > 1 used to go
+through ggml's token axis -- a mat-vec per token, so the weights were re-read
+once each instead of being tiled, which is invisible on a short prompt and not
+on a long one. `kernels/kquant_mm.h` is ggml's `kernel_mul_mm` for both
+formats, and `kquant::MM_ROW_LIMIT` (8, measured) is where the dispatcher
+switches. In GPU seconds, which is the number to read on this machine:
+
+    prompt tokens        affine    q4k-all              q6k-full
+                         int4      mat-vec    tile      mat-vec    tile
+    599                   0.69      1.43       0.68      1.79       0.69
+    2932                  2.49      6.84       2.71      8.82       2.75
+
+**2.75x and 3.54x the affine artifact's GPU work, down to 1.09x and 1.10x** at
+2932, and to exactly 1.00x at 599. On the wall, taking only draws that ran at
+93% GPU busy or better: `q6k-full` 325.7 -> 1035.5 tok/s at 2932 and
+310.4 -> 815.3 at 599; `q4k-all` 399.8 -> 836.9 at 599. Decode is untouched,
+M = 1 being far below the crossover.
+
+Read GPU seconds and not the wall here. Within a configuration the GPU holds to
+1% across draws (6.85, 6.90, 6.84) while the wall swings by 3x (3.78, 8.30,
+11.46 s for 2.49, 2.57, 2.64 s of GPU) and by 4.4x at worst. And at 2932 the
+`q4k-all` tile draws
+all came back at 34-41% busy -- a third of the GPU work inside the same wall,
+which is "prefill's half-idle GPU" below showing through from underneath.
+
+The one thing it did change is the instrument. A tiled prefill perturbs a
+probe capture -- and so does mlx's own, by more than this one; Phase 19 has
+the control and the sign tests, which are coin flips. The consequence worth
+carrying: **the k-quant captures in Phases 15-18 were taken on a mat-vec
+prefill and every affine capture in this rebuild on a tiled one.** The
+orderings survive it.
 
 ---
 

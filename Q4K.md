@@ -208,10 +208,35 @@ two-tensor modules.
    a one-hot activation, where each output row must be one column of one
    expert. That unlocks the 96 routed modules, 0.7172 GB of a decode step.
 
-7. **Prefill** (`qmm_t`) -- **still the debt.** M > 1 goes through ggml's
-   token axis, a mat-vec per token, so the weights are re-read once each.
-   It exists so a k-quant artifact can be run at all; it changes no verdict
-   and it is the reason a probe capture takes minutes rather than seconds.
+7. **Prefill** (`qmm_t`) -- **DONE, and it is one tile for both formats.**
+   `kernels/kquant_mm.h` is the legacy (`simdgroup_matrix`) branch of ggml's
+   `kernel_mul_mm`, 64 output features by 32 rows by 32 of K, with the format
+   moved into a traits struct because the artifact stores three tensors where
+   ggml stores one block. `kquant_gather_qmm_t` is the routed twin and it
+   takes **mlx's** answer to the ragged part rather than ggml's: ggml builds a
+   per-expert row list in a separate pass (`kernel_mul_mm_id_map0`) and
+   dispatches a grid over experts, while mlx's `gather_qmm_rhs` walks the
+   tile's own indices, finds each run of one expert and runs the K loop once
+   per run. mlx's needs no second kernel and no scratch, keeps the port's own
+   grid, and is *correct for any ordering* -- unsorted rows are slow, not
+   wrong, which is a test rather than a comment.
+
+   Three departures from ggml's kernel, and the middle one is the load-bearing
+   one:
+
+   - **the layout**, as above;
+   - **the tile scalar is `float`, not ggml's `half`.** The gemm replaces a
+     kernel that is already checked, so its contract is that it agrees with
+     that kernel to within the difference in summation order. Rounding a
+     dequantized weight to eleven significand bits is a 5e-4 perturbation --
+     three orders above reassociation -- so it would not. At `float` the
+     measured disagreement with the mat-vec is **2.0e-6**, which is what two
+     float32 sums in different orders look like. (mlx's own affine gemm
+     rounds its dequantized weights to *bfloat16*, so this tile is the more
+     faithful of the two, and the probes show it.)
+   - **the store** stages through threadgroup memory and converts, because
+     `dst` here is the activation type where ggml's is float32. That also
+     gives the routed variant its row slicing for free.
 
 8. **Q6_K -- kernel DONE, artifact pending.** `kernels/q6k.metal` is ggml's
    `kernel_mul_mv_q6_K_f32_impl` and `dequantize_row_q6_K`, with `tests/q6k.rs`
@@ -421,6 +446,86 @@ quantize, one group at a time. Either derive the super-scale from the
 pre-compensation weights (an approximation) or make the walk's block the whole
 256-column super-block (exact, but reintroduces the staleness that Phase 7's
 "the block is the group" decision removed on purpose).
+
+## Where the crossover is
+
+`kquant::matmul` has to pick one of the two kernels at every call, and the
+answer is not obvious in either direction. The mat-vec re-reads the whole
+matrix once per row, so its cost is linear in M from the second row on. The
+tile reads it once per 32 rows but pays for a 32-row tile whether or not the
+rows are there. `src/bin/kquant_mm.rs` times both at M = 1..64 on the four
+shapes the two formats are used at -- best of forty windows of thirty
+dispatches, tile time over mat-vec time:
+
+    shape                     M=1    M=4    M=6    M=8   M=16   M=32
+    in_proj_qkv [8192, 2048]  3.91   1.65   1.13   0.86   0.44   0.22
+    out_proj    [2048, 4096]  4.62   1.74   1.22   0.94   0.50   0.25
+    q_proj      [2048, 2048]  2.89   1.11   0.80   0.63   0.33   0.18
+    down_proj   [2048,  512]  1.81   0.93   0.84   0.67   0.40   0.22
+
+**The crossover is 4 to 8 rows, and `MM_ROW_LIMIT` is 8** -- the conservative
+end, right for the two widest shapes and leaving the two narrow ones a little
+on the mat-vec. It also keeps the speculative verify window, `depth + 1` = 4
+rows, exactly where it was; a prefill kernel has no business moving the MTP
+path.
+
+The shape of that table is worth reading rather than just its crossing point:
+**the tile's own time is flat from M = 1 to M = 32** -- 98.4 to 99.1 us for
+`in_proj_qkv` across the whole range -- and doubles at 64, where a second row
+tile appears. So the ratio is the mat-vec's straight line divided by a
+constant, and at M = 1 the tile is 1.8x to 4.6x worse. The guard is not
+optional.
+
+**And one measurement lesson, which is `HANDOFF.md`'s own rule one level up.**
+The first run of that bench timed *one* dispatch between two `sync`s and every
+shape came back at 120-190 us, crossover invisible. That is the submit-and-wait
+round trip on this machine -- thirty times a small matrix's own kernel time.
+Chaining thirty dispatches inside each window is what made the difference
+measurable at all.
+
+## The instrument moved, and a control says it is the tile, not the kernel
+
+`Q4K.md` and `REBUILD.md` both say a probe capture has to come back with the
+same KL table or the kernel is wrong. It did not, quite, and the first reading
+looked bad: `q6k-full`'s median went **0.0327 -> 0.0354** and the head-to-head
+printed "lower on 19 of 57", which reads like a significant loss.
+
+Two things were wrong with that reading, and the second is the interesting one.
+
+**The sign test was counting ties as losses.** 13 of 64 probes are bit-identical
+between the two captures and many more are identical on the live set. Over the
+probes that actually moved it is a coin flip:
+
+    pair                              moved   gemm lower on      p   median
+    q4k-all      -> gemm                 43       18    0.360   0.0320 -> 0.0315
+    q6k-full     -> gemm                 44       19    0.451   0.0327 -> 0.0354
+    int4 mat-vec -> mlx's own gemm       34       19    0.608   0.0447 -> 0.0427
+
+**And the third row is the control.** `ORNITH_AFFINE_GEMM=0` (a measurement
+escape hatch in `ops::quantized`, inert by default) runs an *all-affine*
+artifact's prefill through mlx's mat-vec instead of mlx's tiled gemm -- the
+same move, on a path nobody here wrote, with no k-quant anywhere in it. It
+moves the capture by **more** than either k-quant does:
+
+    pair                          max_abs   rows bit-identical   largest KL
+    int4 mat-vec vs mlx's gemm      3.116        24 of 64          0.348
+    q6k-full mat-vec vs this tile   3.062        13 of 64          0.152
+    q4k-all  mat-vec vs this tile   2.671        13 of 64          0.062
+
+So: **changing prefill from a mat-vec per token to a tile perturbs a capture,
+on any quantization family, and this tile perturbs it less than mlx's own.**
+That last part is not luck -- mlx's `qmm_t` dequantizes its weights into
+threadgroup memory as *bfloat16* and this one uses float, which is the whole
+reason the tile scalar was made a template parameter.
+
+What it costs to know: the recorded verdicts of Phases 15-18 were all taken on
+a mat-vec prefill, while every affine verdict in this rebuild was taken on a
+tiled one. **The captures were never on the same instrument.** The orderings
+survive it -- `q4k-all` 0.0301 < `q6k-full` 0.0344 < `int4` 0.0422, the same
+order and the same `max` to four decimals on both k-quant artifacts, with
+`arith/ru-7x8` landing on the same side of its cliff -- but that was worth
+checking rather than assuming, and it is the kind of thing that would have sat
+undetected under a table.
 
 ## How this goes wrong
 

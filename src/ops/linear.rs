@@ -32,7 +32,7 @@ impl Linear {
     pub fn matmul(&self, ctx: &Context, x: &Array) -> Array {
         match self {
             Linear::Mlx(q) => quantized_matmul(ctx, x, q),
-            Linear::K(q) => kquant::qmv(ctx, x, q),
+            Linear::K(q) => kquant::matmul(ctx, x, q),
         }
     }
 
@@ -41,9 +41,9 @@ impl Linear {
     ///
     /// `sorted` is mlx's hint that the rows are grouped by expert, which lets
     /// its kernel stream an expert's weights once for a run of rows. The
-    /// k-quant has no such variant, so the flag only reaches the mlx side --
-    /// stated here rather than silently ignored, because the two paths then
-    /// differ in speed and not in result.
+    /// k-quant's gemm does the same, by finding the runs inside its own tile,
+    /// so the flag now reaches both sides -- and on the k-quant side it is only
+    /// a hint about speed: `kquant::gather_qmm_t` is correct for any ordering.
     pub fn gather_matmul(
         &self,
         ctx: &Context,
@@ -54,7 +54,7 @@ impl Linear {
     ) -> Array {
         match self {
             Linear::Mlx(q) => gather_qmm_rows(ctx, x, q, lhs_indices, rhs_indices, sorted),
-            Linear::K(q) => kquant::gather_qmv(ctx, x, q, lhs_indices, rhs_indices),
+            Linear::K(q) => kquant::gather_matmul(ctx, x, q, lhs_indices, rhs_indices, sorted),
         }
     }
 

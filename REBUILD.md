@@ -2679,6 +2679,193 @@ the same shape Phase 17 saw, pointing the other way.
 
 ---
 
+## Phase 19 -- the prefill debt paid, and the captures were never on one instrument -- **DONE**
+
+Phases 15-18 built five k-quant artifacts and every one of them was measured
+through a **mat-vec per token** at prefill: ggml's `kernel_mul_mv_*` carries a
+token axis on the grid's y, so M > 1 works, and it works by re-reading the
+whole weight matrix once for each row. `HANDOFF.md` put a number on it --
+level with affine at 600 prompt tokens, where L2 absorbs a 9 MB matrix read
+599 times, and -8% / -21% in tok/s at 3060. This is the tile that replaces it:
+ggml's `kernel_mul_mm`, 64 output features by 32 rows by 32 of K, in
+`kernels/kquant_mm.h`, shared by both formats through a traits struct, plus the
+routed twin.
+
+`Q4K.md` step 7 has the design and the three departures from ggml's kernel.
+The one that decided everything else: **the tile scalar is `float`, not ggml's
+`half`**, because a gemm that replaces a checked kernel owes agreement with it,
+and rounding a dequantized weight to eleven significand bits is a 5e-4
+perturbation where reassociation is 2e-6.
+
+### What it bought
+
+Read GPU seconds here and not the wall. Five configurations, two prompts, two
+or three draws each -- and within a configuration the **GPU seconds hold to
+1%** (`q4k-all` on the mat-vec: 6.85, 6.90, 6.84) while the wall swings by
+**3x** (`int4` at 2932: 3.78, 8.30, 11.46 s for 2.49, 2.57, 2.64 s of GPU) and
+by **4.4x** at worst (`q4k-all` on the tile at 599: 0.72 and 3.16 s, for 0.68
+and 0.76). The wall is measuring the swap file; the GPU is measuring the
+kernel.
+
+    prompt tokens        affine    q4k-all              q6k-full
+                         int4      mat-vec    tile      mat-vec    tile
+    599                   0.69      1.43       0.68      1.79       0.69   s GPU
+    2932                  2.49      6.84       2.71      8.82       2.75   s GPU
+
+**The debt is paid.** At 2932 tokens the k-quant prefill was 2.75x and 3.54x
+the affine artifact's GPU work and is now **1.09x and 1.10x**; at 599 it was
+2.1x and 2.6x and is now **1.00x** -- level, to the digit, on both formats.
+
+The wall follows wherever the host keeps up. Quoting only the draws that ran at
+93% GPU busy or better, so the number is the kernel and not the queue:
+
+    prompt tokens     q4k-all               q6k-full
+                      mat-vec    tile       mat-vec    tile
+    599                399.8     836.9       310.4     815.3   tok/s
+    2932               411.9       --        325.7    1035.5   tok/s
+
+**and where it does not keep up, the gain stays in the GPU column.** Every
+`q4k-all` draw on the tile at 2932 came back at 34-41% busy: 2.71 s of GPU
+inside a 6.7-8.2 s wall, against the mat-vec's 6.84 s inside 7.1-9.2. Same
+wall, a third of the work. That is `HANDOFF.md`'s "prefill's half-idle GPU"
+showing through from underneath -- the tile removed GPU work that had been
+hiding inside a host-bound wall, and what is left is a scheduling problem that
+this phase does not touch.
+
+Decode is untouched by construction: M = 1 and 8 routed rows are both below the
+crossover, so both take the mat-vec they always took.
+
+One number that is *not* a win and is worth leaving visible: at 2932 tokens the
+affine artifact still does 2.49 s of GPU where `q6k-full` does 2.75, and it is
+reading **more** bytes a token. mlx's steel gemm is a tuned kernel and this is
+ggml's untuned one; ~10% is what that costs.
+
+### The crossover, measured rather than picked
+
+`src/bin/kquant_mm.rs` times both kernels at M = 1..64 on the four shapes the
+formats are used at. The tile's own time is **flat** from M = 1 to 32 -- it
+does a 32-row tile's work whether the rows are there or not -- so the ratio is
+the mat-vec's straight line over a constant, and the crossing is at 4 to 8
+rows depending on width. `MM_ROW_LIMIT` is 8: the conservative end, and it
+leaves the speculative verify window (4 rows) exactly where it was.
+
+At M = 1 the tile is 1.8x to 4.6x *worse*, so the guard is load-bearing rather
+than decorative.
+
+### The instrument moved, and the control says it is the tile
+
+`Q4K.md` and this file both said the probe capture had to come back with the
+same KL table or the kernel was wrong. It came back with `q6k-full`'s median at
+**0.0327 -> 0.0354** and a head-to-head of "lower on 19 of 57", which read like
+the first significant loss since Phase 17.
+
+Both halves of that reading were wrong, and the second half is the finding.
+
+**The sign test counted ties as losses.** Restricted to the probes that
+actually moved, all three A/Bs are coin flips:
+
+    pair                             moved   tile lower on      p     median
+    q4k-all      -> tile                43        18        0.360   0.0320 -> 0.0315
+    q6k-full     -> tile                44        19        0.451   0.0327 -> 0.0354
+    int4 mat-vec -> **mlx's own gemm**  34        19        0.608   0.0447 -> 0.0427
+
+**The third row is a control and it is the point.** `ORNITH_AFFINE_GEMM=0` --
+a measurement escape hatch in `ops::quantized`, inert by default -- runs an
+all-affine artifact's prefill through mlx's mat-vec instead of mlx's tiled
+gemm. Same move, no k-quant anywhere in it, code nobody here wrote. It moves
+the capture by *more* than either k-quant tile does:
+
+    pair                            max_abs   bit-identical rows   largest KL
+    int4 mat-vec vs mlx's gemm        3.116         24 of 64          0.348
+    q6k-full mat-vec vs this tile     3.062         13 of 64          0.152
+    q4k-all  mat-vec vs this tile     2.671         13 of 64          0.062
+
+So the movement is what tiling a prefill does to a capture, on any
+quantization family -- and this tile moves it less than mlx's own, because
+mlx's `qmm_t` dequantizes into threadgroup memory as *bfloat16* and this one
+uses float.
+
+**What that costs to know: the k-quant verdicts in Phases 15-18 were taken on a
+mat-vec prefill while every affine verdict in this rebuild was taken on a tiled
+one. The captures were never on the same instrument.** The orderings survive
+it, which is why those phases stand:
+
+    variant           median      p90      max   top-1 moved
+    q4k-all-gemm      0.0301   0.1449   4.6466     8 of 64
+    q6k-full-gemm     0.0344   0.2116   4.5238     5 of 64
+    int4-gemm         0.0422   0.2040   0.7394     8 of 64
+
+Same order as Phase 18's table, and `max` unchanged to four decimals on both
+k-quant artifacts -- `arith/ru-7x8` lands on the same side of its cliff. But it
+was worth checking rather than assuming, and it is exactly the sort of
+difference that sits undetected under a table.
+
+### And one recorded verdict does not survive it: Phase 17's
+
+Phase 17 produced **the only significant result this instrument has ever
+returned** -- `q6k-all` lower than `q4k-all` on 22 of 64 probes, p = 0.017 --
+and Phase 18 explained it as 48 modules quantized without an importance
+vector. `q6k-all` was therefore worth re-capturing on the tile, so that both
+arms of that comparison sit on one instrument. They now do:
+
+    comparison                        instrument   sign test          p
+    q6k-all vs q4k-all   (Phase 17)   mat-vec      20 of 57       0.033
+    q6k-all vs q4k-all   (Phase 17)   **tile**     **23 of 58**   **0.148**
+    q6k-full vs q6k-all  (Phase 18)   mat-vec      35 of 57       0.111
+    q6k-full vs q6k-all  (Phase 18)   tile         35 of 58       0.148
+
+(The first row recomputes Phase 17's claim on its own captures over the live
+set rather than all 64, which is why it reads 0.033 where the phase recorded
+0.017. Unlike the same-artifact A/Bs above, these have no ties to argue about:
+two different artifacts differ on every live probe.)
+
+**Phase 18's finding is unchanged and Phase 17's headline is not.** The
+weighted conversion is better than the unweighted one by the same margin on
+either instrument, which is the claim Phase 18 rests on. But the loss it was
+explaining -- the only p below 0.05 in nineteen phases -- reads as a coin flip
+once both artifacts are prefilled the same way. Phase 17 already carried two
+corrections (the per-bit argument was pointed at the wrong step; the missing
+imatrix, not the format, was the cost). This is a third, and it is the one that
+takes the result rather than the explanation: **there may have been nothing
+there to explain.**
+
+What that does *not* license is reading the tile as the truer instrument. It is
+the one the port now runs and the one every affine number was taken on, which
+is the argument for using it; it is not independently more correct than a
+mat-vec, and the two disagree by less than either disagrees with the parent.
+
+### The routed side, and why it is mlx's design and not ggml's
+
+ggml solves "which rows belong to which expert" with a separate pass that
+builds a per-expert row list and a grid dispatched over experts. mlx's
+`gather_qmm_rhs` solves it inside the tile: walk the tile's own indices, find
+each maximal run of one expert, run the K loop once per run, store only that
+run's rows. This takes mlx's, for three reasons -- no second kernel and no
+scratch buffers, the port's own output grid is preserved, and it is **correct
+for any ordering**. Unsorted rows are slow, not wrong, and that is a test
+rather than a comment. `switch_glu_sorted` sorts at every batch of 64 rows or
+more, so at prefill the runs are ~64 rows against a 32-row tile.
+
+That also closes the "kquant_gather_qmm_rhs" item `Q4K.md` listed as a
+follow-on: the streaming behaviour mlx gets from sorted rows is what the run
+loop does, so there is no second kernel to write.
+
+### What is left
+
+  - **A Hessian for `in_proj_z`**, still: it would take the 4-bit side's
+    imatrix from 61 of 91 modules to all of them. Unchanged by this phase.
+  - **Re-capturing the last two k-quant artifacts on the tile**, if their
+    numbers are ever going to be compared against anything again. `q4k-all`,
+    `q6k-all`, `q6k-full` and `int4-head-linattn` are done; `q4k-imatrix` and
+    `q4k` (the 91-module first cut) are not.
+  - **The tile is ggml's shape, not a tuned one.** `vendor/accelerated-qwen-3.8`
+    specialises ggml's *mat-vec* for Apple Silicon by moving shape parameters
+    into function constants; nothing here has done the equivalent for the tile,
+    and the flat 98.4 us across M = 1..32 says a narrower tile would help the
+    shapes that cross late.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

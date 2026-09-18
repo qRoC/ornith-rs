@@ -27,6 +27,8 @@
 
 #include "mlx/backend/metal/kernels/utils.h"
 
+#include "kquant_mm.h"
+
 #define QK_K 256
 #define Q4K_QS_U16 64 // 128 bytes of 4-bit codes, as uint16
 #define Q4K_SC_U16 6  // 12 bytes of packed 6-bit fields, as uint16
@@ -101,12 +103,11 @@ template <typename T>
 //
 // **This is a mat-VEC, including when M > 1.** ggml's kernel carries an `r1`
 // axis -- the grid's y -- that walks the columns of `src1`, and a decode step
-// never uses it. It is here for prefill, and the cost is explicit: the weights
-// are re-read once per token instead of being tiled, so a chunk of 128 reads
-// the matrix 128 times. That is the wrong shape for prefill and the right
-// shape for *having* a prefill at all -- `Q4K.md` leaves `q4k_qmm_t` for last,
-// and until it exists this is what lets a q4k artifact be measured rather than
-// only benchmarked at M = 1.
+// never uses it. The weights are then re-read once per token instead of being
+// tiled, so a chunk of 128 reads the matrix 128 times: the right shape up to a
+// handful of rows and the wrong one past that. `kquant_mm.h` is the tile that
+// takes over, and `kquant::MM_ROW_LIMIT` is the measured row count where it
+// does -- 8, with this kernel keeping everything below.
 // The body, with every pointer already resolved: the caller decides which
 // expert's weights and which token's activations these are. ggml splits it the
 // same way -- `kernel_mul_mv_id` is a wrapper that offsets `src0` by the
@@ -277,9 +278,65 @@ template <typename T, short nr0, short NSG>
       sgitg);
 }
 
-#define instantiate_q4k(tname, type)                                  \
-  instantiate_kernel("q4k_dequantize_" #tname, q4k_dequantize, type)  \
-  instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)          \
-  instantiate_kernel("q4k_gather_qmv_" #tname, q4k_gather_qmv, type, 2, 2)
+// The format, as `kquant_mm.h`'s tile wants it: a dequantizer over 16
+// consecutive weights, plus the three per-super-block strides.
+//
+// ggml's `dequantize_q4_K` in `dequantize.h` takes one `block_q4_K *`; this
+// takes the three pointers the artifact stores and is otherwise the same
+// arithmetic, including the `d / 16` that turns the high nibble's `q & 0xF0`
+// back into `q >> 4` exactly. The one change is the type it divides in: ggml
+// halves `xb->d` in `half`, where `d` near 6e-5 would denormalise, and this
+// halves it in float. That direction is the safe one -- it can only be more
+// accurate than the reference it is checked against.
+//
+// `il` is the il-th run of 16 weights in the 256-weight super-block, which is
+// what ggml's `il` means once its `(il/4)*32 + 16*(il&1)` addressing is
+// unpicked: chunk `il` is weights `[16*il, 16*il + 16)`.
+struct Q4KFmt {
+  static constant constexpr const short QK = QK_K;
+  static constant constexpr const short NL = 16; // 16-weight chunks a block
+  static constant constexpr const int CODES = 128; // bytes of `qs`
+  static constant constexpr const int SCALES = 12; // bytes of packed fields
+  static constant constexpr const int DM = 2; // halves: d and dmin
+
+  // `get_scale_min_k4_just2`, which reads the pair for one sub-block rather
+  // than `get_scale_min_k4`'s two. Same twelve bytes, same packing.
+  static inline uchar2 scale_min(int j, int k, const device uint8_t* q) {
+    return j < 4
+        ? uchar2{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}
+        : uchar2{
+              uchar((q[j + 4 + k] & 0xF) | ((q[j - 4 + k] & 0xc0) >> 2)),
+              uchar((q[j + 4 + k] >> 4) | ((q[j - 0 + k] & 0xc0) >> 2))};
+  }
+
+  static inline void dequantize(
+      const device uint8_t* qs,
+      const device uint8_t* scales,
+      const device half* dm,
+      short il,
+      thread float4x4& reg) {
+    const device uint8_t* q = qs + (il / 4) * 32 + 16 * (il & 1);
+    const short is = (il / 4) * 2;
+    il = il & 3;
+    const uchar2 sc = scale_min(is, il / 2, scales);
+    const float d = il < 2 ? float(dm[0]) : float(dm[0]) / 16.f;
+    const float dl = d * sc[0];
+    const float ml = float(dm[1]) * sc[1];
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (short i = 0; i < 16; ++i) {
+      reg[i / 4][i % 4] = dl * (q[i] & mask) - ml;
+    }
+  }
+};
+
+// The tile scalar is `float`: see `kquant_mm.h` for why it is not ggml's
+// `half`.
+#define instantiate_q4k(tname, type)                                           \
+  instantiate_kernel("q4k_dequantize_" #tname, q4k_dequantize, type)           \
+  instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)                   \
+  instantiate_kernel("q4k_gather_qmv_" #tname, q4k_gather_qmv, type, 2, 2)     \
+  instantiate_kernel("q4k_qmm_t_" #tname, kquant_qmm_t, type, Q4KFmt, float)   \
+  instantiate_kernel(                                                          \
+      "q4k_gather_qmm_t_" #tname, kquant_gather_qmm_t, type, Q4KFmt, float)
 
 instantiate_q4k(bfloat16, bfloat16_t) instantiate_q4k(float32, float)
