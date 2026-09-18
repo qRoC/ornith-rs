@@ -67,20 +67,31 @@ def put_scale_min_k4(sc, mn):
     return out
 
 
-def split(blocks, rows, nb):
-    """ggml's 144-byte blocks -> the three tensors an artifact stores.
+# Where each k-quant's fields sit inside its block, as ggml's structs order
+# them. Q4_K leads with its two super-scales; Q6_K ends with its one.
+#
+#   block_q4_K  d(2) dmin(2) scales(12) qs(128)                 = 144
+#   block_q6_K  ql(128) qh(64) scales(16) d(2)                  = 210
+def split(blocks, rows, nb, kind="q4_K"):
+    """ggml's blocks -> the three tensors an artifact stores.
 
     `Q4K.md`'s storage decision, in one place because it is a byte layout and
     two copies of a byte layout drift. The bytes are not reinterpreted, only
-    sliced: `dm` is the leading `d, dmin` pair, `scales` the twelve packed
-    6-bit fields, `qs` the 128 bytes of codes -- so the kernel reading them as
-    uint16 sees exactly what ggml's reads out of its packed block.
+    sliced, so the kernel reading them sees exactly what ggml's reads out of
+    its packed block. Q6_K's `ql` and `qh` are adjacent and go into one tensor
+    together; its `.dm` is one value wide, because it has no minimum.
     """
-    b = np.asarray(blocks, np.uint8).reshape(-1, BLOCK_BYTES)
+    nbytes = {"q4_K": BLOCK_BYTES, "q6_K": 210}[kind]
+    b = np.asarray(blocks, np.uint8).reshape(-1, nbytes)
     assert len(b) == rows * nb, (len(b), rows, nb)
-    dm = b[:, 0:4].copy().reshape(rows, nb * 4).view(np.float16).reshape(rows, nb, 2)
-    scales = b[:, 4:4 + K_SCALE_SIZE].copy().reshape(rows, nb, K_SCALE_SIZE)
-    qs = b[:, 4 + K_SCALE_SIZE:].copy().reshape(rows, nb * (QK_K // 2)).view(np.uint32)
+    if kind == "q4_K":
+        dm = b[:, 0:4].copy().reshape(rows, nb * 4).view(np.float16).reshape(rows, nb, 2)
+        scales = b[:, 4:4 + K_SCALE_SIZE].copy().reshape(rows, nb, K_SCALE_SIZE)
+        qs = b[:, 4 + K_SCALE_SIZE:].copy().reshape(rows, nb * (QK_K // 2)).view(np.uint32)
+        return qs, scales, dm
+    qs = b[:, 0:192].copy().reshape(rows, nb * 192).view(np.uint32)
+    scales = b[:, 192:208].copy().reshape(rows, nb, 16)
+    dm = b[:, 208:210].copy().reshape(rows, nb * 2).view(np.float16).reshape(rows, nb, 1)
     return qs, scales, dm
 
 
