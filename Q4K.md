@@ -312,6 +312,13 @@ byte has to come from somewhere, it should come from here -- which is what
 this measurement was for, and it is the opposite of `mxfp8`, which sat *off*
 the curve rather than on it.
 
+**AND THAT PARAGRAPH IS WRONG, which Phase 17 measured.** Built, the 8-bit
+side's bytes are the *only* ones that cost anything: `q6k-all` is lower than
+`q4k-all` on 22 of 64 probes, p = 0.017, the first significant comparison this
+instrument has produced -- while the 4-bit side's 187 modules were a coin flip
+across two phases. The per-bit argument is a fifth falsified predictor, and
+the first one this project reasoned out for itself rather than borrowed.
+
 What it does not say is that Q6_K keeps the quality: this is weight error, the
 currency this rebuild has falsified twice as a selector (Phases 4 and 7).
 Turning 6.1% of a step into a KL needs the second kernel, and the first one

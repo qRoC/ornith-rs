@@ -2506,6 +2506,86 @@ probe is the one this rebuild has watched break four formats.
 
 ---
 
+## Phase 17 -- Q6_K on the eight-bit side, and the first measurable cost -- **DONE**
+
+`Q4K.md` priced Q6_K for the 169 modules the artifact holds at affine int8 g64
+and argued, per bit, that they were the artifact's *cheapest* bits to give up:
+0.68 error-doublings a bit against the 0.96 the 4-bit side already pays. This
+phase built it. **The probes say the opposite, and it is the first thing this
+instrument has called significant.**
+
+`kernels/q6k.metal` is ggml's `kernel_mul_mv_q6_K_f32_impl` and
+`dequantize_row_q6_K`. Two traps of its own, neither of them Q4_K's: the
+sub-block scale is **signed** and the code is **biased by 32**, so
+`w = d*sc*(q - 32)` with no minimum anywhere. `forge_q4k.py --q6k` converts
+**128 of the 169** -- not `embed_tokens`, read by a gather and never by a
+matvec, and not `shared_expert_gate`, which is `[1, 2048]` where the kernel
+covers four rows at a time.
+
+Built on top of `q4k-all`, so the artifact is 315 k-quantized modules and the
+only variable against it is the 8-bit side. `check_rebuild.py` PASSes, 452/281
+holds, and **all 315 modules agree with ggml digest for digest**.
+
+### What it bought, and what it cost
+
+    artifact            bytes/token  decode      median KL, all 64 probes
+                                     best of 4   median     p90      max    top-1
+    int4-head-linattn    2.0761 GB   102.6 t/s   0.0350   0.1933   0.7394   8/64
+    gptq-head-linattn    2.0761 GB        --     0.0273   0.2412   1.0122   9/64
+    q4k-imatrix  (91)    1.9814 GB   104.8 t/s   0.0260   0.2336   1.6524   6/64
+    q4k-all     (187)    1.9311 GB   107.9 t/s   0.0237   0.1697   4.6466   6/64
+    **q6k-all   (315)**  **1.8051**  **124.2**   0.0342   **0.1572** 4.8855  **5/64**
+
+**-13.1% of a decode step against the baseline and +21% of the rate** -- and
+the decode draws span 104.9 to 124.2, so read the best-of-four as a best case
+rather than a typical one.
+
+    q6k-all vs q4k-all            lower on 22 of 64   p = 0.017
+    q6k-all vs int4-head-linattn  lower on 36 of 64   p = 0.38
+    q6k-all vs gptq-head-linattn  lower on 33 of 64   p = 0.90
+
+**22 of 64 is the first significant result this instrument has produced.**
+Every comparison in Phases 15 and 16 was a coin flip; this one is not, and it
+says the last step *hurt*. The whole package is still indistinguishable from
+the artifact that ships -- 36 of 64 against `int4-head-linattn`, at 13% fewer
+bytes -- but the marginal move from `q4k-all` to `q6k-all` is a measured loss
+rather than a free byte.
+
+Two honesties about that p-value. It is uncorrected, and four comparisons were
+run, so Bonferroni would put it at 0.068. And it is in the *expected*
+direction -- more quantization, more damage -- so it is a confirmation that
+the instrument can see something rather than a surprise it dug up.
+
+### The prediction it falsifies is this file's own
+
+`Q4K.md`'s per-bit framing said the 8-bit side was where the next byte should
+come from, because giving up a bit there costs 0.68 error-doublings against
+the 4-bit side's 0.96. The probes invert it: **the 4-bit side's bytes were
+free across two phases and 187 modules, and the 8-bit side's are not.**
+
+That is the fifth static predictor this rebuild has falsified -- after total
+weight error, per-decile weight error, output error on random `x`, and the
+H-weighted error -- and the first that was *this project's own reasoning*
+rather than a borrowed one. The mechanism is not established; what is
+established is that a rate-distortion argument about where bits are cheapest
+does not survive contact with 64 probes any better than a norm does.
+
+### The shape of the trade is not uniform
+
+`q6k-all` is worse in the middle and better in the tail: the **best p90 of
+every artifact here (0.1572)** and the **fewest top-1 tokens moved (5 of
+64)**, against the worst median of the three k-quant artifacts. Where the
+8-bit conversion shows most:
+
+    code/metal-kernel      -0.8404    q6k 1.0345   q4k-all 1.8749
+    arith/ru-7x8           +0.2389    q6k 4.8855   q4k-all 4.6466
+    longrange/json-field   +0.1502    q6k 0.3961   q4k-all 0.2460
+
+So it is not one probe this time -- it is a broad small loss in the middle
+with one large gain, which is what a median moving against a p90 looks like.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
