@@ -20,10 +20,14 @@
 //!   scales  uint8   [O, I / 256, 12]  8 x 6-bit scale + 8 x 6-bit min
 //!   dm      float16 [O, I / 256, 2]   d and dmin
 //!
-//! Only the M = 1 path is here. `Q4K.md` scopes the first cut that way on
-//! purpose: `affine_qmv_fast` is 38% of a decode step, so one kernel is enough
-//! to measure GB/token and GPU busy for real, and prefill can keep running the
-//! affine artifact until the format is judged.
+//! **One kernel, and it is a mat-vec.** `Q4K.md` scopes the first cut to
+//! M = 1, because `affine_qmv_fast` is 38% of a decode step and that alone is
+//! enough to measure GB/token and GPU busy for real. ggml's kernel also
+//! carries a token axis, and [`qmv`] keeps it: at M > 1 it is a mat-vec per
+//! token, re-reading the weights once each rather than tiling them. That is
+//! the wrong shape for prefill and the reason a q4k artifact can be *run* at
+//! all before `q4k_qmm_t` exists -- without it there is no prefill, and
+//! without a prefill there is no probe capture and no verdict.
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
@@ -106,15 +110,19 @@ pub fn dequantize(ctx: &Context, w: &Q4kMatrix, dtype: Dtype) -> Array {
     out
 }
 
-/// `x @ w.T` for a single row of `x`: ggml's `kernel_mul_mv_q4_K_f32_impl`.
+/// `x @ w.T`: ggml's `kernel_mul_mv_q4_K_f32_impl`.
 ///
-/// `x` is `[.., 1, I]` or `[I]`; the result is `[.., 1, O]`, keeping the
-/// caller's leading shape the way `quantized_matmul` does.
+/// `x` is `[.., M, I]`; the result is `[.., M, O]`, keeping the caller's
+/// leading shape the way `quantized_matmul` does. M is the grid's y axis, as
+/// in ggml -- a mat-vec per token rather than a tiled gemm, so the weights are
+/// re-read once per token. At M = 1, the decode step, that costs nothing; at
+/// prefill it is the price of not having written `q4k_qmm_t` yet, and it is
+/// paid in time rather than in correctness.
 pub fn qmv(ctx: &Context, x: &Array, w: &Q4kMatrix) -> Array {
     let (o, k) = (w.out_dims(), w.in_dims());
     assert_eq!(x.shape[x.ndim() - 1], k, "q4k qmv: x is {k}-wide?");
-    assert_eq!(x.numel(), k, "q4k qmv is the M = 1 path only");
     assert_eq!(k % QK_K, 0, "q4k qmv: {k} is not a multiple of {QK_K}");
+    let m = x.numel() / k;
     // The kernel's tail guard covers a short last row, but a threadgroup that
     // starts past the end would still walk the weight tensors, so refuse the
     // shape instead of reading off the end of the buffer.
@@ -137,7 +145,7 @@ pub fn qmv(ctx: &Context, x: &Array, w: &Q4kMatrix) -> Array {
         .out(&out)
         .bytes(&(k as i32))
         .bytes(&(o as i32))
-        .groups((o / (NSG * NR0), 1, 1), (32, NSG, 1));
+        .groups((o / (NSG * NR0), m, 1), (32, NSG, 1));
     out
 }
 

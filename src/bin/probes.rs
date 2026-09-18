@@ -33,7 +33,6 @@ use ornith_rs::json;
 use ornith_rs::metal::Context;
 use ornith_rs::model::config::TextConfig;
 use ornith_rs::model::qwen3_5::TextModel;
-use ornith_rs::ops::quantized::quantized_matmul;
 use ornith_rs::refs::{model_dir, refs_root};
 use ornith_rs::tokenizer::Tokenizer;
 use ornith_rs::tokenizer::split::Dialect;
@@ -146,7 +145,7 @@ fn main() {
         let mut caches = model.make_cache();
         let processed = prefill(&ctx, &model, &mut caches, &ids, CHUNK, None, |_, _| {});
         let (h, _) = model_call(&ctx, &model, &mut caches, &ids[processed..], None);
-        let logits = quantized_matmul(&ctx, &h, &model.lm_head);
+        let logits = model.lm_head.matmul(&ctx, &h);
         let last = logits.numel() / logits.dim(-1);
         assert_eq!(last, 1, "the logit-producing step is a single token in mlx-lm");
         let lg = logits.to_vec_f32(&ctx);

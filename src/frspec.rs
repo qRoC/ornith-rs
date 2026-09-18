@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
 use crate::ops::embedding::gather_rows;
+use crate::ops::linear::Linear;
 use crate::ops::quantized::QuantMatrix;
 
 pub struct FrSpec {
@@ -38,7 +39,7 @@ pub struct FrSpec {
     /// to the host, so the subset index has to be mapped back there too.
     ids: Array,
     /// `lm_head`'s rows for those ids, and nothing else.
-    pub head: QuantMatrix,
+    pub head: Linear,
     pub n: usize,
     pub vocab: usize,
 }
@@ -49,7 +50,7 @@ impl FrSpec {
     /// The gather is `mx.take(..., axis=0)` on each of `weight`, `scales` and
     /// `biases`, which is what `install_frspec_draft_head` does and what this
     /// port already does for every embedding lookup.
-    pub fn load(ctx: &Context, lm_head: &QuantMatrix, path: &Path) -> Result<FrSpec, String> {
+    pub fn load(ctx: &Context, lm_head: &Linear, path: &Path) -> Result<FrSpec, String> {
         let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if raw.len() < 4 {
             return Err(format!("{}: too short for a count", path.display()));
@@ -69,6 +70,10 @@ impl FrSpec {
 
         // The same checks MTPLX makes, because a bad list here is a wrong
         // token rather than a slow one.
+        // Pruning is a row gather, and a Q4_K row is three tensors with a
+        // 12-byte packing rather than a slice; `as_mlx` says so rather than
+        // gathering the wrong thing.
+        let lm_head = lm_head.as_mlx();
         let vocab = lm_head.out_dims();
         if n == 0 || n >= vocab {
             return Err(format!("{n} ids is not a pruning of {vocab}"));
@@ -96,7 +101,7 @@ impl FrSpec {
             group_size: lm_head.group_size,
             bits: lm_head.bits,
         };
-        Ok(FrSpec { ids, head, n, vocab })
+        Ok(FrSpec { ids, head: Linear::Mlx(head), n, vocab })
     }
 
     /// Turn one index into the pruned head's rows into the token id it stands

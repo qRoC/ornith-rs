@@ -26,19 +26,21 @@ use crate::ops::quantized::{QuantMatrix, quantized_matmul};
 use crate::ops::rope::rope;
 use crate::weights::WeightStore;
 
+use crate::ops::linear::Linear;
+
 use super::cache::{LayerCache, make_cache};
 use super::config::TextConfig;
 
 pub struct GatedDeltaNet {
-    pub in_proj_qkv: QuantMatrix,
-    pub in_proj_z: QuantMatrix,
+    pub in_proj_qkv: Linear,
+    pub in_proj_z: Linear,
     pub in_proj_b: Array,
     pub in_proj_a: Array,
     pub conv1d: Array,
     pub dt_bias: Array,
     pub a_log: Array,
     pub norm: Array,
-    pub out_proj: QuantMatrix,
+    pub out_proj: Linear,
 }
 
 pub struct Attention {
@@ -78,7 +80,7 @@ pub struct TextModel {
     pub embed_tokens: QuantMatrix,
     pub layers: Vec<DecoderLayer>,
     pub norm: Array,
-    pub lm_head: QuantMatrix,
+    pub lm_head: Linear,
 }
 
 impl TextModel {
@@ -110,15 +112,15 @@ impl TextModel {
             let lp = format!("{p}.layers.{i}");
             let mixer = if cfg.is_linear_layer(i) {
                 Mixer::Linear(GatedDeltaNet {
-                    in_proj_qkv: ws.quant_matrix(ctx, &format!("{lp}.linear_attn.in_proj_qkv")),
-                    in_proj_z: ws.quant_matrix(ctx, &format!("{lp}.linear_attn.in_proj_z")),
+                    in_proj_qkv: ws.linear(ctx, &format!("{lp}.linear_attn.in_proj_qkv")),
+                    in_proj_z: ws.linear(ctx, &format!("{lp}.linear_attn.in_proj_z")),
                     in_proj_b: ws.tensor(ctx, &format!("{lp}.linear_attn.in_proj_b.weight")),
                     in_proj_a: ws.tensor(ctx, &format!("{lp}.linear_attn.in_proj_a.weight")),
                     conv1d: ws.tensor(ctx, &format!("{lp}.linear_attn.conv1d.weight")),
                     dt_bias: ws.tensor(ctx, &format!("{lp}.linear_attn.dt_bias")),
                     a_log: ws.tensor(ctx, &format!("{lp}.linear_attn.A_log")),
                     norm: ws.tensor(ctx, &format!("{lp}.linear_attn.norm.weight")),
-                    out_proj: ws.quant_matrix(ctx, &format!("{lp}.linear_attn.out_proj")),
+                    out_proj: ws.linear(ctx, &format!("{lp}.linear_attn.out_proj")),
                 })
             } else {
                 Mixer::Full(Attention {
@@ -149,7 +151,7 @@ impl TextModel {
             });
         }
         let norm = ws.tensor(ctx, &format!("{p}.norm.weight"));
-        let lm_head = ws.quant_matrix(ctx, "language_model.lm_head");
+        let lm_head = ws.linear(ctx, "language_model.lm_head");
         TextModel { cfg, embed_tokens, layers, norm, lm_head }
     }
 
@@ -166,7 +168,7 @@ impl TextModel {
         caches: &mut [LayerCache],
     ) -> (Array, Array) {
         let (h, pre_norm) = self.forward_hidden(ctx, ids, caches);
-        let logits = quantized_matmul(ctx, &h, &self.lm_head);
+        let logits = self.lm_head.matmul(ctx, &h);
         (logits, pre_norm)
     }
 
@@ -407,8 +409,8 @@ impl GatedDeltaNet {
         let key_dim = cfg.key_dim();
         let kernel = cfg.linear_conv_kernel_dim;
 
-        let qkv = quantized_matmul(ctx, x, &self.in_proj_qkv);
-        let z = quantized_matmul(ctx, x, &self.in_proj_z).reshape(&[b, s, hv, dv]);
+        let qkv = self.in_proj_qkv.matmul(ctx, x);
+        let z = self.in_proj_z.matmul(ctx, x).reshape(&[b, s, hv, dv]);
         // in_proj_b and in_proj_a are unquantized [Hv, hidden] matrices.
         let bb = crate::ops::matmul::matmul(ctx, &x.reshape(&[b * s, x.dim(-1)]), &self.in_proj_b, true)
             .reshape(&[b, s, hv]);
@@ -442,7 +444,7 @@ impl GatedDeltaNet {
         // RMSNormGated: normalise, then gate with z in float32.
         let normed = rms_norm(ctx, &out, Some(&self.norm), cfg.rms_norm_eps);
         let gated = precise_swiglu(ctx, &z, &normed);
-        quantized_matmul(ctx, &gated.reshape(&[b, s, hv * dv]), &self.out_proj)
+        self.out_proj.matmul(ctx, &gated.reshape(&[b, s, hv * dv]))
     }
 }
 
@@ -471,8 +473,8 @@ impl GatedDeltaNet {
         let key_dim = cfg.key_dim();
         let kernel = cfg.linear_conv_kernel_dim;
 
-        let qkv = quantized_matmul(ctx, x, &self.in_proj_qkv);
-        let z = quantized_matmul(ctx, x, &self.in_proj_z).reshape(&[b, s, hv, dv]);
+        let qkv = self.in_proj_qkv.matmul(ctx, x);
+        let z = self.in_proj_z.matmul(ctx, x).reshape(&[b, s, hv, dv]);
         let bb = crate::ops::matmul::matmul(ctx, &x.reshape(&[b * s, x.dim(-1)]), &self.in_proj_b, true)
             .reshape(&[b, s, hv]);
         let aa = crate::ops::matmul::matmul(ctx, &x.reshape(&[b * s, x.dim(-1)]), &self.in_proj_a, true)
@@ -521,7 +523,7 @@ impl GatedDeltaNet {
         let out = concat_all_time(ctx, &outs);
         let normed = rms_norm(ctx, &out, Some(&self.norm), cfg.rms_norm_eps);
         let gated = precise_swiglu(ctx, &z, &normed);
-        let y = quantized_matmul(ctx, &gated.reshape(&[b, s, hv * dv]), &self.out_proj);
+        let y = self.out_proj.matmul(ctx, &gated.reshape(&[b, s, hv * dv]));
         (y, snaps)
     }
 }

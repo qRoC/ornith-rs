@@ -20,7 +20,6 @@ use crate::array::{Array, Dtype};
 use crate::metal::Context;
 use crate::model::cache::LayerCache;
 use crate::model::qwen3_5::TextModel;
-use crate::ops::quantized::quantized_matmul;
 use crate::vision::splice::{VisionSplice, spliced_chunk_embeddings};
 
 pub const DEFAULT_PREFILL_STEP_SIZE: usize = 2048;
@@ -128,7 +127,7 @@ pub fn step(
     splice: Option<&mut VisionSplice>,
 ) -> u32 {
     let (h, _) = model_call(ctx, model, caches, tokens, splice);
-    let logits = quantized_matmul(ctx, &h, &model.lm_head);
+    let logits = model.lm_head.matmul(ctx, &h);
     sampler.sample(ctx, &logits)
 }
 

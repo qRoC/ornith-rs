@@ -91,7 +91,7 @@ template <typename T>
   }
 }
 
-// `kernel_mul_mv_q4_K_f32_impl` at M = 1.
+// `kernel_mul_mv_q4_K_f32_impl`.
 //
 // One simdgroup carries `nr0` output rows; `NSG` of them share a threadgroup.
 // The 32 lanes split four ways over blocks (`ix`) and eight ways within one
@@ -99,9 +99,14 @@ template <typename T>
 // row loop re-reads only the weights. ggml's own `N_SG_Q4_K` / `N_R0_Q4_K` are
 // 2 and 2.
 //
-// The decode step is the whole point: `Q4K.md` scopes the first cut to M = 1,
-// because `affine_qmv_fast` is 38% of a step and one kernel is enough to
-// measure GB/token and GPU busy for real.
+// **This is a mat-VEC, including when M > 1.** ggml's kernel carries an `r1`
+// axis -- the grid's y -- that walks the columns of `src1`, and a decode step
+// never uses it. It is here for prefill, and the cost is explicit: the weights
+// are re-read once per token instead of being tiled, so a chunk of 128 reads
+// the matrix 128 times. That is the wrong shape for prefill and the right
+// shape for *having* a prefill at all -- `Q4K.md` leaves `q4k_qmm_t` for last,
+// and until it exists this is what lets a q4k artifact be measured rather than
+// only benchmarked at M = 1.
 template <typename T, short nr0, short NSG>
 [[kernel]] void q4k_qmv(
     const device uint16_t* qs [[buffer(0)]],
@@ -125,6 +130,7 @@ template <typename T, short nr0, short NSG>
 
   const int nb = K / QK_K;
   const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
+  const int r1 = int(tgpig.y); // which row of x, i.e. which token
 
   // Row strides, in each tensor's own unit.
   const int qs_row = nb * Q4K_QS_U16;
@@ -135,7 +141,7 @@ template <typename T, short nr0, short NSG>
   float yh[16];
   float sumf[nr0] = {0.f};
 
-  const device T* y4 = x + ix * QK_K + 64 * iq + 8 * ir;
+  const device T* y4 = x + (int64_t)r1 * K + ix * QK_K + 64 * iq + 8 * ir;
 
   uint16_t sc16[4];
   thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
@@ -201,7 +207,7 @@ template <typename T, short nr0, short NSG>
   for (short row = 0; row < nr0 && first_row + row < O; ++row) {
     const float sum_all = simd_sum(sumf[row]);
     if (tiisg == 0) {
-      out[first_row + row] = T(sum_all);
+      out[(int64_t)r1 * O + first_row + row] = T(sum_all);
     }
   }
 }

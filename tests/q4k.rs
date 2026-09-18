@@ -162,3 +162,42 @@ fn the_loader_reads_the_three_tensors() {
     let d = compare(&got.to_vec_f32(&ctx), &case.f32("head_deq"));
     assert_eq!(d.max_abs, 0.0, "loaded q4k module: {d}");
 }
+
+/// The token axis: M rows of `x` must each give the M = 1 answer.
+///
+/// ggml's kernel walks the columns of `src1` on the grid's y, and the port
+/// keeps that -- it is what gives a q4k artifact a prefill at all. Every row is
+/// independent by construction, so stacking a vector M times and finding M
+/// different answers means the axis is addressed wrongly.
+#[test]
+fn the_token_axis_repeats_the_same_answer() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    let ctx = Context::new().unwrap();
+    for name in ["head", "qkv"] {
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        let rows = case.meta_usize(&format!("{name}_rows"));
+        let one = case.get(&format!("{name}_x")).to_f32();
+
+        let y1 = qmv(&ctx, &Array::from_f32(&ctx, &one, &[1, cols]), &w).to_vec_f32(&ctx);
+
+        // Three tokens: the same row, a scaled copy, and zeros -- so a wrong
+        // stride shows up as the wrong row rather than as a lucky match.
+        let mut many = one.clone();
+        many.extend(one.iter().map(|v| v * 0.5));
+        many.extend(std::iter::repeat_n(0.0f32, cols));
+        let y3 = qmv(&ctx, &Array::from_f32(&ctx, &many, &[3, cols]), &w).to_vec_f32(&ctx);
+
+        let d = compare(&y3[..rows], &y1);
+        assert_eq!(d.max_abs, 0.0, "{name} token 0: {d}");
+        let half: Vec<f32> = y3[rows..2 * rows].to_vec();
+        let d = compare(&half, &y1.iter().map(|v| v * 0.5).collect::<Vec<_>>());
+        assert!(d.max_rel <= MATVEC_MAX_REL, "{name} token 1 (halved): {d}");
+        // A zero row still carries the minima: `- dmin * m * sum(y)` is zero
+        // only because `sum(y)` is, so this is not a trivially empty check.
+        assert!(
+            y3[2 * rows..].iter().all(|v| *v == 0.0),
+            "{name} token 2 should be all zeros"
+        );
+    }
+}

@@ -42,7 +42,6 @@ use crate::metal::Context;
 use crate::model::cache::{KvCache, LayerCache};
 use crate::model::mtp::{MtpHead, make_mtp_cache};
 use crate::model::qwen3_5::TextModel;
-use crate::ops::quantized::quantized_matmul;
 
 /// Where the MTP head's own KV cache comes from at the start of a cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +190,7 @@ pub fn generate_step_mtp(
         splice.as_deref_mut(),
     );
     progress(prompt.len(), prompt.len());
-    let logits = quantized_matmul(ctx, &hidden, &model.lm_head);
+    let logits = model.lm_head.matmul(ctx, &hidden);
     let mut primary = sampler.sample(ctx, &logits);
     let rows = hidden.numel() / model.cfg.hidden_size;
     let mut h = hidden.reshape(&[rows, model.cfg.hidden_size]).slice_leading(rows - 1, 1);
@@ -221,7 +220,7 @@ pub fn generate_step_mtp(
         // verify: one trunk forward over [primary] + drafts, which is the
         // window the draft chain already built where the GPU can reach it.
         let (vh, _, capture) = model.forward_capture(ctx, &window, caches);
-        let vlogits = quantized_matmul(ctx, &vh, &model.lm_head);
+        let vlogits = model.lm_head.matmul(ctx, &vh);
 
         // Every row this window could be asked for, in one pass.
         //

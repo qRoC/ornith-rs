@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
+use crate::ops::linear::Linear;
 use crate::ops::q4k::Q4kMatrix;
 use crate::ops::quantized::{QuantMatrix, QuantMode};
 use crate::safetensors::{SafeTensors, TensorInfo, shards_from_index};
@@ -166,6 +167,18 @@ impl WeightStore {
             mode: spec.mode,
             group_size: spec.group_size,
             bits: spec.bits,
+        }
+    }
+
+    /// Load one quantized linear, in whichever family `config.json` says.
+    ///
+    /// The model calls this for the modules a Q4_K artifact converts --
+    /// `lm_head` and the three gated-delta projections -- and `quant_matrix`
+    /// for everything else, which is every module whose mode cannot change.
+    pub fn linear(&mut self, ctx: &Context, path: &str) -> Linear {
+        match self.quant_config(path).mode {
+            QuantMode::Q4k => Linear::Q4k(self.q4k_matrix(ctx, path)),
+            _ => Linear::Mlx(self.quant_matrix(ctx, path)),
         }
     }
 

@@ -47,7 +47,8 @@ use crate::ops::layout::{concat_inner, slice_inner, transpose_hl, transpose_lh};
 use crate::ops::matmul::matmul;
 use crate::ops::moe::sparse_moe_block_dense;
 use crate::ops::norm::rms_norm;
-use crate::ops::quantized::{QuantMatrix, quantized_matmul};
+use crate::ops::linear::Linear;
+use crate::ops::quantized::QuantMatrix;
 use crate::ops::rope::rope;
 use crate::weights::WeightStore;
 
@@ -151,13 +152,13 @@ impl MtpHead {
         ctx: &Context,
         cfg: &TextConfig,
         embed_tokens: &QuantMatrix,
-        lm_head: &QuantMatrix,
+        lm_head: &Linear,
         trunk_hidden: &Array,
         next_ids: &Array,
         cache: &mut KvCache,
     ) -> (Array, Array) {
         let hidden = self.hidden(ctx, cfg, embed_tokens, trunk_hidden, next_ids, cache);
-        let logits = quantized_matmul(ctx, &hidden, lm_head);
+        let logits = lm_head.matmul(ctx, &hidden);
         (logits, hidden)
     }
 

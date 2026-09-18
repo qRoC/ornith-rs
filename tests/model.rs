@@ -11,7 +11,6 @@ use ornith_rs::metal::Context;
 use ornith_rs::model::config::TextConfig;
 use ornith_rs::model::qwen3_5::TextModel;
 use ornith_rs::ops::norm::rms_norm;
-use ornith_rs::ops::quantized::quantized_matmul;
 use ornith_rs::refs::{RefCase, compare, model_dir};
 use ornith_rs::weights::WeightStore;
 
@@ -75,7 +74,7 @@ fn check_pass(
     check(case, ctx, &format!("{tag}_prenorm"), &h);
     let normed = rms_norm(ctx, &h, Some(&model.norm), model.cfg.rms_norm_eps);
     check(case, ctx, &format!("{tag}_hidden"), &normed);
-    let logits = quantized_matmul(ctx, &normed, &model.lm_head);
+    let logits = model.lm_head.matmul(ctx, &normed);
     check(case, ctx, &format!("{tag}_logits"), &logits);
 }
 

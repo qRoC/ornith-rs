@@ -156,7 +156,7 @@ fn head_matches_mtplx() {
     let (vh, _) = model.forward_hidden(&ctx, &w, &mut caches);
     check(&case, &ctx, "verify_hidden", &vh);
     let vlogits =
-        ornith_rs::ops::quantized::quantized_matmul(&ctx, &vh, &model.lm_head);
+        model.lm_head.matmul(&ctx, &vh);
     check(&case, &ctx, "verify_logits", &vlogits);
 }
 
