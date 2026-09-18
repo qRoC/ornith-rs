@@ -4001,19 +4001,38 @@ load hoisted across rows does not: the `ib` loop order, the lane split and the
 
 Priced by subtracting the dense re-read from the **measured** cycles in the
 next section, which is the honest form of this arithmetic: 41% of a row's
-3.31 ms is 1.36 ms saved per extra window row, and nothing else moves.
+3.31 ms is 1.36 ms saved per extra window row, and nothing else moves. The
+third column takes the other two thirds as far as they go -- the expert
+gather charging for the ~23 distinct experts a four-token window names rather
+than its 32 rows, and one recurrence dispatch writing all `T` snapshots
+instead of one per token, call it half of that share, which brings a row to
+~1.2 ms.
 
-    on this prompt, GPU ms a token      today   dense re-read taken back
-    autoregressive                       8.56       8.56
-    --mtp-depth 1 --frspec               7.53       6.73    -21% instead of -12%
-    --mtp-depth 3 --frspec               9.67       7.86     -8% instead of +13%
+    on this prompt, GPU ms a token   today   dense re-read back   all of it
+    autoregressive                    8.56        8.56              8.56
+    --mtp-depth 1 --frspec            7.53        6.73 (-21%)       6.28 (-27%)
+    --mtp-depth 2 --frspec            8.37        7.05              6.31
+    --mtp-depth 3 --frspec            9.67        7.86  (-8%)       6.84 (-20%)
 
-So depth 3 stops losing and depth 1 stays the knee. Taking the other two
-thirds as far as they go -- charging the expert gather for the ~23 distinct
-experts a four-token window names rather than its 32 rows, and letting one
-recurrence dispatch write all `T` snapshots instead of one per token, call it
-half of that share -- brings the per-row cost to ~1.2 ms and gives **6.28 ms a
-token at depth 1 (-27%) and 6.84 at depth 3 (-20%)**.
+**Depth 3 stops losing, and the knee does not move.** That is worth stating
+plainly, because the session that opened this phase predicted the opposite --
+"if it confirms, it also takes the knee deeper than one". It does not, and the
+reason is not the price of a row but the decay of acceptance. At 0.69 / 0.57 /
+0.52 the marginal draft levels are worth 0.69, 0.39 and 0.20 of a token, i.e.
+5.91, 3.37 and 1.75 ms of avoided autoregression, against a marginal cost of
+one draft level plus one window row plus the sampler's extra row:
+
+    marginal row        worth     costs today   costs with the lever
+    second window row    5.91       4.49            3.04  /  2.28
+    third                3.37       4.49            3.04  /  2.28
+    fourth               1.75       4.49            3.04  /  2.28
+
+A depth pays while `cost / extra tokens` is below the current ms a token. The
+third row crosses only in the most optimistic column, and by a hair (depth 2
+at 6.31 against depth 1's 6.28); the fourth is never worth 2.28 ms whatever
+the kernel does. **A cheaper window widens the win at the depth that already
+works rather than buying a deeper one** -- to move the knee, acceptance has to
+move, which is the head's business and not the trunk's.
 
 ### The loop agrees with the decomposition
 
@@ -4023,11 +4042,17 @@ prompt, 200 tokens, greedy, `q6k-full`:
     config                     GPU ms/token   acceptance   tokens/cycle
     autoregressive                 8.56           --            1.00
     --mtp-depth 1 --frspec         7.53          0.69           1.695
+    --mtp-depth 2 --frspec         8.37        0.67/0.57        2.062
     --mtp-depth 3 --frspec         9.67   0.67/0.55/0.52        2.247
 
-    measured cycle = ms/token x tokens/cycle    12.76      21.73
-    draft + verify, from the decomposition      11.96      19.91
-    unaccounted                                  0.80       1.82
+    measured cycle = ms/token x tokens/cycle   12.76    17.26    21.73
+    draft + verify, from the decomposition     11.96    15.91    19.91
+    unaccounted                                 0.80     1.35     1.82
+
+Depth 2 was measured after the rest of this phase was written, as the check
+the two flanking depths could not be: the decomposition predicted its cycle at
+15.91 ms of draft and verify plus an overhead interpolated between the other
+two depths (1.31), i.e. 17.22 ms, and it came back **17.26**.
 
 The residual is the loop itself and grows with the window as it should: the
 sampler takes `depth + 1` rows through `log_softmax` and `argmax` over 248320,

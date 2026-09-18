@@ -1940,6 +1940,16 @@ In order:
    and one recurrence dispatch writing all `T` snapshots instead of one per
    token -- gives **-27% at depth 1 and -20% at depth 3**.
 
+   **It does not move the knee, and that was the other half of the
+   prediction.** Depth 2 measures 8.37 GPU ms a token today and 7.05 / 6.31
+   under the two columns above, against depth 1's 7.53 / 6.73 / 6.28 -- the
+   knee stays at 1 and only ties at 2 in the most optimistic case. The binding
+   constraint there is acceptance, not the price of a row: 0.69 / 0.57 / 0.52
+   makes the marginal levels worth 5.91, 3.37 and 1.75 ms against a marginal
+   cost of 4.49 today and ~2.3 with everything taken. A cheaper window widens
+   the win at the depth that already works; only a better head buys a deeper
+   one.
+
 Smaller gaps, each with an assert or a comment where it bites:
 
 - The chat template's `tools` system block and the assistant `tool_calls`
