@@ -1,4 +1,4 @@
-"""Audit a forged Q4_K artifact against ggml, module by module.
+"""Audit a forged k-quant artifact against ggml, module by module.
 
     ORNITH_GGML_BUILD=../../.ggml-build python3 tools/q4k_audit.py <artifact>
 
@@ -60,12 +60,15 @@ def main():
     idx = json.loads((art / "model.safetensors.index.json").read_text())["weight_map"]
     pidx = json.loads((PARENT / "model.safetensors.index.json").read_text())["weight_map"]
 
-    mods = sorted(
-        m for m, v in cfg.items() if isinstance(v, dict) and v.get("mode") == "q4k"
-    )
+    kinds = {m: {"q4k": "q4_K", "q6k": "q6_K"}[v["mode"]]
+             for m, v in cfg.items()
+             if isinstance(v, dict) and v.get("mode") in ("q4k", "q6k")}
+    mods = sorted(kinds)
     if not mods:
-        sys.exit(f"{art} has no q4k modules")
-    print(f"{len(mods)} q4k modules in {art.name}\n")
+        sys.exit(f"{art} has no k-quantized modules")
+    from collections import Counter
+    print(f"{len(mods)} k-quantized modules in {art.name}: "
+          + ", ".join(f"{n} {k}" for k, n in Counter(kinds.values()).most_common()) + "\n")
 
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from forge_q4k import parent_of
@@ -87,13 +90,20 @@ def main():
         dm = dm.reshape(-1, dm.shape[-2], dm.shape[-1])
         rows, nb = scales.shape[0], scales.shape[1]
 
-        # Reassemble ggml's 144-byte blocks out of the three tensors -- the
-        # inverse of `q4k.split`, so a disagreement here is the forge's.
-        blocks = np.empty((rows * nb, q4k.BLOCK_BYTES), np.uint8)
-        blocks[:, 0:4] = dm.reshape(rows * nb, 2).view(np.uint8).reshape(-1, 4)
-        blocks[:, 4 : 4 + q4k.K_SCALE_SIZE] = scales.reshape(rows * nb, q4k.K_SCALE_SIZE)
-        blocks[:, 4 + q4k.K_SCALE_SIZE :] = qs.reshape(rows * nb, 32).view(np.uint8)
-        deq = q4k_ggml.dequantize(lib, blocks, rows * nb * q4k.QK_K).reshape(rows, -1)
+        # Reassemble ggml's blocks out of the three tensors -- the inverse of
+        # `q4k.split`, so a disagreement here is the forge's.
+        kind = kinds[mod]
+        nbytes = q4k_ggml.KINDS[kind][0]
+        blocks = np.empty((rows * nb, nbytes), np.uint8)
+        if kind == "q4_K":
+            blocks[:, 0:4] = dm.reshape(rows * nb, 2).view(np.uint8).reshape(-1, 4)
+            blocks[:, 4 : 4 + q4k.K_SCALE_SIZE] = scales.reshape(rows * nb, q4k.K_SCALE_SIZE)
+            blocks[:, 4 + q4k.K_SCALE_SIZE :] = qs.reshape(rows * nb, 32).view(np.uint8)
+        else:
+            blocks[:, 0:192] = qs.reshape(rows * nb, 48).view(np.uint8)
+            blocks[:, 192:208] = scales.reshape(rows * nb, 16)
+            blocks[:, 208:210] = dm.reshape(rows * nb, 1).view(np.uint8).reshape(-1, 2)
+        deq = q4k_ggml.dequantize(lib, blocks, rows * nb * q4k.QK_K, kind=kind).reshape(rows, -1)
 
         pname, half = parent_of(mod)
         pt = mx.load(str(PARENT / pidx[pname]))[pname]
@@ -105,8 +115,9 @@ def main():
         del pt
         rel = 100 * float(np.linalg.norm(w - deq) / np.linalg.norm(w))
         worst = max(worst, rel)
-        out[mod] = {"rows": rows, "blocks": nb, "rel_rms": rel, "digest": digest(deq)}
-        print(f"  [{n + 1:3d}/{len(mods)}] {mod:<58} {rel:6.3f}%", flush=True)
+        out[mod] = {"rows": rows, "blocks": nb, "kind": kind,
+                    "rel_rms": rel, "digest": digest(deq)}
+        print(f"  [{n + 1:3d}/{len(mods)}] {mod:<58} {kind}  {rel:6.3f}%", flush=True)
         del w, deq, blocks
 
     (art / "q4k_audit.json").write_text(json.dumps(out, indent=1))

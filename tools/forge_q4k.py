@@ -2,8 +2,9 @@
 
     ORNITH_GGML_BUILD=../../.ggml-build python3 tools/forge_q4k.py [options]
 
-      --imatrix          feed `quantize_q4_K` diag(H) as its importance vector
+      --imatrix          feed the quantizer diag(H) as its importance vector
       --experts          also convert the 96 routed-expert modules
+      --q6k              convert the *8-bit* side to Q6_K instead
       --from <name>      base artifact to build on (default int4-head-linattn)
       --out <name>       output artifact name
 
@@ -78,10 +79,20 @@ def _opt(name, default=None):
 
 IMATRIX = "--imatrix" in sys.argv
 EXPERTS = "--experts" in sys.argv
+# Q6_K takes the other end of the artifact: the 169 modules held at affine
+# int8 g64 = 8.50 bits, where 6.5625 is 22.8% fewer bytes. `Q4K.md` priced it
+# at 0.68 error-doublings a bit against the 0.96 the 4-bit side already pays.
+Q6K = "--q6k" in sys.argv
+KIND = "q6_K" if Q6K else "q4_K"
+MODE = "q6k" if Q6K else "q4k"
+SRC_BITS = 8 if Q6K else 4
 BASE = MODELS / _opt("--from", "ornith-1.5-35b-a3b-int4-head-linattn")
 OUT = MODELS / _opt(
     "--out",
-    "ornith-1.5-35b-a3b-q4k" + ("-imatrix" if IMATRIX else "") + ("-experts" if EXPERTS else ""),
+    "ornith-1.5-35b-a3b-"
+    + MODE
+    + ("-imatrix" if IMATRIX else "")
+    + ("-experts" if EXPERTS else ""),
 )
 EXPERT_HESSIANS = ROOT / "refs/gptq-experts-q0/hessians"
 
@@ -93,6 +104,22 @@ EXPERT_SUFFIXES = (
     "mlp.switch_mlp.up_proj",
     "mlp.switch_mlp.down_proj",
 )
+
+# The 8-bit side, minus two that the kernel cannot take whatever the config
+# says: `embed_tokens` is read by a gather and never by a matvec, and
+# `shared_expert_gate` is `[1, 2048]` where the kernel covers four rows at a
+# time. That is 128 of the 169, and the 41 left out are 0.0% and 0.8% of a
+# decode step.
+Q6K_SUFFIXES = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate",
+    "mlp.shared_expert.gate_proj",
+    "mlp.shared_expert.up_proj",
+    "mlp.shared_expert.down_proj",
+) + EXPERT_SUFFIXES
 
 
 def parent_of(mod):
@@ -106,7 +133,7 @@ def parent_of(mod):
     assert mod.startswith("language_model.model.layers."), mod
     n, rest = mod[len("language_model.model.layers.") :].split(".", 1)
     base = f"model.language_model.layers.{n}."
-    if rest in SUFFIXES:
+    if rest in SUFFIXES or rest in Q6K_SUFFIXES[:8]:
         return base + rest + ".weight", None
     if rest == "mlp.switch_mlp.gate_proj":
         return base + "mlp.experts.gate_up_proj", "lo"
@@ -127,9 +154,16 @@ def hessian_for(mod):
     # no calibration cost.
     if mod.endswith("linear_attn.in_proj_z"):
         mod = mod[: -len("in_proj_z")] + "in_proj_qkv"
-    if ".switch_mlp." in mod:
+    # Everything that reads the post-attention normed hidden shares one
+    # Hessian: the router, the shared expert's two input projections and the
+    # routed experts' two. `down_proj` reads the routed experts' intermediate,
+    # which is what `layerN.inter` was captured on -- and the *shared*
+    # expert's intermediate is a different tensor, so it gets none.
+    hidden_readers = (".switch_mlp.gate_proj", ".switch_mlp.up_proj", ".mlp.gate",
+                      ".shared_expert.gate_proj", ".shared_expert.up_proj")
+    if mod.endswith(".switch_mlp.down_proj") or mod.endswith(hidden_readers):
         n = mod.split(".layers.")[1].split(".")[0]
-        which = "inter" if mod.endswith("down_proj") else "hidden"
+        which = "inter" if mod.endswith(".switch_mlp.down_proj") else "hidden"
         f = EXPERT_HESSIANS / f"layer{n}.{which}.npy"
     else:
         f = HESSIANS / f"{mod}.npy"
@@ -151,10 +185,10 @@ def main():
     aidx = json.loads((BASE / "model.safetensors.index.json").read_text())["weight_map"]
     pidx = json.loads((PARENT / "model.safetensors.index.json").read_text())["weight_map"]
 
-    want = SUFFIXES + (EXPERT_SUFFIXES if EXPERTS else ())
+    want = Q6K_SUFFIXES if Q6K else SUFFIXES + (EXPERT_SUFFIXES if EXPERTS else ())
     mods = sorted({k.rsplit(".", 1)[0] for k in aidx if k.endswith(".scales")})
     already = {m for m, v in acfg["quantization"].items()
-               if isinstance(v, dict) and v.get("mode") == "q4k"}
+               if isinstance(v, dict) and v.get("mode") in ("q4k", "q6k")}
     q = acfg["quantization"]
 
     def bits_of(m):
@@ -165,8 +199,9 @@ def main():
         m
         for m in mods
         if m not in already
-        and bits_of(m) == 4
-        and (m == "language_model.lm_head" or m.split(".layers.")[-1].split(".", 1)[-1] in want)
+        and bits_of(m) == SRC_BITS
+        and ((m == "language_model.lm_head" and not Q6K)
+             or m.split(".layers.")[-1].split(".", 1)[-1] in want)
     ]
     # **Only what is already 4-bit.** The eight last layers keep their experts
     # at int8 g64 because Phase 4 put the knee there, and `EXPERT_SUFFIXES`
@@ -175,8 +210,8 @@ def main():
     # wrong thing -- it is 24 of the 120 modules the name filter alone selects.
     if already:
         print(f"{len(already)} modules are already q4k in {BASE.name}; leaving them alone")
-    print(f"{len(mods)} quantized modules, converting {len(convert)} to Q4_K"
-          + (" with diag(H)" if IMATRIX else ""))
+    print(f"{len(mods)} quantized modules, converting {len(convert)} "
+          f"({SRC_BITS}-bit) to {KIND}" + (" with diag(H)" if IMATRIX else ""))
 
     OUT.mkdir(parents=True)
     touched = {aidx[m + ".weight"] for m in convert}
@@ -216,16 +251,18 @@ def main():
 
             h = hessian_for(mod) if IMATRIX else None
             with_h += h is not None
-            qs, scales, dm = q4k.split(q4k_ggml.quantize(lib, w, imatrix=h), rows, nb)
+            qs, scales, dm = q4k.split(
+                q4k_ggml.quantize(lib, w, imatrix=h, kind=KIND), rows, nb, KIND)
             if experts > 1:
                 qs = qs.reshape(experts, rows // experts, -1)
-                scales = scales.reshape(experts, rows // experts, nb, 12)
-                dm = dm.reshape(experts, rows // experts, nb, 2)
+                scales = scales.reshape(experts, rows // experts, nb, scales.shape[-1])
+                dm = dm.reshape(experts, rows // experts, nb, dm.shape[-1])
 
             for suffix in ("weight", "scales", "biases", "dm"):
                 tensors.pop(f"{mod}.{suffix}", None)
-            bytes_before += rows * cols * 5 // 8      # affine int4 g32 = 5.00 bits
-            bytes_after += rows * nb * q4k.BLOCK_BYTES
+            # affine int4 g32 is 5.00 bits, affine int8 g64 is 8.50
+            bytes_before += int(rows * cols * (8.5 if Q6K else 5.0) / 8)
+            bytes_after += rows * nb * q4k_ggml.KINDS[KIND][0]
             tensors[f"{mod}.weight"] = mx.array(qs)
             tensors[f"{mod}.scales"] = mx.array(scales)
             tensors[f"{mod}.dm"] = mx.array(dm)
@@ -246,7 +283,12 @@ def main():
     (OUT / "model.safetensors.index.json").write_text(json.dumps(idx, indent=1))
 
     for m in convert:
-        acfg["quantization"][m] = {"group_size": q4k.QK_K, "bits": 4, "mode": "q4k"}
+        # `bits` is informational for a k-quant -- the real rate is 4.50 or
+        # 6.5625 and `mode` is what decides the layout -- but mlx-lm's schema
+        # wants an integer, so it carries the code width.
+        acfg["quantization"][m] = {
+            "group_size": q4k.QK_K, "bits": 6 if Q6K else 4, "mode": MODE
+        }
     (OUT / "config.json").write_text(json.dumps(acfg, indent=1))
 
     print(f"\n{done} modules in {time.time() - t0:.0f}s"
