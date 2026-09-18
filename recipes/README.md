@@ -11,6 +11,32 @@ Phase 4 has the arithmetic and the measured results.
 | `nvfp4-head-linattn.json` | the same four families, at **nvfp4 g16** | 169 | 60 | 1.925 (-29.7%) | 8.55 ms | 6.6010 | **0.429** |
 | `int4-except-gates.json` | everything but the 80 router and shared-expert gates | 80 | 60 | 1.858 (-32.2%) | 8.29 ms | 6.6422 | **0.323** |
 | *(no recipe)* `fp8scale-twin` | the four families at **affine int4 g32 with E4M3 scale+bias** | 169 | 60 | 1.925 (-29.7%) | -- | 6.5035 | **0.443** |
+| *(no recipe)* **`gptq-head-linattn`** | `int4-head-linattn` exactly, re-rounded by GPTQ | 169 | 60 | 2.076 (identical) | 9.17 ms | 6.4238 | **0.0417** |
+
+**`gptq-head-linattn` costs nothing to take, and that is the strongest thing
+that can be said for it.** Same bits, same coverage, same three tensors, same
+shards, same kernels, same dispatch profile count for count -- only which
+integer each weight rounds to differs, and `full_forward_matches_mlx` passes at
+`max_abs == 0.0`. Forged by `tools/forge_gptq.py` from `refs/gptq/`
+(`tools/dump_gptq_stats.py`); no `align_rebuild.py`, the base was aligned.
+
+**But the margin depends on what you measure from, and Phase 8 measured from
+the parent.** The KL columns in the table above are against `A`, which is
+itself quantized:
+
+| | vs `A` | vs the bf16 parent |
+|---|---|---|
+| median KL | 0.0187 vs 0.0285 | 0.0303 vs 0.0427 |
+| p90 | **0.0985** vs 0.2003 | 0.2510 vs **0.2076** |
+| max | 0.9229 vs **0.5029** | 1.0122 vs **0.7394** |
+| sign test | 38/58, p = 0.025 | **31/57, p = 0.60** |
+
+Against the parent GPTQ is still ahead on the median and is still the least
+damaged of the forged variants, but the two are **not separable probe by
+probe**, and GPTQ's tail is the worse of the two. `REBUILD.md` Phase 8 has the
+mechanism: these Hessians were captured on `A`, so GPTQ reconstructs `A`'s
+layer outputs and was then scored on its distance from `A`. Re-capturing them
+from the parent is the open follow-up.
 
 The last row has no recipe because it is not an mlx mode and `mtplx forge`
 cannot build it. `tools/forge_fp8scale_twin.py` builds a stand-in instead --
@@ -19,9 +45,18 @@ the candidate format can be written out in the ordinary affine layout and
 run unmodified. Its GB/token is the arithmetic of the format it stands for
 (4.50 bits), not of the file on disk (5.00).
 
-**`int4-head-linattn` is still the one to keep.** Past it the distribution
+**`int4-head-linattn` is the knee of the byte/quality trade, and Phase 7
+supersedes it only in rounding, not in coverage** -- `gptq-head-linattn` is
+that same recipe re-rounded. Past it the distribution
 cost per point of traffic is seventeen times higher -- 0.0020 nats a point up
 to it, 0.0344 a point beyond -- for 4.3% more decode.
+
+> **REOPENED 2026-09-18 by Phase 14.** A third 4.50-bit route -- a Q4_K-shaped
+> grid, 6-bit integer scale and min against power-of-two super-scales -- lands
+> at median KL **0.0403 against the base's 0.0404**, i.e. the same distribution
+> for 7.3% fewer bytes, and strictly dominates `int4-head-linattn` on the pair.
+> The sentence below was true of the two routes tested and is not true of the
+> space. Realising the bytes still needs a kernel mlx has no mode for.
 
 **Both 4.50-bit routes lose, and lose the same way.** `nvfp4-head-linattn`
 and the fp8-scale twin land at 0.429 and 0.443 nats -- nine times
@@ -66,9 +101,22 @@ The kernels stay in the port -- they are verified, they cost nothing at rest,
 and on an M5 the `_r_2` narrow-qmv path changes the speed side of this trade
 even though it cannot change the quality side.
 
-The artifacts are `~/.mtplx/models/ornith-1.5-35b-a3b-{int4-head-linattn,
-nvfp4-head-linattn, int4-except-gates}`; the control is
-`-attention8-bf16recurrence-vision-mtplx`, which is also the port's default.
+**Four artifacts are on disk and the rest were deleted, deliberately.** What a
+build produces is not the artifact -- it is `refs/artifact/<name>/probes.bin`,
+[64, 248320] log-probabilities in 64 MB, which is what `compare_probes.py`
+reads and what every verdict in this file rests on. Six measured-and-rejected
+variants (`nvfp4-head-linattn`, `int4-except-gates`, `fp8scale-twin`,
+`awq-linattn`, `awq-ml`, `gptqp-head-linattn`) were 149 GB of artifact whose
+measurements are 384 MB of capture; the captures are kept and the artifacts are
+gone. Any of them re-forges from its recipe or its `tools/forge_*.py` in about
+two minutes.
+
+What is kept, and why:
+
+    ornith-ai--Ornith-1.5-35B-A3B                              67 G  the bf16 parent; a 70 GB re-download
+    ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx   27 G  control A, and the port's default model_dir
+    ornith-1.5-35b-a3b-int4-head-linattn                        26 G  the RTN base, and what every forge builds from
+    ornith-1.5-35b-a3b-gptq-head-linattn                        26 G  the current best
 
 **Not built, and why.** A third published sibling quantizes the recurrence
 inputs `in_proj_a` / `in_proj_b` as well, which every recipe here keeps in
@@ -76,12 +124,15 @@ bf16 deliberately. It buys 0.2 percentage points of traffic over
 `int4-except-gates` -- 1.850 against 1.855 GB a token. Near-zero prize against
 real risk; priced in seconds, one build and one qualification run saved.
 
-**The bf16 parent is still the row that is missing**, and its ppl and KL
-cannot be measured on this host: 67.0 GiB of weights against a 51.8 GiB GPU
-working set, so `mlx_lm.load` dies in the loader. What it *can* now give is
-the weight error each variant pays against it, one module at a time --
-`tools/weight_error.py`, which loads a tensor rather than a model. See
-`REBUILD.md` Phase 4.
+**The bf16 parent's KL row is filled as of Phase 8; its perplexity is not.**
+`mlx_lm.load` does die -- 67.0 GiB against a 51.8 GiB working set -- but that
+is about residency, not about the forward.
+`tools/dump_parent_probes.py` streams the parent one layer at a time (measured
+peak **1.73 GiB**, whole 64-probe capture **24 s**) and writes
+`refs/artifact/parent/probes.bin`, so `compare_probes.py` now scores every
+variant against the parent instead of against `A`. Perplexity is the same pass
+and is not done. `tools/weight_error.py` still gives the per-module weight
+error against the parent without loading a model.
 
 **Run order after any build:**
 

@@ -212,6 +212,52 @@ def schemes():
         s = np.where(s == 0, 1, s)
         return (np.clip(np.round((w - b) / s), 0, n) * s + b).ravel()
 
+    def q4k_enc(w, sub=32, bits=4, sup=256, sbits=6):
+        """A Q4_K-shaped grid, stood in without a kernel.
+
+        llama.cpp's k-quants encode a sub-block's scale and min as **6-bit
+        integers** against two fp16 super-scales per 256 weights, which has no
+        subnormal regime at all -- the thing that cost nvfp4 its quality here,
+        since 99.6% of this model's group scales land below E4M3's smallest
+        normal. The trade is the other way round from a float: an integer has
+        uniform *absolute* resolution against the super-block maximum, so a
+        sub-block far below that maximum is encoded coarsely in *relative*
+        terms. Which failure matters more on these weights is the question.
+
+        Made standable-in the way the fp8-scale twin was: the super-scales are
+        **powers of two**, so `2**k * s_i` with a 6-bit `s_i` is exactly
+        representable in bf16 and the whole thing writes out in the ordinary
+        affine g32 layout on mlx's own kernels -- group size 32, which mlx
+        supports, unlike IDEAS #1's 16 (`REBUILD.md` Phase 13).
+
+        Rate: 4 + (7 + 7) / 32 + 16 / 256 = 4.50 bits -- both fields are
+        magnitude-plus-sign, which puts it at exactly nvfp4's and the
+        fp8-scale twin's rate and makes the three directly comparable.
+        """
+        k, n = sup // sub, 2**bits - 1
+        s_top = b_top = float(2**sbits - 1)      # magnitude field; both carry a sign
+        g = w.reshape(-1, sub)
+        lo, hi = g.min(1), g.max(1)
+        s, b = (hi - lo) / n, lo
+        ns = len(s) // k
+        s, b, g = s[:ns * k], b[:ns * k], g[:ns * k]
+
+        # A power of two >= max/top: the product stays exact in bf16 *and*
+        # nothing clips. `floor` here instead of `ceil` lets a super-block's own
+        # largest scale overflow the 6-bit field in up to half of all
+        # super-blocks -- worth 19% against 8%, and it read as a verdict on the
+        # format until the number was too bad to believe.
+        def po2(x, top):
+            m = np.maximum(np.abs(x).reshape(ns, k).max(1, keepdims=True), 1e-30)
+            return 2.0 ** np.ceil(np.log2(m / top))
+
+        ds, db = po2(s, s_top), po2(b, b_top)
+        sq = (np.clip(np.round(s.reshape(ns, k) / ds), 0, s_top) * ds).ravel()
+        bq = (np.sign(b) * np.clip(np.round(np.abs(b).reshape(ns, k) / db), 0, b_top).ravel() * np.repeat(db.ravel(), k)).ravel()
+        sq = np.where(sq == 0, np.finfo(np.float32).tiny, sq)
+        return (np.clip(np.round((g - bq[:, None]) / sq[:, None]), 0, n)
+                * sq[:, None] + bq[:, None]).ravel()
+
     def nvfp4_enc(w, g, enc):
         w = w.reshape(-1, g)
         a = np.abs(w).max(1, keepdims=True) / 6.0
@@ -232,6 +278,18 @@ def schemes():
          lambda w: affine_enc(w, 16, 4, q.e4m3)),
         ("IDEAS #1  + global scale", 5.00,
          lambda w: affine_enc(w, 16, 4, enc_global(np.abs(w).max()))),
+        # Decomposition, added when IDEAS #1 was priced out (`REBUILD.md`
+        # Phase 13): its 5.00-bit win is at a group size mlx's affine mode does
+        # not accept, so the question is whether the win is the *granularity*
+        # or the *encoding*. `g16 bf16` is the granularity with a perfect
+        # encoding and no rate discipline (6.00 bits); `g32 fp8 +global` is the
+        # encoding at the body's own granularity, which is the fp8-scale twin.
+        ("  decomp  affine g16, bf16 scale+bias (rate-free)", 6.00,
+         lambda w: affine_enc(w, 16, 4, q.bf16)),
+        ("  decomp  affine g32, fp8 scale+bias + global", 4.50,
+         lambda w: affine_enc(w, 32, 4, enc_global(np.abs(w).max()))),
+        ("Q4_K-shaped  g32, 6-bit int scale+min, po2 super", 4.50,
+         lambda w: q4k_enc(w)),
         ("IDEAS #2  Lloyd-Max g16, fp8 scale, + global", 4.50,
          lambda w: q.lloyd(w, 16, 4, enc_global(np.abs(w).max()))),
         ("          Lloyd-Max g32, bf16 scale", 4.50,

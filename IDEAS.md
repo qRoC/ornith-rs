@@ -29,6 +29,14 @@ marked unmeasured.
 > | Lloyd-Max g32, bf16 scale | 4.50 | 8.21% | 8.2-9.0% |
 > | nvfp4 g16 (built) | 4.50 | 9.51% | 10.4-13.1%, or 9.5% with one |
 >
+> **PRICED OUT, 2026-09-18 -- `REBUILD.md` Phase 13.** The first idea holds
+> and cannot be built: mlx's affine mode accepts group sizes 32, 64 and 128
+> only (`ops.cpp:5007`), so there is **no oracle at g16**, and the twin trick
+> that stood in for the 4.50-bit format cannot help because the *layout*
+> differs rather than the encoding. Decomposed, the -10% is
+> **-1.31 points of granularity minus 0.51 back for the fp8 scales** -- so the
+> gain lives in the group size, which is exactly the part mlx will not run.
+>
 > **So the first idea holds on weight error and the second does not.**
 > `g16, fp8 scale+bias` is really 10% better than the body at equal bits --
 > but only once a single fp32 a tensor moves the scales out of the

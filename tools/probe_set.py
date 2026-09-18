@@ -28,6 +28,20 @@ say that is not the criterion.
     has the highest entropy of the old eight and cannot tell the variants
     apart; `Дважды два равно` sits below it and spreads them over 8.4x.
 
+**And the set cannot rank languages, which is worth knowing before anyone
+tries.** Raw medians say Cyrillic probes take about twice the KL of Latin ones
+in every artifact, the control included -- but the Cyrillic probes here are
+also far higher-entropy (2.81 nats median against 1.63), because they were
+picked for discriminating power and not for matched difficulty. Regress
+`log KL ~ entropy + is_cyrillic` over the live probes and the entropy term is
++0.77 to +0.91 across five artifacts while the script term is never
+significant (t from -0.06 to +1.36, negative in one). The entropy gap alone
+predicts a bigger factor than the one observed. So the raw split measures the
+same thing the axis below measures -- damage lands where the distribution is
+spread -- and says nothing about the language. Ranking languages needs probes
+**matched on control entropy across them**, which is a different set, not a
+wider one.
+
 What separates a useful probe from a decorative one is **spread across
 variants**, and spread is not visible in the text -- it has to be measured.
 `compare_probes.py` reports it, and the measured verdict on these eight

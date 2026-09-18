@@ -83,8 +83,12 @@ def main():
         total = 0
         groups = {}
         for name, nbytes in by.items():
-            if ".switch_mlp." in name:
+            if ".switch_mlp." in name or ".mlp.experts." in name:
                 # top_k of `experts` slabs, and the tensor holds all of them.
+                # `.mlp.experts.` is the **parent's** fused layout, which
+                # conversion splits into `switch_mlp.gate_proj/up_proj`. Without
+                # it a parent falls into "other" and reports its whole expert
+                # bank as decode traffic -- 68.3 GB a token instead of 3.4.
                 nbytes = nbytes * top_k // experts
                 key = "switch_mlp (top-k)"
             elif name.endswith(("embed_tokens.weight", "embed_tokens.scales",

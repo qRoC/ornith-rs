@@ -28,7 +28,13 @@ MODEL = os.environ.get(
     "/Users/qroc/.mtplx/models/"
     "ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx",
 )
-REFS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "refs")
+REFS = os.environ.get(
+    # The Rust side has read this since the port began (`refs::refs_root`); the
+    # writer did not, so regenerating references for a forged artifact meant
+    # overwriting the control's. Same variable, both sides.
+    "ORNITH_REFS",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "refs"),
+)
 
 _DTYPE_NAMES = {
     mx.bfloat16: "bfloat16",

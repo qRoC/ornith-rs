@@ -1516,6 +1516,771 @@ perplexity, calibration output error, and activation magnitude itself.**
 
 ---
 
+## Phase 7 -- the rounding, which is the last degree of freedom -- **DONE; VERDICT WEAKENED BY PHASE 8**
+
+> **Read Phase 8 before this section.** Everything below is measured against
+> the control artifact `A`, because at the time that was the only reference
+> there was. The bf16 parent has since been captured
+> (`tools/dump_parent_probes.py`), and against it this phase's headline does
+> not hold at its stated strength: the sign test goes from 38/58, p = 0.025 to
+> **31/57, p = 0.60**, and the median per-probe ratio from 1.59x to **1.10x**.
+> The artifact is still not worse and is kept. The claim that it *pays*, at
+> that margin, was partly an artifact of the reference. Phase 8 blamed the
+> Hessians having been captured on `A`; **Phase 9 refuted that** and found
+> the real cause -- two draws of this method disagree with each other by
+> 56% of their own distance from the parent, so this phase and the next
+> were each reading one sample. The group table below is noise.
+
+Phase 4 closed the **format**: mlx has exactly four modes, affine int4 is the
+answer, and the best non-mlx 4.50-bit format was built as a stand-in and lost
+by the same margin. Phase 5 closed the **coverage**: the knee is
+`int4-head-linattn`, 44 of 60 probes, p = 0.0004. Phase 6 closed the
+**scaling**: activation-aware, built, keeps the oracle, buys perplexity and no
+KL.
+
+Between them those three exhaust everything about the artifact *except which
+integer each weight rounds to*. Round-to-nearest picks the closest grid point
+for every weight independently. GPTQ (Frantar et al., arXiv:2210.17323) picks
+a point that costs the layer's **output** less and pays for the deviation by
+pushing the error into the columns it has not reached yet, along the direction
+the inverse Hessian of the calibration input says is cheapest. The output is
+an ordinary affine artifact: same bits, same group size, same three tensors,
+same shards, same kernels.
+
+**It is the first lever since the MTP fix that pays.** Median KL over the 58
+live probes falls 0.0285 -> 0.0187, a factor of **1.52**; the median of the
+per-probe ratios is **1.59x**. Those are two statistics, not one.
+
+| | `int4-head-linattn` | `gptq-head-linattn` |
+|---|---:|---:|
+| GB a token | 2.0761 | **2.0761**, line for line |
+| dispatch profile | 1078 epochs, 37 kernels | **identical**, count for count |
+| perplexity (6620 tokens) | 6.5022 | **6.4238** |
+| max KL, the frozen eight | 0.048 | **0.0417** |
+| **median KL, 58 live probes** | 0.0285 | **0.0187** |
+| p90 KL | 0.2003 | **0.0985** |
+| max KL | **0.5029** | 0.9229 |
+| least damaged on | 20 of 58 | **38 of 58** |
+| relative weight error | **8.1-8.7%** | 9.3-12.2% |
+| calibration output error | -- | **-33.2% mean** (-76.8% best, -20.7% worst) |
+| `full_forward_matches_mlx` | `max_abs == 0.0` | `max_abs == 0.0` |
+
+Head to head it is lower on **38 of 58** live probes, median ratio **1.59x**,
+sign test p = 0.025 two-sided. That is a weaker p than Phase 5's 0.0004 and
+the effect is larger; both facts are the same fact, because this comparison
+has two variants where that one had five.
+
+### What it cost, because it is not free
+
+    group       n  gptq-head-linattn  int4-head-linattn
+    arith       8             0.0699             0.0887
+    script      8             0.0157             0.0379
+    morph       8             0.0540             0.0481   <- worse
+    longrange   7             0.0512             0.1059
+    format      6             0.0098             0.0119
+    rare        8             0.0152             0.0083   <- worse
+    code        6             0.0278             0.0747
+    mixed       7             0.0135             0.0203
+
+It wins the four groups Phase 5 measured as carrying the signal -- `arith`
+most of all -- and **loses `rare` by 1.8x and `morph` slightly**. The single
+worst probe in the whole set is now GPTQ's: `code/metal-kernel` goes 0.5029 ->
+**0.9229**, and `rare/cauchy` 0.0034 -> 0.0632.
+
+The obvious suspect is the corpus, and it is named rather than cleared:
+**624 samples, 254028 tokens** -- omlx's built-in calibration set (code 200,
+en 150, ko 60, zh 50, ja 60, tool_calling 40, reasoning 40) plus the 24
+paragraphs of `awq_calib.txt`. That mix has **six Cyrillic characters in
+744k**, so nearly all the Russian in the calibration comes from this project's
+own file. A rare-token probe is exactly what an underrepresented tail looks
+like when `lm_head`'s rounding is fitted to a distribution that does not
+contain it. Untested; the corpus is the first thing to move if anyone wants
+the `rare` row back.
+
+### The finding that outlasts the artifact: weight error ranks *backwards* here
+
+Phase 4 established that `tools/weight_error.py` ranks formats only within a
+fixed coverage, by order and never by magnitude. This is a sharper result and
+it comes from the one direction Phase 4 could not produce:
+
+**Coverage is fixed, the format is fixed, weight error went up by 13%, and the
+KL went down by 1.6x.** Every variant before this one moved both currencies
+the same way, so "more weight error, more damage" survived Phase 5 as a
+weakened but intact ordering. It does not survive a variant built to trade one
+against the other. `weight_error.py` cannot rank a *rounding* change at all,
+not even by order.
+
+And the objective GPTQ actually minimises is `||(W - Wq) X^T||` -- **the
+calibration output error Phase 6 measured and rejected**. Phase 6 bought six
+points of it and no KL; this bought 33 and 1.6x. So the currency was not the
+problem in Phase 6; the **reachable set** was. AWQ had a fold point -- the
+inverse of every scale had to be absorbed by a preceding op, which put
+`out_proj` and `lm_head` out of reach and left one family of three. GPTQ folds
+nothing into anything, so all 91 modules are reachable, including the two AWQ
+could not touch. **A predictor that fails under a constrained search is not
+thereby falsified; it may be the constraint that failed.** That is the fifth
+predictor and the first one to survive.
+
+### The control, which is the reason any of this can be believed
+
+`forge_gptq.py --off` runs the identical code path with the compensation term
+zeroed and asserts the result **is the base artifact's own tensors -- codes,
+scales and biases, all 91 modules, bit for bit**. It passes. So "the only
+variable is the rounding" is a checked statement, not a description of intent;
+it is the same role `alpha = 0` played in Phase 6.
+
+Two more checks behind it:
+
+- `gptq.py`'s grid is `aq.quantize`'s grid, verified against both `aq.quantize`
+  and the base artifact's stored tensors on a real module before anything was
+  built.
+- `dump_gptq_stats.py` asserts that `in_proj_qkv` and `in_proj_z` see the
+  **identical** input tensor before letting one Hessian serve both -- 30
+  layers, 4 calls each, `max_abs == 0.0`. `dump_awq_stats.py` asserted the same
+  thing in prose.
+
+### What was built
+
+    tools/dump_gptq_stats.py   H = sum x x^T for the 61 input groups, 2.36 GB
+                               fp32, 254028 tokens, 272 s. Not the 256 `rows`
+                               `dump_awq_stats.py` keeps -- that is a rank-256
+                               estimate of a matrix about to be inverted at
+                               dimension 4096.
+    tools/gptq.py              the algorithm, in numpy, over aq.py's exact grid
+    tools/forge_gptq.py        the forge and the --off control, 142 s for 91
+                               modules
+    tools/ref.py               now honours ORNITH_REFS, which the Rust side has
+                               read since the port began
+
+### What is still open, and the big one is not small
+
+- **The experts were not touched.** These 91 modules are 57% of a decode
+  step's *traffic* but a small share of its *parameters*: the 256 experts of
+  40 layers are 90%+ of the model and are quantized by round-to-nearest, as
+  they have been since the parent. They need a routed-activation capture (each
+  expert sees only the tokens routed to it), which is the one piece of
+  machinery this phase did not need. omlx's own documentation describes a
+  batched expert GPTQ that shares one Hessian across a layer's experts,
+  because they all read the same hidden states; the **implementation is not in
+  the vendored copy** (0.7.0.dev3 ships oQe, an imatrix weighting, not GPTQ),
+  so `docs/oQ_Quantization.md` there describes a version this tree does not
+  have.
+- **No act-order.** Quantizing columns in order of decreasing `diag(H)` is the
+  standard companion trick and needs a `g_idx` per column, which mlx's affine
+  layout has no room for. Permuting the weight instead needs the input
+  permuted, and the input comes out of an RMSNorm shared with modules that are
+  not being touched -- the same fold-point wall Phase 6 hit, from the other
+  side.
+- **The corpus has no Russian**, and `rare` regressed. See above.
+- **Damping was not searched.** `percdamp` is 0.01, the literature's default,
+  and `ORNITH_GPTQ_DAMP` exists so that it can be moved. Nothing here says
+  0.01 is right for this model.
+
+---
+
+## Phase 8 -- the bf16 parent, measured at last -- **DONE, AND IT MOVES A VERDICT**
+
+Every KL in Phases 4 to 7 is `KL(A || variant)`, where the control `A` is
+itself a quantized artifact: 260 modules at 8 bits. The unquantized parent was
+never measured, and this file and `recipes/README.md` both carried the row as
+missing, for a stated reason -- 67.0 GiB of weights against a 51.8 GiB working
+set, so `mlx_lm.load` dies.
+
+**That reason was about residency, not about the forward.** A layer only has to
+be resident while it runs. `tools/dump_parent_probes.py` inverts the loop:
+instead of walking 40 layers for one probe, it walks 64 probes for one layer,
+then drops the layer and loads the next.
+
+    heaviest layer of 40   3.13 GiB        measured peak   1.73 GiB
+    lm_head / embed        0.95 GiB each   working set    51.8 GiB
+    whole 64-probe capture                 **24 seconds**
+
+Twenty-four seconds, against a row that stood open for four phases. The
+`--check` mode exists because the assumption the whole thing rests on --
+that a dropped layer is actually released -- is worth testing before spending
+a pass: active memory is **0.00 GiB between layers**, flat.
+
+**The capture is sane, and one number says so.** With the parent as control,
+the least quantized artifact has to come out nearest it. It does: `new` (`A`
+itself, 260 modules at 8 bits) is the least damaged on **34 of 61** live
+probes at a median of 0.0179, well clear of everything forged from it.
+
+### What it says about Phase 7
+
+    KL(parent || variant), 57 live probes      gptq      int4-head-linattn
+    median                                   0.0303          0.0427
+    p90                                      0.2510          0.2076   <- worse
+    max                                      1.0122          0.7394   <- worse
+    least damaged on                        31 of 57        26 of 57
+    sign test                          31/57, p = 0.60  (was 38/58, p = 0.025)
+    median per-probe ratio                    1.10x         (was 1.59x)
+
+**The direction survives and the margin does not.** GPTQ is still ahead on the
+median and is still the least damaged of the forged variants -- but probe by
+probe the two are not separable, and GPTQ's *tail* is worse than the artifact
+it replaces. Phase 7's "it pays, 1.52x" was measured from `A` and reads
+differently from the parent.
+
+Two group-level conclusions from Phase 7 were wrong, **in opposite directions**:
+
+    group      vs A: gptq / base     vs parent: gptq / base
+    arith       0.0699 / 0.0887       0.1771 / 0.1526   <- looked best, is worst
+    rare        0.0152 / 0.0083       0.0239 / 0.0231   <- looked worst, is a tie
+    script      0.0157 / 0.0379       0.0217 / 0.0438   holds
+    longrange   0.0512 / 0.1059       0.0472 / 0.1077   holds
+
+So the `rare` regression this file spent a paragraph explaining, and blamed on
+six Cyrillic characters in 744k, **was not a regression at all** -- it was the
+reference. And `arith`, the group Phase 5 measured as carrying the most signal,
+inverts: GPTQ is further from the parent there than the artifact it replaces.
+
+### The mechanism, and it is a mistake worth writing down
+
+`dump_gptq_stats.py` captured the Hessians **from `A`**, because that was the
+best model that would load. GPTQ minimises `||(W - Wq) X^T||` over exactly
+those `X`. So it does not reconstruct the parent's layer outputs -- it
+reconstructs **`A`'s**, including `A`'s own damage, and then it was scored on
+its distance from `A`. Part of the Phase 7 margin was the measurement agreeing
+with itself.
+
+**Calibrate on the thing you are trying to reproduce, and score against it
+too.** The streaming path makes both possible now and neither was before, so
+this is a correction the earlier phase could not have made.
+
+> **REFUTED BY PHASE 9.** The mechanism above was tested by re-capturing the
+> Hessians from the parent and re-forging, and it does not hold: the two
+> Hessians differ by **0.58%** and the parent-Hessian variant comes out
+> *slightly worse*, 27 of 58, p = 0.69. What Phase 9 found instead is that
+> GPTQ here is a **high-variance procedure**, so Phase 7 and Phase 8 were each
+> reading a single draw. Read Phase 9 before building on anything in this
+> section, including its group table.
+
+### What this opens
+
+- **Re-capture the Hessians from the parent and re-forge.** Same streaming
+  harness, same `gptq.py`, same 91 modules. This is the direct fix for the
+  mechanism above and it is now cheap.
+- **`A` is not uniformly the nearest thing to the parent.** On `arith`,
+  `awq-linattn` (0.0976), `fp8scale-twin` (0.0988) and `int4-except-gates`
+  (0.1256) all sit closer to the parent than `A` does (0.1376). Treat that as
+  a caution rather than a finding -- eight probes to a group makes a group
+  median noisy -- but the `A`-referenced instrument could not see it at all.
+- **Every earlier capture can be re-scored for nothing.** The eight
+  `refs/artifact/*/probes.bin` are log-probabilities; the parent's is one more
+  file. `compare_probes.py` now takes any capture as the control and excludes
+  only that one from the variant list, so Phases 4, 5, 6 and 7 all re-rank
+  against the parent without a rebuild.
+- **The parent's perplexity is still missing**, and it is the same pass: keep
+  hidden states for the 6620-token corpus and run `norm` + `lm_head` per chunk
+  at the end. Not done here.
+
+### The trap this had to clear
+
+The parent is an HF checkpoint carrying `mtp.*` and a torch-layout `conv1d`,
+so `qwen3_5.TextModel.sanitize` **adds 1.0 to the trunk norm gains**. Streaming
+sanitizes per layer instead of once over the whole dict, so
+`has_unsanitized_conv1d` is computed globally from the full key list before any
+layer is touched, and asserted. A second assertion checks the result rather
+than the intent: layer 0's mean `|gain|` is **1.0312**, which is an absolute
+gain; a delta-encoded one sits near 0.0 and would have produced a model that
+loads and is wrong. That is the double shift, from the side that is easy to
+miss.
+
+---
+
+## Phase 9 -- the same method twice, and it disagrees with itself -- **DONE**
+
+Phase 8 blamed Phase 7's inflated margin on the Hessians having been captured
+from `A` rather than from the parent. Phase 8's own streaming path makes that
+testable, so it was tested: `tools/dump_gptq_stats_parent.py` accumulates the
+same 61 Hessians over the same 254028-token corpus with `X` taken from the
+parent, and `forge_gptq.py` re-forges from them.
+
+**The two calibrations are the same calibration.**
+
+    ||H_parent - H_A|| / ||H_A||        0.58%  (in_proj_qkv)   0.12%  (out_proj)
+    off-diagonal correlation          0.999968               0.999998
+    GPTQ objective, mean improvement    -33.20%   against  -33.22%
+
+**And the two artifacts are not the same artifact.** A 0.58% perturbation of
+`H` flips **9.9%** of the codes by a mean of 1.8 grid levels, because the
+compensation is sequential -- every column's error is pushed into all the
+columns after it, so a microscopic difference in direction compounds over a
+2048-column walk.
+
+    KL(parent || variant), 58 live probes    median      p90      max   best on
+    gptq  (A Hessians)                       0.0300   0.2501   1.0122  22 of 58
+    gptq  (parent Hessians)                  0.0354   0.1788   1.4685  18 of 58
+    int4-head-linattn  (round-to-nearest)    0.0422   0.2040   0.7394  18 of 58
+
+    parent-H vs A-H, head to head: 27 of 58, p = 0.69
+
+**The number that matters is not in that table.** The median KL *between the
+two GPTQ variants* is **0.0196** against their median distance from the parent
+of 0.0348 -- **0.56x**. Two artifacts produced by the same method, from
+calibrations that agree to three decimal places, are **more than half as
+different from each other as either is from the truth**.
+
+In the currency the phases have been arguing in: the claimed GPTQ-over-RTN
+effect is 0.0122 nats of median KL, and the spread between two draws of GPTQ
+is 0.0054 -- **44% of it**.
+
+### What that retires
+
+- **Phase 8's mechanism is refuted.** The Hessians were never the problem;
+  `A` and the parent produce inputs whose second moments agree to a fraction of
+  a percent.
+- **Both phases' group tables are noise.** Phase 7 blamed a `rare` regression
+  on six Cyrillic characters in 744k; Phase 8 blamed an `arith` inversion on
+  the reference. Neither survives a second draw: between these two runs
+  `longrange` moves 0.0472 -> 0.1397 (3x), `arith` 0.1771 -> 0.1342, `script`
+  0.0217 -> 0.0350. Those are two samples of one procedure, not two findings.
+- **The tail was never a property of GPTQ either.** Phase 8 recorded that
+  GPTQ's p90 and max come out worse than RTN's. On the second draw the p90 is
+  *better* than RTN's (0.1788 against 0.2040) and the max is much worse
+  (1.4685). Erratic in both directions is what the variance predicts.
+
+### What survives
+
+**A systematic gain, smaller than claimed.** Both draws beat round-to-nearest
+on the median -- 0.0300 and 0.0354 against 0.0422 -- so the direction is real
+and it is not a draw artifact. Call it **~0.008 nats, roughly 20%**, not the
+29% one draw showed and not the 1.52x Phase 7 announced against the wrong
+reference. Both variants remain byte-identical at 2.0761 GB a token with an
+identical dispatch profile, so a ~20% median gain for nothing is still worth
+having; it is the *confidence* that was never there.
+
+### The lesson, and it is this project's recurring one
+
+Phase 5 found a verdict resting on one context of eight. Phase 7's
+[[speculation]] correction found a verdict resting on a stale measurement.
+This one rests on **one draw of a stochastic procedure**, and the procedure
+was never examined for being stochastic -- it is deterministic given `H`, which
+is not the same thing as stable in `H`.
+
+### What to do instead, and the knob is already there
+
+The variance is not in the Hessian estimate -- that is stable to 0.58% across
+two very different models -- it is in the algorithm's response to it. More
+calibration data will not fix that. **Damping will**: `percdamp` controls how
+aggressive the compensation is, it is at the literature default of 0.01, and
+`ORNITH_GPTQ_DAMP` has existed since Phase 7 without ever being searched.
+Phase 7 listed that as open and had no reason to care; now there is one.
+
+Anything measured about GPTQ here from now on needs **several draws**, not one.
+Two forges cost 280 s and a probe capture each, so this is affordable and was
+simply never done.
+
+---
+
+## Phase 10 -- the damping sweep -- **DONE; ITS HEADLINE DOES NOT REPLICATE**
+
+> **Read Phase 11 first.** This phase concluded that `percdamp = 0.03` beats
+> the default, on two draws a point that did not overlap. With **four** draws a
+> point they overlap completely (Mann-Whitney p = 0.56) and the optimum is not
+> there. What survives is the finding this phase was not looking for: GPTQ
+> beats round-to-nearest by **23%**, 14 of 14 forges, p = 6e-05. The method and
+> the tooling below are sound; the ranking of damping values is not.
+
+Phase 9 left GPTQ with a real effect and a noise floor half its size, and named
+the only available knob: `percdamp` adds `lambda * mean(diag H)` to the
+diagonal, so it interpolates continuously between full GPTQ (chaotic) and
+round-to-nearest (deterministic, no gain). Act-order needs a `g_idx` the affine
+layout has no room for and the block already equals the group; there is nothing
+else to turn.
+
+**The design uses Phase 9's negative result as its control.** The `A` Hessians
+and the parent's differ by nothing systematic (27 of 58, p = 0.69), so forging
+from each at the same damping gives two draws of one procedure -- a replicate,
+not a second effect. Four damping values, two draws each; `percdamp = 0.01` was
+already on disk from Phases 7 and 9.
+
+    59 live probes, reference = bf16 parent, RTN = 0.0418, control A = 0.0185
+
+    percdamp   draw A-H   draw P-H     mean   spread   vs RTN   spread/effect
+       0.003     0.0355     0.0352   0.0354   0.0003  +0.0064          0.04x
+        0.01     0.0297     0.0343   0.0320   0.0046  +0.0098          0.47x
+     -> 0.03     0.0285     0.0293   0.0289   0.0008  +0.0129          0.06x
+        0.10     0.0394     0.0419   0.0406   0.0025  +0.0012          2.14x
+
+**`percdamp = 0.03` is better than the default on both axes at once.** The
+median gain over round-to-nearest goes from **23% to 31%**, and the two draws
+do not overlap with the two at 0.01 -- max(0.03) = 0.0293 against
+min(0.01) = 0.0297. `p90` improves too, 0.1801 and 0.1673 against RTN's 0.2005,
+where at 0.01 one draw was 0.2491. Still byte-identical, still the same kernels.
+
+At the other end 0.10 does what the mechanism predicts: 0.0406 against RTN's
+0.0418, effect +0.0012, noise twice the signal. The curve is a U with its
+minimum somewhere between 0.01 and 0.10, and 0.03 is the best point tested.
+
+### Two things this does not say
+
+**The artifacts did not become stable; the statistic did.** KL between the two
+draws at 0.03 is 0.0190 -- **0.66x their own distance from the parent**, against
+0.58x at 0.01 and 0.50x at 0.10. Two very different sets of rounding decisions
+arrive at the same aggregate quality. That is enough to decide whether GPTQ
+beats RTN and says nothing about which artifact to keep, where it happens not
+to matter because both are equally good.
+
+**Two replicates is a spread estimate with one degree of freedom.** The spread
+column is nearly worthless on its own -- 0.0003 at `percdamp` 0.003 is most
+likely luck, and that same point has the *largest* disagreement between its
+artifacts (0.81x). What carries the result is the non-overlap of two pairs and
+the coherent shape of the curve, not that column.
+
+### Tooling
+
+`ORNITH_FORGE_LINK=1` hard-links the shards a forge does not rewrite instead of
+copying them -- six builds at 26 GB each moved the disk by 3 GB total. It is
+opt-in and only for sweeps: a hard link means editing one artifact edits the
+other, which is wrong for anything kept. Captures live in `refs/sweep/` rather
+than `refs/artifact/` so they stay out of `compare_probes.py`'s default variant
+list; `tools/sweep_report.py` reads them. The artifacts themselves were deleted
+after each capture, which is the whole point of `probes.bin` being the product.
+
+### Open
+
+- **More replicates.** `H` is additive over samples, so one streaming pass with
+  four accumulators (samples modulo 4) yields four independent Hessians in the
+  same ~290 s. Four draws at 0.01 and 0.03 would make the spread column mean
+  something instead of decorating.
+- **`percdamp = 0.05`**, to bracket the minimum.
+- **The experts**, still 256 x 40 layers at round-to-nearest, still 90%+ of the
+  parameters. This phase is what that job was waiting on, and the answer is
+  now "probably yes, after the replicates".
+
+---
+
+## Phase 11 -- four draws instead of two, and the optimum evaporates -- **DONE**
+
+Phase 10 ranked damping values on two draws each and found `percdamp = 0.03`
+better than the default, on the strength of two pairs not overlapping. Phase 10
+also wrote down why that was weak: two replicates is a spread estimate with one
+degree of freedom. So the replicates were made properly.
+
+`H` is additive over samples, so `ORNITH_GPTQ_SPLIT=4` keeps four accumulators
+and routes sample *s* to *s* mod 4 -- **four independent calibrations in one
+streaming pass**, whose sum is the single one. Each is a quarter of the data, so
+each Hessian is noisier than production and the spread they show is an **upper
+bound** on the spread at full corpus size. What they can settle is a ranking.
+
+    four quarter draws each, median KL(parent || variant), 59 live probes
+
+    percdamp 0.01   0.0277  0.0324  0.0337  0.0373     mean 0.0328
+    percdamp 0.03   0.0251  0.0335  0.0338  0.0369     mean 0.0323
+
+    separation: max(0.03) 0.0369  against  min(0.01) 0.0277  -- OVERLAP
+    Mann-Whitney: 0.03 lower in 8 of 16 pairings, exact p = 0.56
+
+**A coin flip.** Phase 10's non-overlap was luck. And `percdamp = 0.05`, forged
+to bracket the minimum, lands at 0.0371 with a spread of 0.0060 -- worse than
+both and its own noise is larger than its effect. There is no usable optimum in
+0.003 to 0.05; at 0.10 the method degenerates to round-to-nearest as predicted,
+with one of the two draws landing *above* it.
+
+### What survives, and it is now the solid part
+
+Pooling every forge at `percdamp <= 0.03` -- **14 independent artifacts** across
+two Hessian sources, four corpus quarters and three damping values:
+
+    median KL     0.0324 +- 0.0010 (sem)     round-to-nearest  0.0418
+    effect        +0.0094 nats = **23%** of the damage RTN pays
+    every draw below RTN                     14 of 14, sign test p = 6.1e-05
+    per-forge sd  0.0037 = **39% of the effect**
+
+So GPTQ's gain over round-to-nearest is **real, and it is 23%** -- byte
+identical, same kernels, same dispatch profile. What the damping knob cannot do
+is shrink the run-to-run spread: it sits at 39% of the effect and no value
+tested moves it. Phase 9 called the variance irreducible by anything but this
+knob; the knob has now been searched and it does not reduce it either.
+
+**Keep `percdamp` at 0.01.** Not because it won -- 0.01 and 0.03 are
+indistinguishable -- but because nothing argues for moving off the default.
+
+### The lesson, for the third time in this rebuild
+
+Phase 5 found a verdict resting on one context of eight. Phase 9 found two
+phases resting on one draw each. This one found a phase that *named* its own
+one-degree-of-freedom problem in writing and drew a conclusion from it anyway.
+**Two samples is not a measurement**, and writing "two samples is not a
+measurement" next to the conclusion does not make it one.
+
+Anything measured about GPTQ here takes **four draws minimum**, which costs one
+streaming pass plus four forges -- about 25 minutes, now scripted.
+
+### What this settles for the experts
+
+The gain is real at p = 6e-05, so extending GPTQ to the 256 experts of 40
+layers -- 90%+ of the parameters, still round-to-nearest -- is justified on the
+evidence. What it will need is the same four-draw discipline, because a single
+expert forge will land anywhere in a +-39% band.
+
+---
+
+## Phase 12 -- the experts, 93.1% of the model, and they buy ~3.5% -- **DONE, two draws**
+
+The 91 modules of Phases 7 to 11 are **1.52 B parameters, 3.7%** of the
+artifact. The 256 experts of 40 layers are **38.65 B, 93.1%**, round-to-nearest
+since the parent's own recipe, and their damage sits in the 0.0185 nats the
+*control* pays -- a pool no phase has touched.
+
+`tools/dump_gptq_experts.py` and `tools/forge_gptq_experts.py` spend the same
+lever on them. One Hessian a layer shared by its 256 experts (the exact
+per-expert object is 172 GB), pooled over **(token, expert) pairs** so it is
+routing-weighted; `gate_proj` and `up_proj` share the 2048-dimensional one and
+the identity is asserted at `max_abs == 0.0`, `down_proj` has its own at 512.
+
+### The result
+
+    KL(parent || variant), 58 live probes    median      p90      max   vs RTN
+    RTN `int4-head-linattn`                  0.0422   0.2040   0.7394     0.0%
+    91 modules GPTQ, draw A-H                0.0300   0.2501   1.0122   +29.0%
+    91 modules GPTQ, draw P-H                0.0354   0.1788   1.4685   +16.2%
+    experts GPTQ, draw 1                     0.0412   0.3116            +1.4%
+    experts GPTQ, draw 2                     0.0395   0.2919            +5.5%
+    **experts GPTQ, mean of two**            0.0403                     **+3.5%**
+
+(Draw 1 reads -0.6% against 58 live probes and +1.4% against the 59 that draw 2
+brings in; same capture, different denominator.)
+
+Byte-identical at 2.0761 GB a token. GPTQ's own objective fell **13.26%** on
+average and as much as 36% on the best `gate_proj`, and **none of it reached
+the distribution**. The tail is slightly *worse*: p90 0.3175 against RTN's
+0.2040.
+
+Two draws, and they bracket the effect rather than confirm it: the spread
+between them (0.0017) is **larger than the effect itself** (0.0015 against RTN).
+So +3.5% is not distinguishable from zero, and both draws make the **tail
+worse** -- p90 0.3116 and 0.2919 against round-to-nearest's 0.2005.
+
+Against the 91 modules' +17.9% and +28.9%, on 3.7% of the parameters. The
+expert line is closed.
+
+### Parameter share does not predict damage share, and this phase was built on assuming it did
+
+**3.7% of the parameters carried the damage; 93.1% carried almost none.** The
+motivation written at the top of this section -- that the experts must be the
+big prize because they are most of the model -- is refuted by the measurement
+it motivated.
+
+Four candidate reasons, ranked, none of them measured here:
+
+1. **`lm_head` is the output.** 508 M of the 91 modules' 1.52 B, and its error
+   *is* the logit error. Nothing downstream dilutes it; every other module's
+   error passes through a norm, a residual and more layers.
+2. **The linear-attention path accumulates.** `in_proj_qkv`, `in_proj_z` and
+   `out_proj` feed a float32 recurrent state carried across 30 layers. An error
+   injected there persists; a feed-forward error perturbs the residual stream
+   once.
+3. **MoE averages its experts.** A token sums 8 of 256, router-weighted. If
+   their quantization errors are independent the sum suppresses them by roughly
+   sqrt(8), and each expert is seen by ~3% of tokens.
+4. **The shared Hessian may be the limit, not the experts.** One pooled `H` a
+   layer serves 256 experts whose inputs are disjoint token subsets. That is
+   the approximation this phase chose for tractability, and it is the honest
+   alternative explanation: exact per-expert Hessians for one layer would
+   separate "the experts do not pay" from "this way of paying them does not
+   work".
+
+### The control earned its keep again
+
+`forge_gptq_experts.py --off` failed at layer 32, and the reason is a fact
+about this artifact that nothing had written down: **the experts are not
+uniform.** Layers 0-31 hold theirs at 4 bits / group 32 and **layers 32-39 at
+8 bits / group 64**. The forge had assumed one rate. Fixed by reading
+`config.json`'s per-tensor overrides and by generalising `aq.pack4` into
+`aq.pack(q, bits, cols)`; all 120 expert tensors then reproduce the base bit
+for bit, at both rates.
+
+### The experts split in two, and only one half is reachable
+
+On a 16-expert slice, which answers in a minute rather than forty:
+
+    L0  gate_proj    out 0.0373 -> 0.0238   **-36.1%**
+    L20 gate_proj    out 0.0587 -> 0.0483   **-17.8%**
+    L0  down_proj    out 0.0731 -> 0.0729         -0.3%
+    L20 down_proj    out 0.0813 -> 0.0810         -0.4%
+
+`gate_proj` and `up_proj` behave like the 91 modules. `down_proj` does not move
+at all, and the Hessians say why:
+
+    Hessian                          off-diag   eff. rank        top-1% var
+    in_proj_qkv (the -33% baseline)  0.72-0.87   9-23 / 2048      38-48%
+    experts gate/up                  0.93-0.96  12-91 / 2048      21-45%
+    experts down (SwiGLU output)     **0.15-0.17**  **468-490 / 512**   **2.2%**
+
+**`down_proj` reads `silu(gate) * up`** -- an elementwise product of two
+near-independent projections, which decorrelates the channels. The Hessian goes
+near-isotropic, `H^-1` near-diagonal, and GPTQ has nowhere to push the error:
+it degenerates to round-to-nearest *by construction*, not by accident.
+
+No `down_proj` was in the 91 modules, so nothing had looked. It is a third of
+expert parameters and a third of the forge time, and it should be excluded from
+any future GPTQ scope.
+
+### The complementarity that falls out of it
+
+The one module GPTQ cannot touch is one AWQ **can**. `h_c = silu(W_gate x)_c *
+(W_up x)_c`, and the nonlinearity is only on the gate path, so scaling channel
+`c` of `h` is dividing **row `c` of `W_up`**, with `W_down diag(s)` restoring
+the product. An exact fold, over ~12.9 B parameters, that Phase 6 never
+considered because expert `down_proj` was never in its scope.
+
+Untested, and it is the first thing to try if this phase's KL comes back thin.
+
+---
+
+## Phase 13 -- IDEAS #1, priced out rather than left untested -- **DONE**
+
+`IDEAS.md`'s surviving row -- `affine g16, fp8 scale+bias, with a per-tensor
+fp32` at 5.00 bits -- was the only scheme in that table that held on real
+weights and had never been built. Reproduced exactly:
+
+    scheme                                   bits   lm_head  in_proj_qkv  out_proj  switch_mlp
+    affine g32, bf16 scale+bias (the body)   5.00     8.03%       7.81%     8.25%       7.94%
+    IDEAS #1  g16, fp8 scale+bias + global   5.00     7.11%       7.01%     7.24%       7.05%
+
+**And decomposed, which is new.** Two rows were added to
+`tools/weight_error.py --schemes` to ask whether the win is the granularity or
+the encoding:
+
+    decomp  affine g16, bf16 scale+bias (rate-free)  6.00   6.60%  6.50%  6.71%  6.55%
+    decomp  affine g32, fp8 scale+bias + global      4.50   8.31%  8.10%  8.56%  8.22%
+
+So: g32 -> g16 with a perfect encoding buys **-1.31 points** and costs a whole
+bit; paying that bit back with fp8 scales instead of bf16 returns **+0.51**.
+Net at equal 5.00 bits, **-0.80 points, -10% relative**. The idea is real and
+it is the best 5.00-bit scheme measured here.
+
+### It cannot be built inside the contract
+
+    ValueError: [quantize] The requested group size 16 is not supported.
+                The supported group sizes are 32, 64, and 128.
+
+That is `mlx/ops.cpp:5007`, an API-level validation, so **there is no MLX
+oracle at g16** -- nothing to compare against. The kernel side is no friendlier:
+`QuantizedBlockLoader` carries `static_assert(BCOLS <= group_size)`, which the
+gemm tiles may not satisfy at 16.
+
+**And the twin trick does not transfer.** `forge_fp8scale_twin.py` worked
+because an E4M3 value times a power of two is exactly representable in bf16 --
+a different *encoding* inside the *same layout*. Here the layout itself
+differs: g16 needs twice as many (scale, bias) pairs as g32 and the affine
+layout has nowhere to put them.
+
+Unblocking means patching the vendored reference, rebuilding mlx from source,
+instantiating `(16, 4)` in the port, and then verifying against a **modified**
+mlx. The contract survives that in form and not in spirit.
+
+### Why it is not worth it, in the currency that has failed twice
+
+0.80 points of relative weight error, and weight error is the predictor this
+rebuild has now falsified twice:
+
+- Phase 4: `int4-except-gates` has the **lower** weight error and the **higher**
+  median KL.
+- Phase 7: GPTQ moved weight error **up 13%** and median KL **down 23%**.
+
+The prize here is smaller than what GPTQ delivered while moving the same
+quantity the wrong way. **Priced out, not untested** -- and the decomposition
+is the part worth keeping, because it says the granularity is where the gain
+lives, which is useful to anyone who later has a g16 kernel.
+
+---
+
+## Phase 14 -- a Q4_K-shaped grid, and the 4.50-bit space reopens -- **DONE**
+
+Phase 4 closed the 4.50-bit space on two routes -- mlx's `nvfp4` and the best
+non-mlx format then known, the fp8-scale twin -- and both lost. Phase 13 priced
+out IDEAS #1 because its win lives at a group size mlx will not run. What was
+never tried is the structure llama.cpp actually ships: **a sub-block's scale and
+min as 6-bit integers against two super-scales per 256 weights.**
+
+An integer has **no subnormal regime**, which is precisely what cost nvfp4 its
+quality here: 99.6% of this model's group scales sit below E4M3's smallest
+normal, so a format predicted at 9.5% measured 10.4-13.1%. The trade runs the
+other way -- an integer has uniform *absolute* resolution against the
+super-block maximum, so a sub-block far below it is coarse in relative terms.
+Which failure costs more on these weights was the question.
+
+**Priced first, then built.** `weight_error.py --schemes`:
+
+    affine g32, bf16 scale+bias -- the body   5.00   8.03  7.81  7.90  8.25  7.94
+    **Q4_K-shaped**                           4.50   8.07  7.86  7.93  8.30  7.98
+    fp8-scale twin                            4.50   8.31  8.10  8.18  8.56  8.22
+    Lloyd-Max g32, bf16 scale                 4.50   8.42  8.20  8.28  8.57  8.98
+    nvfp4 g16, + global scale                 4.50   9.45  9.53  9.50  9.44  9.48
+
+**And it is standable-in for the same reason the fp8-scale twin was**: the
+super-scales are powers of two, so a 6-bit integer times one is exactly
+representable in bfloat16, and the sub-block stays 32 wide -- mlx's own group
+size, unlike IDEAS #1's 16. `aq.q4k_encode`, `tools/forge_q4k_twin.py`, 283
+modules in 195 s, `check_rebuild.py` PASS, zero underflows.
+
+    KL(parent || variant), 60 live probes   median      p90      max   vs RTN
+    control A                     2.739     0.0182   0.1677   1.0479   +55.0%
+    int4-head-linattn RTN         2.076     0.0404   0.1969   0.7394     0.0%
+    int4-head-linattn + GPTQ      2.076     0.0295   0.2482   1.0122   +27.1%
+    **Q4_K twin**        stands for 1.925   0.0403   0.2447   0.7218    +0.2%
+    fp8-scale twin       stands for 1.925   0.0432   0.2395   0.6521    -7.0%
+    nvfp4                          1.925    0.0521   0.4613   4.7839   -29.0%
+
+**The same KL for 7.3% fewer bytes a decode step**, and a slightly *better*
+maximum. It strictly dominates `int4-head-linattn` on the (bytes, quality)
+pair, which neither earlier 4.50-bit route did. **"The 4.50-bit space is
+closed" was true of the two routes tested and is not true of the space.**
+
+### Three things this is not
+
+- **The bytes are arithmetic, not measured.** On disk the artifact is 5.00
+  bits; 4.50 is the rate of the format it stands for. Realising it needs a
+  Metal kernel for a layout mlx has no mode for -- it takes `affine`, `mxfp4`,
+  `nvfp4`, `mxfp8`. So this is a **pricing** result: it says the kernel is now
+  worth considering, where before it was not, because before both routes lost.
+- **The tail is worse**: p90 0.2447 against 0.1969.
+- **Weight error happened to predict correctly this time** -- 7.86% against the
+  twin's 8.10%, same order as the KL. After Phase 4 and Phase 7 both falsified
+  it, treat that as a coincidence rather than a rehabilitation.
+
+### The combination nobody has built
+
+GPTQ is +27.1% at 2.076 GB a token; this is +0.2% at 1.925. They are orthogonal
+-- one picks the grid, the other picks which point on it -- so together they
+would be GPTQ's quality at Q4_K's bytes.
+
+The obstacle is structural rather than conceptual: `gptq.py` derives a group's
+scale from the weights it is about to quantize, one group at a time, while a
+super-scale needs all eight of a super-block's groups at once. Either derive
+the super-scale from the pre-compensation weights (an approximation) or make
+the walk's block the whole 256-column super-block (exact, but reintroduces the
+staleness Phase 7's "the block is the group" decision removed).
+
+### The kernel, designed before it is written
+
+`Q4K.md` is the plan, and it turns on one decision that is not obvious: **build
+real ggml Q4_K, not the twin's variant.** The twin's power-of-two super-scales
+and magnitude-plus-sign fields exist only so it could be measured without a
+kernel. Dropping them buys the thing a bespoke format normally costs --
+**llama.cpp becomes the oracle.** mlx has no k-quant mode, so a Q4_K kernel has
+no MLX reference and `max_abs == 0.0` against MLX does not exist for it; adding
+the mode to vendored mlx would only make the port agree with code from the same
+hand. `ggml`'s `dequantize_row_q4_K` did not learn the format from us.
+
+The hidden cost, which `Q4K.md` says to price before writing Metal: an artifact
+in a mode mlx cannot load also cannot be captured by `dump_probes.py`, so the
+measuring instrument needs a port-side equivalent.
+
+### A bug worth recording, because the number lied convincingly
+
+The first measurement read **18.8-25.4%** and looked like a verdict on the
+format. It was `floor` where `ceil` belonged in the power-of-two super-scale:
+with `floor`, a super-block's own largest field overflows its 6-bit range in up
+to half of all super-blocks and gets clipped. A format that everyone else ships
+successfully measuring three times worse than plain affine is a bug report, not
+a finding.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

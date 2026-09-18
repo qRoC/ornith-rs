@@ -72,10 +72,22 @@ def quantize(w, group_size=32, bits=4, encode=None):
 
 def pack4(q, out_cols):
     """8 four-bit codes to a uint32, low nibble first."""
-    q = q.reshape(-1, 8).astype(np.uint32)
+    return pack(q, 4, out_cols)
+
+
+def pack(q, bits, out_cols):
+    """`32 // bits` codes to a uint32, lowest-order field first.
+
+    mlx packs 4-bit and 8-bit affine weights the same way, so one function
+    serves both. The routed experts need it: this artifact holds layers 32-39
+    at 8 bits / group 64 and the other 32 at 4 / 32, which is invisible until
+    something asserts against the base -- `forge_gptq_experts.py --off` did.
+    """
+    per = 32 // bits
+    q = q.reshape(-1, per).astype(np.uint32)
     word = np.zeros(len(q), np.uint32)
-    for i in range(8):
-        word |= q[:, i] << (4 * i)
+    for i in range(per):
+        word |= q[:, i] << (bits * i)
     return word.reshape(-1, out_cols)
 
 # Smallest non-zero E4M3 magnitude: the subnormal step.
@@ -98,3 +110,52 @@ def fp8_encode(scale, bias):
     floor = np.float32(E4M3_MIN * ks)
     s = np.where(s == 0, np.where(scale < 0, -floor, floor), s).astype(np.float32)
     return s, (e4m3(bias / kb) * kb).astype(np.float32)
+
+
+SUPER = 8       # sub-blocks of `group_size` sharing one power-of-two super-scale
+QK_BITS = 6     # magnitude field, plus a sign
+
+
+def q4k_encode(scale, bias):
+    """The k-quant shape: 6-bit integer scale and min against a per-super-block
+    power of two. 4 + (7 + 7) / 32 + 16 / 256 = **4.50 bits**.
+
+    llama.cpp's Q4_K stores a sub-block's scale and min as small **integers**
+    normalised by two fp16 super-scales per 256 weights, which is why it has no
+    subnormal regime -- the failure that cost nvfp4 its quality here, where
+    99.6% of group scales fall below E4M3's smallest normal. The trade runs the
+    other way from a float: an integer has uniform *absolute* resolution against
+    the super-block maximum, so a sub-block far below that maximum is coarse in
+    relative terms.
+
+    Standable-in like `fp8_encode`: the super-scales are powers of two, so a
+    6-bit integer times one is exactly representable in bfloat16 and the result
+    writes out in the ordinary affine layout on mlx's own kernels. Unlike
+    IDEAS #1 the sub-block stays 32 wide, which mlx supports -- that is the
+    whole reason this one can be built and that one cannot
+    (`REBUILD.md` Phase 13).
+
+    `aq.quantize`'s scale carries a sign (it records which edge the group was
+    fitted to), so both fields are magnitude-plus-sign rather than unsigned.
+    """
+    top = np.float32(2**QK_BITS - 1)
+
+    def enc(v):
+        n = len(v) // SUPER
+        assert len(v) % SUPER == 0, (len(v), SUPER)
+        g = np.abs(v[:n * SUPER]).reshape(n, SUPER)
+        # A power of two >= max/top: exact in bf16, and nothing clips. Using
+        # floor here lets a super-block's own largest field overflow in up to
+        # half of all super-blocks, which costs 19% error against 8%.
+        k = 2.0 ** np.ceil(np.log2(np.maximum(g.max(1, keepdims=True), 1e-30) / top))
+        q = np.clip(np.round(g / k), 0, top) * k
+        return (np.sign(v) * q.ravel()).astype(np.float32)
+
+    s = enc(scale)
+    # A group whose scale underflows to zero is unreconstructable; floor it at
+    # one super-scale step with the sign kept, as `fp8_encode` does.
+    step = 2.0 ** np.ceil(np.log2(np.maximum(
+        np.abs(scale).reshape(-1, SUPER).max(1, keepdims=True), 1e-30) / top))
+    floor = np.repeat(step.ravel(), SUPER).astype(np.float32)
+    s = np.where(s == 0, np.where(scale < 0, -floor, floor), s).astype(np.float32)
+    return s, enc(bias)

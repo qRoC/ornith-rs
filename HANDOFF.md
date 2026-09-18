@@ -1398,6 +1398,63 @@ In order:
      kernel in the step, and taking it means reordering across block and layer
      boundaries, which needs a deferred op layer rather than another dozen
      lines. Worth doing only if something else wants that layer anyway.
+   - **The bytes are spent, but the *rounding* was not, and it paid.**
+     `REBUILD.md` Phase 7: GPTQ over the same 91 modules, same bits, same
+     coverage, same kernels, **same 2.0761 GB a token and the same 1078-epoch
+     dispatch profile count for count**. Median KL over the 58 live probes
+     0.0285 -> **0.0187**, least damaged on 38 of 58, perplexity 6.5022 ->
+     6.4238, and `full_forward_matches_mlx` still `max_abs == 0.0`. The
+     artifact is `~/.mtplx/models/ornith-1.5-35b-a3b-gptq-head-linattn`.
+     It costs nothing at runtime because nothing at runtime changed.
+
+     **Phase 8 then measured the bf16 parent and the margin shrank.** Every
+     number above is against `A`, which is quantized. Against the parent the
+     sign test goes 38/58, p = 0.025 -> **31/57, p = 0.60**, the median
+     per-probe ratio 1.59x -> **1.10x**, and GPTQ's p90 and max come out
+     *worse* than the artifact it replaces. It is still ahead on the median
+     and still the least damaged of the forged variants; it is no longer
+     separable probe by probe. The mechanism is named: the Hessians were
+     captured on `A`, so GPTQ reconstructs `A`'s layer outputs and was then
+     scored on its distance from `A`.
+
+     **Phase 9 tested that mechanism and refuted it, and found a worse
+     problem.** The parent's Hessians differ from `A`'s by **0.58%** and the
+     re-forge is no better (27 of 58, p = 0.69) -- but it is a *different
+     artifact*: a 0.58% perturbation of `H` flips **9.9% of the codes**,
+     because the compensation is sequential over 2048 columns. The median KL
+     **between the two GPTQ variants** is 0.0196 against their 0.0348 from the
+     parent -- **two draws of the same method are 56% as far apart as either
+     is from the truth**, and the claimed GPTQ-over-RTN effect is only twice
+     that spread. Both phases' group tables are noise; the `rare` regression
+     was neither the corpus nor the reference. What survives is a real but
+     smaller systematic gain, **~20% of median KL**, for identical bytes.
+     Anything measured here from now on needs several draws.
+
+     **Phases 10 and 11 searched the one knob; it does not pay, and the
+     search is what finally measured the effect.** Phase 10 read
+     `percdamp = 0.03` as better on two draws a point. On **four** draws a
+     point (`ORNITH_GPTQ_SPLIT=4`, four disjoint corpus quarters in one
+     streaming pass) 0.01 and 0.03 overlap completely -- Mann-Whitney
+     p = 0.56 -- and 0.05 is worse than both. **Keep the 0.01 default.**
+
+     What the sweep did establish, pooling **14 independent forges**:
+     GPTQ beats round-to-nearest by **0.0094 nats, 23% of its damage**,
+     14 of 14 below it, sign test **p = 6.1e-05** -- byte-identical, same
+     kernels, same dispatch profile. Per-forge sd is **39% of that effect**
+     and no damping value reduces it, so any single forge lands in a +-39%
+     band. Four draws minimum for anything measured here from now on; that is
+     one streaming pass plus four forges, ~25 minutes, scripted. The 256 experts of 40 layers -- 90%+ of
+     the parameters -- were never touched at all.
+
+   - **The bf16 parent is measurable on this machine, and was not.**
+     `tools/dump_parent_probes.py` streams it one layer at a time: measured
+     peak **1.73 GiB** against a 51.8 GiB working set, whole 64-probe capture
+     in **24 seconds**. `mlx_lm.load` dies on 67.0 GiB, but that is residency,
+     not the forward. `compare_probes.py` now takes any capture as the control,
+     so all eight artifacts re-rank against the parent with no rebuild. The
+     same trick sizes up: the 397B parent is 12.5 GiB a layer, which also
+     fits.
+
    - **Then bytes -- and the byte lever is now spent, in both senses.**
      `REBUILD.md` Phase 4 is done. Five artifacts built from the verified
      parent and judged on perplexity, KL, bytes and GPU busy; the answer is

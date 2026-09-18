@@ -61,9 +61,15 @@ def kl(a, b):
 def main():
     args = sys.argv[1:]
     control = args[0] if args else ARTIFACTS / "new"
+    # Whatever is the control is not also a variant. Until Phase 8 the control
+    # was always `new` and the exclusion could be spelled as its name; with the
+    # bf16 parent captured (`dump_parent_probes.py`), `new` becomes an ordinary
+    # variant and is the one that says whether the streamed capture is sane --
+    # the least quantized artifact has to come out nearest the parent.
+    cname = pathlib.Path(control).expanduser().resolve().name
     variants = args[1:] or sorted(
         p for p in ARTIFACTS.iterdir()
-        if p.is_dir() and p.name != "new" and (p / "probes.json").exists()
+        if p.is_dir() and p.resolve().name != cname and (p / "probes.json").exists()
     )
     if not variants:
         sys.exit("no variant captures with probes.bin; run dump_probes.py first")
