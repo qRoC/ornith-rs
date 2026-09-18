@@ -238,7 +238,20 @@ Why it suits this project better than anything else here:
 ## If it were ranked
 
 1. **Activation-aware scaling** -- no kernels, keeps the oracle, attacks the
-   binding question from the only side with room left.
+   binding question from the only side with room left. **BUILT AND MEASURED,
+   and it does not pay** -- `REBUILD.md` Phase 6. Both halves of the pitch
+   held: no Metal was written and `full_forward_matches_mlx` passes on the
+   forged artifact at `max_abs == 0.0`. What did not hold is the outcome. At
+   byte-identical traffic it improves perplexity out of sample (6.5022 ->
+   6.4512) and leaves the distribution alone or slightly worse (geometric-mean
+   KL ratio 1.16x over 61 probes, p = 0.25), with the loss concentrated 3-7x
+   on Russian arithmetic -- the probes Phase 5 measured as carrying the most
+   signal. Two further findings: only one of the three candidate families was
+   reachable at all, decided by the granularity of the op the inverse folds
+   into and not by activation spread (the dead one has 140x the spread of the
+   live one); and recalibrating on a 36% non-Latin corpus moved 1.9% of the
+   scales, so `mean|x|` saliency is substantially language-independent and a
+   calibration set cannot reach the failure.
 2. **fp8 scale at group 16** instead of bf16 at 32 -- 10-17% less error at
    identical bits and an unchanged kernel shape. The closest thing here to
    free, and it needs mlx to accept an fp8 group scale in `affine` mode, which

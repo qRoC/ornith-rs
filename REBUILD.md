@@ -1394,6 +1394,128 @@ was the real requirement.
 
 ---
 
+## Phase 6 -- activation-aware scaling, built and it does not pay -- **DONE**
+
+`IDEAS.md` ranked this first of everything left, and the ranking was sound on
+its own terms: it needs no new Metal, it produces an ordinary affine artifact
+so the MLX oracle survives, and it attacks *output* error, the axis nothing in
+Phase 4 touched. Built, measured on Phase 5's instrument, and it is a trade
+rather than a win.
+
+`W diag(s)` quantized against `x diag(1/s)` is the same product, so a channel
+the activations actually use can be given more of the 4-bit grid for free --
+provided something upstream absorbs `1/s`. Three tools:
+`tools/dump_awq_stats.py` (per-channel input statistics and sampled input
+vectors over a calibration corpus), `tools/awq_search.py` (choose `s`), and
+`tools/forge_awq.py` (apply it).
+
+### The fold point decided the scope, not the statistics
+
+Three families were candidates. Only one survived, and activation spread had
+nothing to do with which:
+
+| family | spread, max/median | folds into | outcome |
+|---|---:|---|---|
+| `in_proj_qkv`, `in_proj_z` | 20-57x | `input_layernorm` | **built**, 28.3% of traffic |
+| `out_proj` | **1319x** | `linear_attn.norm` | unreachable |
+| `lm_head` | 9.4x | `model.norm` | unreachable |
+
+`out_proj` has by far the most saliency to exploit and none of it is
+reachable: its only fold point is `linear_attn.norm`, which is per-head-dim
+and shared across all 32 value heads, while the outliers sit at individual
+(head, dim) pairs -- taking out the per-dim mean leaves 98-114% of the
+log-variance behind. The gate is the other candidate and it is nonlinear, so
+nothing folds through it.
+
+`lm_head` folds into `model.norm`, which also feeds the MTP head through
+`pre_fc_norm_hidden` -- and an RMSNorm cannot absorb a per-channel rescale,
+because its own denominator moves with the channel pattern. The search
+independently priced `lm_head` at +1.5%, the smallest of the three, so
+nothing was lost.
+
+**The generalisation: spread is necessary and not sufficient.** What decides
+is whether the preceding op is indexed the same way the saliency is. The dead
+family here has 140x the spread of the live one.
+
+### Powers of two, so that nothing but the quantizer moves
+
+Every fold is a bf16 tensor divided or multiplied by `s`: the norm gain by
+`1/s`, and the two bf16 recurrence projections `in_proj_a`/`in_proj_b`, which
+read the same tensor, by `s`. At an arbitrary scale each of those rounds --
+~0.2% of uncontrolled relative error applied per channel to a whole channel,
+which is the shape of error that killed nvfp4, one order down. Restricted to
+powers of two every fold is exact, asserted tensor by tensor in
+`forge_awq.py`. The search prices the resolution this costs: **+26.2% mean
+output-error reduction against +32.6% unrestricted.**
+
+Two checks make the experiment interpretable. `alpha = 0` reproduces
+`int4-head-linattn` bit for bit -- weight, scales and biases -- so the scaling
+is the only variable. And the port's `full_forward_matches_mlx` passes on the
+forged artifact at `max_abs == 0.0` through all 40 layers, which is the
+"keeps the oracle" half of the idea, and it held exactly as claimed.
+
+### Two artifacts, and perplexity disagrees with the distribution
+
+Both carry **2.0761 GB a token, identical to the base** -- same format, same
+modules, same group size. This is a pure quality intervention at zero cost.
+
+| | calibration | ppl | median KL | p90 | max | vs base |
+|---|---|---:|---:|---:|---:|---|
+| `int4-head-linattn` | -- | 6.5022 | **0.0268** | 0.1928 | 0.5029 | -- |
+| `awq-linattn` | `ppl_corpus.txt`, all Latin | 6.4670 | 0.0300 | **0.1771** | 0.8389 | 27/60, p = 0.52 |
+| `awq-ml` | held-out, 36% non-Latin | **6.4512** | 0.0329 | 0.2374 | 0.4181 | 25/60, p = 0.25 |
+
+**Perplexity improves and the distribution does not.** The first run's
+perplexity gain was in-sample -- it calibrated on `ppl_corpus.txt` and was
+then scored on it -- which is why `tools/awq_calib.txt` exists: 10 KB of
+held-out text sharing no line with the perplexity corpus and 36% non-Latin by
+letter. On that corpus perplexity improves *more* (6.4512, 30% of the gap
+back to the control) and out of sample. Meanwhile the 61 live probes move the
+other way: geometric-mean KL ratios of 1.11x and 1.16x against the base,
+neither significant.
+
+### Where it goes wrong, and why the multilingual corpus did not fix it
+
+The loss is concentrated in `arith`, the group Phase 5 measured as carrying
+the most signal:
+
+| | `int4-head-linattn` | `awq-linattn` | `awq-ml` |
+|---|---:|---:|---:|
+| median KL, `arith` (8) | 0.0887 | 0.1634 | 0.2133 |
+| median KL, other 53 | 0.0228 | 0.0242 | 0.0298 |
+| `arith/ru-2x2` | 0.0507 | 0.1623 | 0.3643 |
+| `arith/ru-7x8` | 0.1361 | 0.2131 | 0.4181 |
+
+Excluding `arith` the experiment is a wash (24/52, p = 0.68 and 23/52,
+p = 0.49). Including it, AWQ makes Russian arithmetic 3-7x worse, and the
+multilingual calibration made it **worse again**, monotonically, which is the
+opposite of the hypothesis that motivated it.
+
+The reason is visible in the scales rather than the outputs: recalibrating on
+a corpus with 11.8% Cyrillic kept the same alpha on **21 of 30 layers** and
+moved **1.9% of channels** (max 3.3%). The saliency map `mean|x|` produces is
+substantially language-independent, so a calibration set cannot reach what is
+going wrong. The channels that carry a rare forced continuation are not the
+channels with large mean magnitude, and mean magnitude is the whole of AWQ's
+saliency model.
+
+### The verdict, and why the continuous variant was not built
+
+**Not adopted.** Identical bytes, no measurable distribution gain, and a
+concentrated regression on the probes with the most power. `int4-head-linattn`
+remains the artifact.
+
+The unrestricted-scale family is the obvious next thing to try, and it is
+deliberately not built. The only evidence for it is +6 points of calibration
+output error over the power-of-two family -- and calibration output error is
+precisely the predictor this phase just falsified, in the same way weight
+error was falsified in Phase 4 and perplexity in Phase 5. Buying it would
+cost the exactness of every fold. **That is four predictors of the
+distribution now measured and all four found wanting: weight error,
+perplexity, calibration output error, and activation magnitude itself.**
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

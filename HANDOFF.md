@@ -1423,11 +1423,34 @@ In order:
      равно` itself. Spread across variants is the property, and it is only
      visible after capture.
 
-   - **So the next thing is activation-aware scaling** (`IDEAS.md`), the one
-     idea not denominated in weight error: it produces an ordinary affine
-     artifact, so `max_abs == 0.0` against MLX survives untouched, and it
-     attacks *output* error, which is the axis none of this touched. It now
-     has an instrument to be judged on.
+   - **Activation-aware scaling was the next thing, and it is now done and
+     rejected** -- `REBUILD.md` Phase 6, the last idea `IDEAS.md` had ranked
+     above the noise. Two artifacts built, both byte-identical to
+     `int4-head-linattn` at 2.0761 GB a token, so it was quality at zero cost
+     or nothing. It is nothing: perplexity improves out of sample (6.5022 ->
+     6.4512) while the 61 live probes move the other way (geometric-mean KL
+     ratio 1.16x, p = 0.25), and the loss lands 3-7x on Russian arithmetic,
+     the highest-signal group there is. The oracle half of the pitch held
+     exactly as claimed -- no Metal written, `full_forward_matches_mlx` passes
+     on the forged artifact at `max_abs == 0.0`.
+
+     Two findings outlast it. **The fold point decides, not the spread**:
+     `out_proj` has 1319x max/median saliency and is unreachable because its
+     only fold point is shared across 32 heads, while `lm_head` is unreachable
+     because `model.norm` also feeds the MTP head through an RMSNorm, which
+     cannot absorb a per-channel rescale. And **`mean|x|` saliency is
+     substantially language-independent** -- recalibrating on a 36% non-Latin
+     held-out corpus kept the same alpha on 21 of 30 layers and moved 1.9% of
+     channels, so no calibration set reaches what goes wrong.
+
+   - **So both levers are spent, and what is left is the runtime.** Bytes
+     closed in Phase 4, quality in Phase 6, and four predictors of the
+     distribution have now been measured and found wanting -- weight error,
+     perplexity, calibration output error, and activation magnitude. What
+     remains on this list is items 1, 2 and 4 above: a machine that is not
+     swapping, the ~3.4% of encode order that needs a deferred op layer, and
+     the MTP stall. All three are wall-clock questions, which is why the first
+     one gates the other two.
 
 3. **Rebuild the artifact from its parent -- DONE**, Phases 0 through 4, and
    it is what unblocked the byte lever above. `REBUILD.md` is the record. The
