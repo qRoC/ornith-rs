@@ -2852,8 +2852,13 @@ loop does, so there is no second kernel to write.
 
 ### What is left
 
-  - **A Hessian for `in_proj_z`**, still: it would take the 4-bit side's
-    imatrix from 61 of 91 modules to all of them. Unchanged by this phase.
+  - ~~A Hessian for `in_proj_z`~~ -- **already done**, and this list was wrong
+    to carry it. `forge_q4k.py:162` rewrites the module name to
+    `in_proj_qkv`, whose Hessian is the same matrix (the two read the same
+    tensor one line apart), so the imatrix has covered all 91 since the commit
+    before Phase 16 and every artifact on disk was forged with it. `Q4K.md`
+    step 9 has the measurement; Phase 15's "what is left" predates it and is
+    left as written.
   - **Re-capturing the last two k-quant artifacts on the tile**, if their
     numbers are ever going to be compared against anything again. `q4k-all`,
     `q6k-all`, `q6k-full` and `int4-head-linattn` are done; `q4k-imatrix` and
