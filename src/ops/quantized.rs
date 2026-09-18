@@ -39,6 +39,7 @@
 //! `x @ w.T`, which is the layout every linear layer in this model uses.
 
 use crate::array::Array;
+use crate::ops::invariant;
 use crate::ops::kquant::KQuant;
 use crate::metal::{Context, Dispatch};
 
@@ -257,7 +258,12 @@ pub fn quantized_matmul(ctx: &Context, x: &Array, qw: &QuantMatrix) -> Array {
     let out = Array::empty(ctx, &out_shape, x.dtype);
 
     let limit = qmv_batch_limit(ctx, k, n);
-    if m >= limit && affine_gemm_enabled() {
+    if invariant::for_rows(m) {
+        // Every row a mat-vec, whatever M is: `qmv_fast_impl` reads row `tid.x`
+        // of `x` and reduces over K the same way no matter how many rows are
+        // beside it, so this is M copies of the M = 1 answer, bit for bit.
+        qmv(ctx, x, qw, &out, m, n, k);
+    } else if m >= limit && affine_gemm_enabled() {
         // B == 1 here (2-D weights), and every linear in this model is
         // transposed, so mlx takes the split-K path.
         qmm_splitk(ctx, x, qw, &out, m, n, k);
@@ -501,7 +507,7 @@ pub fn gather_qmm_rows(
     // `GatherQMM::eval_gpu`, in order: the rhs-sorted batched path first, then
     // the matrix path, then the vector path. M is 1 here, so the matrix path
     // (M >= vector_limit) is unreachable.
-    if rows >= 16 && sorted && rows / experts >= 4 {
+    if rows >= 16 && sorted && rows / experts >= 4 && !invariant::all() {
         gather_qmm_rhs(ctx, x, qw, rhs_indices, &out, rows, n, k);
     } else {
         gather_qmv(ctx, x, qw, lhs_indices, rhs_indices, &out, n, k);

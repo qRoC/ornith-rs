@@ -16,6 +16,7 @@ pub mod scan;
 pub mod searchsorted;
 pub mod sort;
 pub mod indexing;
+pub mod invariant;
 pub mod random;
 pub mod reduce;
 pub mod layout;

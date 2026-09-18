@@ -3026,6 +3026,184 @@ very little of it.
 
 ---
 
+## Phase 21 -- batch invariance, and speculative decoding becomes exact -- **DONE**
+
+A quantized linear picks its kernel by row count: `qmv` at M = 1, `qmv_wide`
+at 2..`qmv_batch_limit`, the split-K gemm above that, and on the k-quant side
+ggml's mat-vec below `MM_ROW_LIMIT` and Phase 19's tile above it. All of them
+are correct and **none of them agrees with the others**, because they
+associate the same sum differently.
+
+Everywhere a batch is an optimisation over rows that *would* have been
+computed one at a time, that disagreement is an artefact of the batching. The
+speculative loop is exactly that: the target runs over `depth + 1` rows where
+the autoregressive path would have run it one row at a time. mlx-vlm fixes it
+and says why in one line -- `quantized_verifier.py`,
+`singleton_quantized_linear`, "fuse a runtime-sized batch while retaining
+singleton qmv arithmetic".
+
+### The check that costs minutes, and it answered no
+
+`tests/quantized.rs` pins M = 1/2/4/8/16/64/256 against MLX at
+`max_abs == 0.0`, but that is port-against-mlx, not M = 1 against M = 4.
+`tests/batch_invariance.rs` asks the second question, and it needs no
+reference: both arms are this machine's own kernels on the same input.
+
+    module                    M = 2..12 against the same row alone, max_abs
+                              int4-head-linattn        q6k-full
+    in_proj_qkv  2048->8192      4.9e-4 .. 3.9e-3      0 to M=7, 7.8e-3 at M>=8
+    out_proj     4096->2048      3.8e-6 (0 at M=2)     --
+    mlp.gate     2048->256       0 to M=10, 6.0e-8     --
+    shared.gate  2048->512       2.3e-2 .. 3.5e-2      --
+    lm_head      2048->248320    **7.8e-3**            0 to M=7, **1.6e-2** at M>=8
+    routed, 2048 rows sorted     1.8e-2                7.8e-3
+
+So the answer is no, and the shape of the no is informative. The k-quant
+modules are *already* invariant up to `MM_ROW_LIMIT = 8` -- ggml's mat-vec
+carries the token axis on the grid's y, which is M independent matvecs -- and
+lose it exactly where Phase 19's tile takes over. The affine modules lose it
+at M = 2, where `qmv_wide` starts sharing one weight read between five rows.
+
+### The flag, and what it does not need
+
+`ORNITH_INVARIANT` in `src/ops/invariant.rs`, off by default. It does not need
+a kernel. The port owns its dispatcher, so "every row a mat-vec" is a branch:
+`qmv_fast_impl` reads row `tid.x` and reduces over K the same way whatever is
+beside it, so `qmv` at M rows **is** M copies of the M = 1 answer. That is
+also why mlx-vlm needs `gather_qmm(rhs_indices=0)` and this does not -- from
+Python there is no way to make `mx.quantized_matmul` take the mat-vec at
+M = 4; from inside the dispatcher there is nothing else to do.
+
+Two settings, because a prefill chunk is *not* a batch of rows that would
+otherwise have run alone:
+
+  - `=1` -- batches of at most `EXACT_WINDOW` rows compute row by row. Prefill
+    keeps Phase 19's tile, so the mode is free at a long prompt.
+  - `=all` -- every M, which is what the probe captures want.
+
+**`EXACT_WINDOW` is 4 and it is not a choice.** mlx takes the fused vector
+SDPA only while `q_len * gqa_factor <= 32`, and this model has 16 query heads
+over 2 kv heads. `src/bin/invariance.rs` measures the boundary rather than
+quoting it: windows of 2, 3 and 4 come back bit-identical, and a window of 5
+first disagrees at **layer 3, the first full-attention layer**, by 3.9e-3. It
+is also the largest window `--mtp-depth 3` produces, which is the depth
+`mtplx_runtime.json` recommends. The two agreeing is luck.
+
+### One thing the quantized flag did not cover, and the bisect found it
+
+With the quantized linears pinned, three windows in sixty still moved -- and
+the first layer to disagree was a *linear-attention* one, a different one each
+time. `in_proj_a` and `in_proj_b` are bf16, and `Matmul::eval_gpu` sends a
+1-row product to `gemv` and a 4-row product to the steel gemm. So the flag now
+row-splits an unbatched bf16 product too. The batched ones are the unfused
+attention's two, which mlx reaches only past the fused limit -- never at a
+decode step or a four-row window.
+
+That is the general lesson of this phase: **batch invariance is a property of
+every kernel a forward touches, not of the quantized ones**, and the only way
+to know which ones noticed is to bisect the layers.
+
+### What it bought, on a whole forward
+
+`src/bin/invariance.rs`, 45-token prompt, 240 decode steps, windows of 4, each
+window measured against the same tokens one at a time *from the same cache
+state*:
+
+    arm                         bit-identical rows   top-1 moved   logit max
+    pinned (same state)  off          0 of 240        7 of 240       2.72
+    pinned (same state)  on         **240 of 240**   **0**           0.0
+    rewound (partial accept) off      0 of 48         4 of 48        1.62
+    rewound (partial accept) on     **48 of 48**     **0**           0.0
+    drift (own caches)   off          0 of 240        8 of 240       2.57
+    drift (own caches)   on         **240 of 240**   **0**           0.0
+
+**2.9% of verify rows had an argmax that moved because the row was batched.**
+A logit differing by 2.7 sounds impossible for a reassociated sum and is not:
+the error enters at the first layer and compounds through forty, which is the
+same mechanism the six divergent probes have in `HANDOFF.md`. Those rows are
+drafts rejected because the target changed its mind.
+
+### And the output is now the autoregressive output
+
+`speculative_tracks_autoregressive` measures how far the two streams stay
+together. It was **36 of 214 tokens** and is **221 of 221** -- all three
+prompts identical to the last token, where two of them used to part company at
+token 8 and 18. The printed text of `--mtp --greedy` is byte-identical to
+`--greedy` on the same prompt, with and without FR-Spec, *without the flag on
+the autoregressive side* -- the window mode does not touch prefill, so there is
+nothing to match.
+
+### What it costs, which is the surprise
+
+300 tokens, one prompt, greedy, GPU seconds because the wall is not a
+measurement on this machine:
+
+    config                      acceptance      by depth          GPU ms/token
+    autoregressive                  --             --             10.49
+    `--mtp`                     168/393  42.7%  0.66/0.56/0.65     9.65  9.66
+    `--mtp` + invariant         180/360  **50.0%**  0.71/0.71/0.58     9.66  9.74
+    `--mtp --frspec`            167/396  42.2%  0.66/0.55/0.67     8.55  8.46
+    `--mtp --frspec` + inv      179/363  **49.3%**  0.70/0.69/0.59     8.54  8.75
+
+**Acceptance up 17% relative, GPU work unchanged, wall unchanged** (89.7/91.1
+against 90.6/90.4; 102.0/102.2 against 102.5/102.6).
+
+Unchanged GPU is not what the arithmetic predicts. A verify window's dense
+linears now read the weight matrix once per row instead of once per five, and
+a decode step is 95% GPU busy waiting on weight reads. The reason it is free
+is that **the grid gets wider, not the traffic**: `qmv`'s grid is
+`(M, O/bn, 1)`, so the four rows of one output tile are adjacent threadgroups
+reading the same lines, and the cache serves three of the four. It is the same
+effect Phase 19 measured from the other side -- "L2 absorbs a 9 MB matrix read
+599 times".
+
+So what the flag buys is exactness and eight points of acceptance; the
+acceptance pays for the extra reads and no more. **It does not make
+speculation faster. It makes it correct.**
+
+### The instrument, fixed at the root this time
+
+Phase 19 found that tiling a prefill moves a probe capture on any
+quantization family, and answered it with a control experiment
+(`ORNITH_AFFINE_GEMM=0`: same move, code nobody here wrote). Under
+`ORNITH_INVARIANT=all` there is nothing to control for, because no kernel
+anywhere depends on a row count:
+
+    pair of captures, same artifact           without the flag     with it
+    int4-head-linattn, mlx gemm vs mat-vec    max_abs 3.116     **byte-identical**
+    q6k-full, tile vs mat-vec                 max_abs 3.062     **byte-identical**
+
+That is `cmp` on `logits.bin`, not a tolerance. A capture in this mode is a
+**third instrument, and the only one with no free parameter in it**:
+
+    variant                 median      p90      max
+    int4-gemm               0.0422   0.2040   0.7394
+    int4-matvec             0.0437   0.2612   0.9139
+    **int4-invariant**      0.0460   0.2571   0.9139
+    q6k-full-gemm           0.0344   0.2116   4.5238
+    q6k-full mat-vec        0.0325   0.2109   4.5238
+    **q6k-full-invariant**  0.0332   0.1898   5.2520
+
+It agrees with both of the others on the ordering -- `q6k-full` below `int4`
+on the median on all three -- and differs from each by about as much as they
+differ from each other. Which is the honest reading of Phase 19's finding
+restated: the instrument has a spread of this size, and no capture in this
+rebuild was ever outside it.
+
+### What is left
+
+  - **Windows past four.** `--mtp-depth 5` drops attention into the unfused
+    batched gemm and the promise ends. Row-splitting a *batched* product is
+    possible and not written; it is also pointless until a depth past 3 looks
+    like it pays, and Phase 21's own acceptance table does not say it does.
+  - **`=all` at a long prompt** is Phase 19's debt taken back on purpose: a
+    mat-vec per token plus one `gemv` per token for `in_proj_a/b`. 64 probes
+    cost 31 s, which is the only place it is used.
+  - **The MTP head is not covered and does not need to be.** Its arithmetic
+    decides which drafts are proposed, not which are accepted.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

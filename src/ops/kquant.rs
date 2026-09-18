@@ -41,6 +41,7 @@
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
+use crate::ops::invariant;
 
 /// ggml's `QK_K`: weights per super-block, the same for both formats.
 pub const QK_K: usize = 256;
@@ -409,7 +410,9 @@ pub fn matmul(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
     // `qmv` fixes four output rows per threadgroup, so a matrix whose O is not
     // a multiple of four has to take the tile, which bounds-checks. No module
     // in this artifact is such a shape, but the fallback is free to state.
-    if (m >= MM_ROW_LIMIT && gemm_enabled()) || w.out_dims() % (NSG * NR0) != 0 {
+    if (m >= MM_ROW_LIMIT && gemm_enabled() && !invariant::for_rows(m) && !invariant::all())
+        || w.out_dims() % (NSG * NR0) != 0
+    {
         qmm_t(ctx, x, w)
     } else {
         qmv(ctx, x, w)
@@ -433,7 +436,7 @@ pub fn gather_matmul(
 ) -> Array {
     let rows = rhs_indices.numel();
     let experts = w.num_experts();
-    if (rows >= 16 && sorted && rows / experts >= 4 && gemm_enabled())
+    if (rows >= 16 && sorted && rows / experts >= 4 && gemm_enabled() && !invariant::all())
         || w.out_dims() % (NSG * NR0) != 0
     {
         gather_qmm_t(ctx, x, w, lhs_indices, rhs_indices)

@@ -179,6 +179,8 @@ kernels/q6k.metal          ggml's Q6_K, for the 8-bit side
 src/ops/kquant.rs          both k-quants' dispatch; the only modes here mlx
                            does not have, with ggml as the oracle in its place
 src/ops/linear.rs          one quantized linear, mlx's family or ggml's
+src/ops/invariant.rs       the batch-invariant mode: a row of a batch
+                           computes what that row would compute alone
 src/metal/                 device, pipeline cache, buffer pool, encoding
 src/{json,safetensors,array,weights}.rs   loading
 src/ops/                   kernel dispatch, one module per mlx primitive family
@@ -195,6 +197,8 @@ src/main.rs                the console chat
 src/refs.rs                golden-reference reader
 src/bin/probes.rs          the 64 probe contexts, captured from the port --
                            the instrument for artifacts mlx cannot load
+src/bin/invariance.rs      a window against the same tokens one at a time,
+                           from the same cache state, and which layer moved
 tools/dump_*.py            golden-reference writers (run against MLX)
 tools/export_probes.py     probe_set.py -> refs/probe_set.json, for the port
 tools/probes_from_logits.py  the port's logits -> probes.bin, and the
@@ -235,6 +239,8 @@ cargo run --release -- --raw -p "..."        # no chat template
 cargo run --release -- --tokenizer-json ...  # tokenizer.json's split regex
 cargo run --release -- --mtp                 # speculative decoding, depth 3
 cargo run --release -- --mtp --mtp-depth 1 --frspec   # the fast pairing
+ORNITH_INVARIANT=1 cargo run --release -- --mtp      # ... and exactly what
+                                                     # --greedy would print
 cargo run --release -- --mtp-depth 1         # shallower draft, see the table below
 cargo run --release -- --image p.bmp -p "..." # one image (repeat for more)
 cargo run --release -- --image p.rgb --image-size 768x448
@@ -268,6 +274,7 @@ dispatch diverged.
 | `q4k.rs` | ggml's **Q4_K**, one of two cases with no MLX behind it: `q4k_dequantize` against ggml's own `dequantize_row_q4_K` at `max_abs == 0.0`, the matvec against a float64 reference and against a one-hot activation, the routed gather over four experts, the three-tensor loader against a forged one-module artifact, and (`--ignored`) every module of a real artifact against ggml digest for digest. Then the **tile**: the same float64 and one-hot checks at M = 37 and at a 100-row matrix (both partial-tile bounds), the routed tile over runs of 5/40/3/22 rows that straddle the 32-row tile three different ways, the same rows shuffled (unsorted is slow, not wrong), and -- the check a replacement owes -- agreement with the matvec it replaces, at 2.0e-6 |
 | `q6k.rs` | the same checks for **Q6_K**, whose traps are its own: a *signed* sub-block scale and a code biased by 32, so `w = d*sc*(q - 32)` with no minimum |
 | `quantized_nvfp4.rs` | the same, in **nvfp4 g16**, plus both gathered branches and `dequantize`. Carries its own weights -- the control artifact's, recut -- so it runs whatever model is on disk and could check the kernels before a build was spent on them |
+| `batch_invariance.rs` | the one case whose oracle is *this machine*: row `r` of an M-row quantized matmul against row `r` computed alone, both families, dense and routed. Without `ops::invariant` they differ -- 7.8e-3 on an `lm_head` logit -- and with it `max_abs == 0.0`. Plus what the window mode promises and where mlx's fused-SDPA limit ends it |
 | `ops.rs` | rms_norm (weighted, weightless, head_dim), rope (decode + prefill, offsets), fused elementwise |
 | `activations.rs` | silu / swiglu / precise_swiglu / sigmoid over **every** bfloat16 input |
 | `attn.rs` | matmul (incl. broadcast batch), softmax, attention at 6 shapes across all three SDPA branches |
@@ -458,6 +465,8 @@ sitting on a machine whose wall clock swings 3x between sittings:
 
     ORNITH_KQUANT_GEMM=0    k-quants take the mat-vec at every M
     ORNITH_AFFINE_GEMM=0    mlx's affine modules take *its* mat-vec at every M
+    ORNITH_INVARIANT=1      every batch of <= 4 rows computes row by row
+    ORNITH_INVARIANT=all    ... at every M, which is what a capture wants
 
 The second is the control for the first: it makes the same move on a path
 nobody here wrote, which is how Phase 19 established that a tiled prefill
@@ -662,6 +671,16 @@ a snapshot is a reference rather than a copy.
 > file. Nothing re-ran it, because nothing connected "the MTP sidecar had one
 > norm wrong" to "speculative decoding does not pay here". When a component is
 > fixed, the measurements that condemned it are stale, not confirmed.
+>
+> **And a second thing was inflating the rejections, found the same way.**
+> `REBUILD.md` Phase 21: a verify row and the autoregressive step it stands in
+> for were not the same arithmetic, so 2.9% of verify rows came back with a
+> different argmax and the drafts that matched the *autoregressive* answer
+> were rejected for it. `ORNITH_INVARIANT=1` closes that -- acceptance
+> 42.7% -> 50.0% at depth 3 on the prompt measured there, at no GPU cost, and
+> the emitted text becomes byte-identical to `--greedy`. The depth knee does
+> not move: a window of five leaves mlx's fused SDPA, so depth 3 is both the
+> fastest depth and the deepest exact one.
 
 The historical record, on the published head. The wall column was how this was
 first read; the GPU column is what it should have been read by, for the reason
@@ -863,20 +882,41 @@ The two structural costs, which are why deeper is worse:
 A dense model would win here; a 3B-active MoE with an unpruned draft head does
 not. FR-Spec is the fix for the first of those, and it is in -- see below.
 
-### How exact it is
+### How exact it is: exactly, under `ORNITH_INVARIANT=1`
 
-The acceptance rule and the rewind are exact. The output is not quite: the
-verify forward runs `depth + 1` tokens at once, and `quantized_matmul` picks a
-different kernel for M = 4 than for M = 1, with a different reduction order and
-therefore a different last bit. Two logits an ulp apart can swap and the
-speculative and autoregressive streams part company.
-`window_and_steps_both_match_mlx` pins both halves: this port reproduces mlx's
-window forward *and* its single-step forward bit for bit, and the two disagree
-with each other by up to 1.44 on a hidden whose scale is 35 -- a few bfloat16
-ulps compounded through 40 residual layers, against top-2 logit gaps that are
-sometimes 0.31. So the streams part company after 8 - 18 tokens, and no
-speculative decoder on this stack can do better, MTPLX's included.
-`speculative_tracks_autoregressive` measures how far they stay together.
+The acceptance rule and the rewind were always exact. The output was not, and
+the reason was the batching: the verify forward runs `depth + 1` tokens at
+once, `quantized_matmul` picks a different kernel for M = 4 than for M = 1,
+and two logits an ulp apart swap. `window_and_steps_both_match_mlx` pins both
+halves -- this port reproduces mlx's window forward *and* its single-step
+forward bit for bit, and the two disagree with each other by up to 1.44 on a
+hidden whose scale is 35, against top-2 logit gaps that are sometimes 0.31. So
+the streams parted company after 8 - 18 tokens.
+
+**This file used to conclude "and no speculative decoder on this stack can do
+better, MTPLX's included". That was wrong, and mlx-vlm had the fix in the
+tree the whole time** -- `models/quantized_verifier.py`,
+`singleton_quantized_linear`, "fuse a runtime-sized batch while retaining
+singleton qmv arithmetic". The window's rows do not have to be batched
+arithmetic; they only have to be batched *dispatch*. `ops::invariant` makes
+every batch of at most four rows compute row by row, `REBUILD.md` Phase 21 has
+the whole measurement, and the headline is:
+
+  - `speculative_tracks_autoregressive` went from **36 of 214** tokens agreed
+    to **221 of 221**;
+  - `--mtp --greedy` prints text byte-identical to `--greedy`, with and
+    without FR-Spec -- and the autoregressive side needs no flag, because the
+    window mode does not touch prefill;
+  - acceptance rose **42.7% -> 50.0%** at depth 3 (0.71/0.71/0.58 by depth)
+    for **no measurable GPU cost**, because `qmv` at M rows widens the grid
+    rather than the traffic and the cache serves the repeated weight reads.
+
+What the flag cannot fix is a window of five or more: mlx takes the fused
+vector SDPA only while `q_len * gqa_factor <= 32`, and at 16 query heads over
+2 kv heads that is four rows. `src/bin/invariance.rs` measures it -- a window
+of 5 first disagrees at layer 3, the first full-attention layer. Depth 3 is
+therefore the deepest draft this model can verify exactly, and it is also the
+depth `mtplx_runtime.json` recommends.
 
 ---
 

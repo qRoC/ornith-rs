@@ -9,6 +9,7 @@
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
+use crate::ops::invariant;
 
 /// `mlx::steel::GEMMParams` (kernels/steel/gemm/params.h), field for field.
 #[repr(C)]
@@ -481,6 +482,47 @@ pub fn matmul(ctx: &Context, a: &Array, b: &Array, transpose_b: bool) -> Array {
     out_shape.push(m);
     out_shape.push(n);
     let out = Array::empty(ctx, &out_shape, a.dtype);
+
+    // Batch invariance: the rows of an M-row product go to the steel gemm and
+    // the rows of a 1-row product go to gemv, and the two associate the sum
+    // differently. Under `ops::invariant` each row takes the kernel it would
+    // have taken alone -- which is the same move `quantized_matmul` makes, and
+    // it matters for the same reason: `in_proj_a` and `in_proj_b` are bf16, so
+    // the quantized flag alone leaves a gated-delta layer batch-dependent.
+    // `src/bin/invariance.rs` found it there, three windows in sixty.
+    //
+    // Only the unbatched shape is split. The batched products here are the
+    // unfused attention's two, which mlx reaches at `l * gqa_factor > 32` --
+    // never at a decode step or a verify window of four rows, which is where
+    // this flag makes its promise, and always at prefill, where a chunk is not
+    // a batch of rows that would otherwise have run alone.
+    let trivial_batch = batch_shape.iter().all(|&d| d == 1);
+    if invariant::for_rows(m) && n > 1 && trivial_batch {
+        let a2 = a.reshape(&[m, k]);
+        let o2 = out.reshape(&[m, n]);
+        let lda = k;
+        let ldb = if transpose_b { k } else { n };
+        for r in 0..m {
+            gemv(
+                ctx,
+                &a2.slice_leading(r, 1),
+                b,
+                &o2.slice_leading(r, 1),
+                1,
+                n,
+                k,
+                1,
+                lda,
+                ldb,
+                false,
+                transpose_b,
+                &[1],
+                &[0],
+                &[0],
+            );
+        }
+        return out;
+    }
 
     // `Matmul::eval_gpu` sends a vector-shaped product to gemv before it ever
     // reaches the steel gemm.
