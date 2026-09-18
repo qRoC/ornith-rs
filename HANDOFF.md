@@ -444,11 +444,48 @@ keeps every intermediate `(conv window, recurrent state)` at no numerical cost
 and almost no bandwidth cost -- each step already allocates its own outputs, so
 a snapshot is a reference rather than a copy.
 
-### It does not pay off here, and the reason is not the one it looks like
+### It does pay off, and the section that said otherwise was measuring a bug
 
-Same prompt, 200 tokens, greedy. The wall column was how this was first read;
-the GPU column is what it should have been read by, for the reason in "Where a
-decode step goes":
+> **OVERTURNED 2026-09-18.** Everything below was measured on the **published**
+> MTP head, the one shipping `post_attention_layernorm` still delta-encoded
+> (`REBUILD.md` Phase 2, and the norm bug it found). That head's acceptance
+> collapses with depth -- 0.53 / 0.34 / 0.35 -- so every draft past the first
+> was nearly free work thrown away, and the honest conclusion at the time was
+> that speculation did not pay. The rebuilt head holds **~0.72 all the way to
+> depth 3**, and nobody re-ran this section after the rebuild. Re-run now, same
+> prompt, 200 tokens, greedy:
+>
+> | | wall tok/s | GPU busy ms/token | idle ms/token | acceptance by depth |
+> |---|---:|---:|---:|---|
+> | autoregressive | 84.6 - 87.1 | 10.54 - 10.80 | 0.81 - 0.93 | -- |
+> | `--mtp-depth 1` | 84.0 | 8.43 | 2.81 | 0.78 |
+> | `--mtp-depth 2` | 95.4 | 8.45 | 1.81 | 0.74 / 0.65 |
+> | `--mtp-depth 3` | 97.0 | **8.38** | 1.84 | 0.72 / 0.71 / 0.74 |
+> | `--mtp-depth 4` | 79.0 | 9.99 | 2.57 | 0.63 / 0.73 / 0.69 / 0.74 |
+> | `--mtp-depth 5` | 83.3 | 9.98 | 1.92 | 0.78 / 0.76 / 0.68 / 0.46 / 0.58 |
+> | **`--mtp-depth 3 --frspec`** | **101.2** | **7.76** | 2.02 | 0.71 / 0.71 / 0.72 |
+> | `--mtp-depth 5 --frspec` | 91.8 | 8.65 | 2.15 | 0.79 / 0.75 / 0.66 / 0.48 / 0.50 |
+>
+> **Depth 3 with FR-Spec does 27-28% less GPU work a token than
+> autoregression and is 16-20% faster on the wall**, on a machine carrying
+> 18.5 GB of swap. The knee is depth 3: depths 4 and 5 give the deep levels
+> back (0.46-0.58) and regress on both columns.
+>
+> What survives from below, unchanged: **the stall is real and still costs**.
+> Idle is ~2.0 ms a token against autoregression's 0.9, so ~10% of the wall is
+> still being left on the floor, and the diagnosis of *where* -- the
+> `gather_rows_by_id` gap -- is untouched by any of this. Fixing it would put
+> depth 3 + FR-Spec near 114 tok/s, ~33% over autoregression.
+>
+> **The lesson is not about MTP.** A conclusion was drawn, written down as
+> settled, and then the thing it measured was replaced by a bug fix in another
+> file. Nothing re-ran it, because nothing connected "the MTP sidecar had one
+> norm wrong" to "speculative decoding does not pay here". When a component is
+> fixed, the measurements that condemned it are stale, not confirmed.
+
+The historical record, on the published head. The wall column was how this was
+first read; the GPU column is what it should have been read by, for the reason
+in "Where a decode step goes":
 
 | | wall tok/s | GPU busy ms/token | GPU busy share | acceptance by depth |
 |---|---|---|---|---|
@@ -618,10 +655,24 @@ The two structural costs, which are why deeper is worse:
    draft head over a ranked sub-vocabulary) exists to avoid, and it is not
    ported.
 2. **The verify forward multiplies MoE traffic**, and nothing can amortise it.
-   Its `depth + 1` tokens each pick their own top-8 of 256 experts, so a
-   4-token window reads ~30.5 distinct experts for its 32 (token, expert)
-   pairs -- 1.05 rows per expert, which is nothing to group. Sorting is the
-   mechanism that would group them and it does not apply: `GatherQMM` takes
+   Its `depth + 1` tokens each pick their own top-8 of 256 experts. The
+   sentence that used to stand here said a 4-token window reads ~30.5
+   distinct experts for its 32 (token, expert) pairs; that is
+   `256 * (1 - (1 - 8/256)^4)`, the expectation under *independent* routing,
+   and it was never measured. **Routing is not independent**:
+   `tools/router_stats.py` measures **20.85** distinct, 1.53 rows per expert,
+   and adjacent tokens share 2.84 of their 8 experts against 0.25 under
+   independence -- shuffling the token order lands back at 28.3, which is the
+   control that says the structure is temporal and real.
+
+   **The conclusion survives the correction anyway, and this is the
+   measurement that settles it:** `cargo run --release --bin moe_reuse` holds
+   the row count fixed and varies only how many distinct experts those rows
+   name. At `d = 4` the gather moves 3% between 32 distinct and 8 -- 0.334 ms
+   against 0.324 -- at ~221 GB/s, which is this machine's sustained
+   bandwidth. **It pays for rows, not for experts**, so the reuse is real and
+   unreachable with these kernels. Sorting is the mechanism that would group
+   them, it costs 22-40% more when forced, and it does not apply: `GatherQMM` takes
    the batched rhs-sorted path only at `rows / experts >= 4`, which at 256
    experts means 1024 rows, i.e. 128 tokens. `switch_glu_sorted` has a
    `force_sort` hook and using it here would buy a counting sort and two
@@ -1463,14 +1514,15 @@ In order:
    on the same artifact, which validates the port and not the artifact, so a
    bad rebuild passes the whole suite -- and `baseline/` holds the only
    material that would catch it.
-4. **The MTP stall**, which is now the only thing between speculative
-   decoding and a wall-clock win. FR-Spec is done and `--mtp-depth 1
-   --frspec` does 14% less GPU work a token than autoregression; what it
-   does not do is convert that into tok/s, because the loop leaves the GPU
-   idle ~2.5 ms a token against autoregression's 0.5. Seven explanations are
-   measured away in "It does not pay off here"; the eighth needs a machine
-   that is not swapping, since this is a wall-clock question and this
-   machine's wall clock is the one number that cannot be trusted.
+4. **The MTP stall** -- and speculation is no longer waiting on it to be
+   worth running. Re-measured on the rebuilt head (see the box at the top of
+   "It does pay off"), `--mtp-depth 3 --frspec` already does **27-28% less
+   GPU work a token** than autoregression and runs 16-20% faster on the wall.
+   That is the largest single win in this document and it was sitting behind
+   a stale measurement, not behind the stall. The stall is still real and
+   still costs: idle ~2.0 ms a token against autoregression's 0.9, ~10% of
+   the wall, and the eighth explanation still needs a machine that is not
+   swapping. Fixing it is worth another ~13 tok/s on top, not the whole win.
 
 Smaller gaps, each with an assert or a comment where it bites:
 
