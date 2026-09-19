@@ -768,3 +768,62 @@ fn the_fused_norm_projection_is_the_two_dispatches() {
         }
     }
 }
+
+/// Every width of the mat-vec computes the same numbers.
+///
+/// `nr0` and `NSG` decide which threadgroup owns which output row and nothing
+/// else -- the block loop, the four-block lane split, the per-block
+/// expression and the final `simd_sum` are per row. So a width sweep is a
+/// pure schedule change, and this is what says so before the sweep is used
+/// to choose one. A width that did not divide the output rows falls back to
+/// ggml's shape rather than reading off the end, which is why a miss is a
+/// skip and not a failure.
+#[test]
+fn every_matvec_width_is_ggmls_width() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    let ctx = Context::new().unwrap();
+    const WIDTHS: [(usize, usize); 4] = [(4, 2), (2, 4), (4, 4), (8, 4)];
+
+    for name in ["head", "qkv", "tail"] {
+        if !case.has(&format!("{name}_qs")) {
+            continue;
+        }
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        let x = case.array(&ctx, &format!("{name}_x")).reshape(&[1, cols]);
+        let want = qmv(&ctx, &x, &w).to_vec_f32(&ctx);
+        for (nr0, nsg) in WIDTHS {
+            if w.out_dims() % (nr0 * nsg) != 0 {
+                continue;
+            }
+            let was = ornith_rs::ops::kquant::set_qmv_shape(nr0, nsg);
+            let got = qmv(&ctx, &x, &w).to_vec_f32(&ctx);
+            ornith_rs::ops::kquant::set_qmv_shape(was.0, was.1);
+            let d = compare(&got, &want);
+            assert_eq!(d.max_abs, 0.0, "{name} qmv at {nr0}x{nsg}: {d}");
+        }
+    }
+
+    if !case.has("moe_qs") {
+        return;
+    }
+    let w = KMatrix::new(
+        KQuant::Q4K,
+        case.array(&ctx, "moe_qs"),
+        case.array(&ctx, "moe_scales"),
+        case.array(&ctx, "moe_dm"),
+    );
+    let (lhs, rhs) = (case.array(&ctx, "moe_lhs"), case.array(&ctx, "moe_rhs"));
+    let x = case.array(&ctx, "moe_x");
+    let want = gather_qmv(&ctx, &x, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    for (nr0, nsg) in WIDTHS {
+        if w.out_dims() % (nr0 * nsg) != 0 {
+            continue;
+        }
+        let was = ornith_rs::ops::kquant::set_gather_qmv_shape(nr0, nsg);
+        let got = gather_qmv(&ctx, &x, &w, &lhs, &rhs).to_vec_f32(&ctx);
+        ornith_rs::ops::kquant::set_gather_qmv_shape(was.0, was.1);
+        let d = compare(&got, &want);
+        assert_eq!(d.max_abs, 0.0, "routed gather at {nr0}x{nsg}: {d}");
+    }
+}

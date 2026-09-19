@@ -462,6 +462,80 @@ pub fn dequantize(ctx: &Context, w: &KMatrix, dtype: Dtype) -> Array {
 /// once but its floor is 7.5x a mat-vec ([`MM_ROW_LIMIT`]), mlx's `qmv_wide`
 /// shares a read between five rows at 0.57x and a different association, and
 /// the grid axis order measured 1.00.
+/// Output rows a simdgroup takes and simdgroups a threadgroup takes, for the
+/// plain and the routed mat-vec.
+///
+/// ggml's `N_SG_Q4_K` / `N_R0_Q4_K` are 2 and 2 and this port has used them
+/// since Q4_K landed, on the reasonable assumption that ggml tuned them. They
+/// were not tuned on this machine, and Phase 34's fused-kernel sweep left a
+/// two-point hint that 4 might be better -- so they are a knob now, and
+/// `step_inventory` sweeps them.
+///
+/// **Changing them cannot change a value.** `first_row = (tgx * NSG + sgitg)
+/// * nr0` decides which threadgroup computes which output row; the block
+/// loop, the four-block lane split, the per-block expression and the final
+/// `simd_sum` are per row and untouched. `tests/q4k` holds every width to
+/// `max_abs == 0.0` against ggml's.
+static QMV_NR0: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(NR0);
+static QMV_NSG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(NSG);
+static GQMV_NR0: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(NR0);
+static GQMV_NSG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(NSG);
+static QMV_SHAPE_ENV: std::sync::Once = std::sync::Once::new();
+
+fn parse_shape(v: &str) -> Option<(usize, usize)> {
+    let (a, b) = v.split_once('x')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+fn shape_env() {
+    QMV_SHAPE_ENV.call_once(|| {
+        if let Some((a, b)) = std::env::var("ORNITH_QMV_SHAPE").ok().and_then(|v| parse_shape(&v)) {
+            QMV_NR0.store(a, std::sync::atomic::Ordering::Relaxed);
+            QMV_NSG.store(b, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some((a, b)) = std::env::var("ORNITH_GQMV_SHAPE").ok().and_then(|v| parse_shape(&v))
+        {
+            GQMV_NR0.store(a, std::sync::atomic::Ordering::Relaxed);
+            GQMV_NSG.store(b, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// `(nr0, nsg)` for the plain mat-vec.
+pub fn qmv_shape() -> (usize, usize) {
+    shape_env();
+    use std::sync::atomic::Ordering::Relaxed;
+    (QMV_NR0.load(Relaxed), QMV_NSG.load(Relaxed))
+}
+
+/// `(nr0, nsg)` for the routed mat-vec.
+pub fn gather_qmv_shape() -> (usize, usize) {
+    shape_env();
+    use std::sync::atomic::Ordering::Relaxed;
+    (GQMV_NR0.load(Relaxed), GQMV_NSG.load(Relaxed))
+}
+
+pub fn set_qmv_shape(nr0: usize, nsg: usize) -> (usize, usize) {
+    let was = qmv_shape();
+    use std::sync::atomic::Ordering::Relaxed;
+    QMV_NR0.store(nr0, Relaxed);
+    QMV_NSG.store(nsg, Relaxed);
+    was
+}
+
+pub fn set_gather_qmv_shape(nr0: usize, nsg: usize) -> (usize, usize) {
+    let was = gather_qmv_shape();
+    use std::sync::atomic::Ordering::Relaxed;
+    GQMV_NR0.store(nr0, Relaxed);
+    GQMV_NSG.store(nsg, Relaxed);
+    was
+}
+
+/// The suffix a width takes in the kernel name: ggml's shape is the bare one.
+fn width_suffix(nr0: usize, nsg: usize) -> String {
+    if (nr0, nsg) == (NR0, NSG) { String::new() } else { format!("_w{nr0}x{nsg}") }
+}
+
 pub fn qmv(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
     let (o, k) = (w.out_dims(), w.in_dims());
     assert_eq!(x.shape[x.ndim() - 1], k, "{} qmv: x is {k}-wide?", w.kind.name());
@@ -492,8 +566,12 @@ pub fn qmv(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
         Hoist::Q6K => w.kind == KQuant::Q6K,
         Hoist::All => true,
     };
+    // The width only applies to the one-row kernel: the M-inside variants
+    // carry their own row axis and are instantiated at ggml's shape alone.
+    let (nr0, nsg) = if mw > 1 { (NR0, NSG) } else { qmv_shape() };
+    let (nr0, nsg) = if o % (nr0 * nsg) == 0 { (nr0, nsg) } else { (NR0, NSG) };
     let name = match (mw > 1, hoisted) {
-        (false, _) => "qmv".to_string(),
+        (false, _) => format!("qmv{}", width_suffix(nr0, nsg)),
         (true, false) => format!("qmv_m{mw}"),
         (true, true) => format!("qmv_mh{mw}"),
     };
@@ -511,7 +589,7 @@ pub fn qmv(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
         // the kernel computes and does not store.
         call.bytes(&(m as i32)).groups((o / (NSG * NR0), m.div_ceil(mw), 1), (32, NSG, 1));
     } else {
-        call.groups((o / (NSG * NR0), m, 1), (32, NSG, 1));
+        call.groups((o / (nsg * nr0), m, 1), (32, nsg, 1));
     }
     out
 }
@@ -675,7 +753,9 @@ pub fn gather_qmv(
     assert_eq!(lhs_indices.numel(), rows, "{} gather: index arrays disagree", w.kind.name());
 
     let out = Array::empty(ctx, &[rows, o], x.dtype);
-    ctx.kernel(&w.kernel("gather_qmv", x.dtype))
+    let (nr0, nsg) = gather_qmv_shape();
+    let (nr0, nsg) = if o % (nr0 * nsg) == 0 { (nr0, nsg) } else { (NR0, NSG) };
+    ctx.kernel(&w.kernel(&format!("gather_qmv{}", width_suffix(nr0, nsg)), x.dtype))
         .arr(&w.qs)
         .arr(&w.scales)
         .arr(&w.dm)
@@ -685,7 +765,7 @@ pub fn gather_qmv(
         .bytes(&(o as i32))
         .arr(lhs_indices)
         .arr(rhs_indices)
-        .groups((o / (NSG * NR0), rows, 1), (32, NSG, 1));
+        .groups((o / (nsg * nr0), rows, 1), (32, nsg, 1));
     out
 }
 

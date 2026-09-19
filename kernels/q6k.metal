@@ -454,6 +454,10 @@ struct Q6KFmt {
 #define instantiate_q6k(tname, type)                                           \
   instantiate_kernel("q6k_dequantize_" #tname, q6k_dequantize, type)           \
   instantiate_kernel("q6k_qmv_" #tname, q6k_qmv, type, 2, 2)                   \
+  instantiate_kernel("q6k_qmv_w4x2_" #tname, q6k_qmv, type, 4, 2) \
+  instantiate_kernel("q6k_qmv_w2x4_" #tname, q6k_qmv, type, 2, 4) \
+  instantiate_kernel("q6k_qmv_w4x4_" #tname, q6k_qmv, type, 4, 4) \
+  instantiate_kernel("q6k_qmv_w8x4_" #tname, q6k_qmv, type, 8, 4) \
   instantiate_kernel("q6k_qmv_m2_" #tname, q6k_qmv_m, type, 2, 2, 2, false)     \
   instantiate_kernel("q6k_qmv_m3_" #tname, q6k_qmv_m, type, 2, 2, 3, false)     \
   instantiate_kernel("q6k_qmv_m4_" #tname, q6k_qmv_m, type, 2, 2, 4, false)     \
@@ -461,6 +465,10 @@ struct Q6KFmt {
   instantiate_kernel("q6k_qmv_mh3_" #tname, q6k_qmv_m, type, 2, 2, 3, true)     \
   instantiate_kernel("q6k_qmv_mh4_" #tname, q6k_qmv_m, type, 2, 2, 4, true)     \
   instantiate_kernel("q6k_gather_qmv_" #tname, q6k_gather_qmv, type, 2, 2)     \
+  instantiate_kernel("q6k_gather_qmv_w4x2_" #tname, q6k_gather_qmv, type, 4, 2) \
+  instantiate_kernel("q6k_gather_qmv_w2x4_" #tname, q6k_gather_qmv, type, 2, 4) \
+  instantiate_kernel("q6k_gather_qmv_w4x4_" #tname, q6k_gather_qmv, type, 4, 4) \
+  instantiate_kernel("q6k_gather_qmv_w8x4_" #tname, q6k_gather_qmv, type, 8, 4) \
   instantiate_kernel(                                                          \
       "q6k_qmm_t_r32_" #tname, kquant_qmm_t, type, Q6KFmt, float, 32)         \
   instantiate_kernel(                                                          \

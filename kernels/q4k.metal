@@ -710,6 +710,10 @@ struct Q4KFmt {
 #define instantiate_q4k(tname, type)                                           \
   instantiate_kernel("q4k_dequantize_" #tname, q4k_dequantize, type)           \
   instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)                   \
+  instantiate_kernel("q4k_qmv_w4x2_" #tname, q4k_qmv, type, 4, 2) \
+  instantiate_kernel("q4k_qmv_w2x4_" #tname, q4k_qmv, type, 2, 4) \
+  instantiate_kernel("q4k_qmv_w4x4_" #tname, q4k_qmv, type, 4, 4) \
+  instantiate_kernel("q4k_qmv_w8x4_" #tname, q4k_qmv, type, 8, 4) \
   instantiate_kernel("q4k_rmsgate_qmv_" #tname, q4k_rmsgate_qmv, type, 2, 2)   \
   instantiate_kernel("q4k_rmsgate_qmv_r4_" #tname, q4k_rmsgate_qmv, type, 4, 4) \
   instantiate_kernel("q4k_rmsgate_qmv_r8_" #tname, q4k_rmsgate_qmv, type, 8, 4) \
@@ -721,6 +725,10 @@ struct Q4KFmt {
   instantiate_kernel("q4k_qmv_mh3_" #tname, q4k_qmv_mh, type, 2, 2, 3)         \
   instantiate_kernel("q4k_qmv_mh4_" #tname, q4k_qmv_mh, type, 2, 2, 4)         \
   instantiate_kernel("q4k_gather_qmv_" #tname, q4k_gather_qmv, type, 2, 2)     \
+  instantiate_kernel("q4k_gather_qmv_w4x2_" #tname, q4k_gather_qmv, type, 4, 2) \
+  instantiate_kernel("q4k_gather_qmv_w2x4_" #tname, q4k_gather_qmv, type, 2, 4) \
+  instantiate_kernel("q4k_gather_qmv_w4x4_" #tname, q4k_gather_qmv, type, 4, 4) \
+  instantiate_kernel("q4k_gather_qmv_w8x4_" #tname, q4k_gather_qmv, type, 8, 4) \
   instantiate_kernel(                                                          \
       "q4k_qmm_t_r32_" #tname, kquant_qmm_t, type, Q4KFmt, float, 32)         \
   instantiate_kernel(                                                          \
