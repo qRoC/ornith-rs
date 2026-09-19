@@ -223,9 +223,13 @@ fn main() {
         Err(_) => 1u8,
     };
     let want_moe_tail = std::env::var("ORNITH_FUSE_MOE_TAIL").as_deref() != Ok("0");
+    let want_gdn_front = std::env::var("ORNITH_FUSE_GDN_FRONT").as_deref() != Ok("0");
+    let want_gdn_norm = std::env::var("ORNITH_FUSE_GDN_NORM").as_deref() != Ok("0");
     ornith_rs::ops::norm::set_fuse_add_rms(want_fuse);
     ornith_rs::ops::moe::set_shared_gate_pos(want_gate_pos);
     ornith_rs::ops::moe::set_fuse_moe_tail(want_moe_tail);
+    ornith_rs::ops::gdn::set_fuse_gdn_front(want_gdn_front);
+    ornith_rs::ops::norm::set_fuse_gdn_norm(want_gdn_norm);
 
 
     // --- the step, and the same step with the work taken out ---------------
@@ -367,6 +371,68 @@ fn main() {
         100.0 * (b - a) / a,
     );
 
+    // --- the gated-delta layer's front end, one dispatch against ten -------
+    println!("\nthe gated-delta front end, fused and not\n");
+    println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
+    let (mut one, mut ten) = (Vec::new(), Vec::new());
+    let (mut d1, mut d10) = (0.0, 0.0);
+    for _ in 0..ab_draws {
+        ornith_rs::ops::gdn::set_fuse_gdn_front(false);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        ten.push(ms);
+        d10 = d;
+        ornith_rs::ops::gdn::set_fuse_gdn_front(true);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        one.push(ms);
+        d1 = d;
+    }
+    ornith_rs::ops::gdn::set_fuse_gdn_front(want_gdn_front);
+    let pairs: Vec<f64> = one.iter().zip(&ten).map(|(f, a)| f - a).collect();
+    let (a, b) = (median(&mut ten.clone()), median(&mut one.clone()));
+    println!("  {:<24} {a:>9.3} {d10:>11.0}  {ten:.3?}", "ten dispatches");
+    println!("  {:<24} {b:>9.3} {d1:>11.0}  {one:.3?}", "one");
+    println!(
+        "  {:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down, {:+.2}%",
+        "so",
+        b - a,
+        d1 - d10,
+        pairs.iter().sum::<f64>() / pairs.len() as f64,
+        pairs.iter().filter(|d| **d < 0.0).count(),
+        pairs.len(),
+        100.0 * (b - a) / a,
+    );
+
+    // --- and RMSNormGated, one dispatch against two ------------------------
+    println!("\nRMSNormGated, fused and not\n");
+    println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
+    let (mut gon, mut goff) = (Vec::new(), Vec::new());
+    let (mut dgon, mut dgoff) = (0.0, 0.0);
+    for _ in 0..ab_draws {
+        ornith_rs::ops::norm::set_fuse_gdn_norm(false);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        goff.push(ms);
+        dgoff = d;
+        ornith_rs::ops::norm::set_fuse_gdn_norm(true);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        gon.push(ms);
+        dgon = d;
+    }
+    ornith_rs::ops::norm::set_fuse_gdn_norm(want_gdn_norm);
+    let pairs: Vec<f64> = gon.iter().zip(&goff).map(|(f, a)| f - a).collect();
+    let (a, b) = (median(&mut goff.clone()), median(&mut gon.clone()));
+    println!("  {:<24} {a:>9.3} {dgoff:>11.0}  {goff:.3?}", "two dispatches");
+    println!("  {:<24} {b:>9.3} {dgon:>11.0}  {gon:.3?}", "one");
+    println!(
+        "  {:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down, {:+.2}%",
+        "so",
+        b - a,
+        dgon - dgoff,
+        pairs.iter().sum::<f64>() / pairs.len() as f64,
+        pairs.iter().filter(|d| **d < 0.0).count(),
+        pairs.len(),
+        100.0 * (b - a) / a,
+    );
+
     // --- the boundary, measured before anything is built --------------------
     //
     // Everything else here prices one class at a time, and a fusion returns
@@ -390,8 +456,16 @@ fn main() {
         // means. A pattern serves a call site, not a block: `sigmoid_gate`
         // is the shared expert's gate and the capture's output gate both,
         // and it is counted in one bucket.
+        // `gdn_front` is the ten of them since Phase 33; the ten patterns
+        // stay so the census prints their zero, and so the list still means
+        // "the front end" under `ORNITH_FUSE_GDN_FRONT=0`. `slice_inner` is
+        // the one pattern here that also serves another call site -- the
+        // attention layers' q/gate split, 20 dispatches -- so the bucket
+        // reads ~20 dispatches wide of the kernel's own set, which is what
+        // `one gated-delta kernel` below is for.
         const GDN: &[&str] = &[
-            "concat_time", "slice_inner", "depthwise_conv_1d", "silu_", "gdn_beta", "compute_g",
+            "gdn_front", "concat_time", "slice_inner", "depthwise_conv_1d", "silu_", "gdn_beta",
+            "compute_g",
         ];
         // `moe_combine` is the six of them since Phase 32; the six patterns
         // stay so the census prints their zero, and so the list still means
@@ -400,7 +474,8 @@ fn main() {
             "moe_combine", "mul_by_row", "div_by_row", "col_reduce", "row_reduce",
             "sigmoid_gate",
         ];
-        const REST: &[&str] = &["rmsbfloat16", "add_rms", "swiglu", "scalar_mul", "add_elem"];
+        const REST: &[&str] =
+            &["rmsbfloat16", "rms_gated", "add_rms", "swiglu", "scalar_mul", "add_elem"];
         let all: Vec<&str> = GDN.iter().chain(MOE).chain(REST).copied().collect();
 
         // First, what each pattern actually matches. A list that matches
@@ -437,10 +512,14 @@ fn main() {
             ),
             ("swiglu, into its consumer", vec!["swiglu"]),
             ("one gated-delta kernel", GDN.to_vec()),
+            ("one RMSNormGated kernel", vec!["rms_gated", "precise_swiglu"]),
             // And the complement of those two: what a general deferred layer
             // would still be chasing once both are written. Measured, not
             // subtracted -- the parts do not sum to the whole.
-            ("left for a deferred layer", vec!["rmsbfloat16", "add_rms", "swiglu", "scalar_mul"]),
+            (
+                "left for a deferred layer",
+                vec!["rmsbfloat16", "rms_gated", "add_rms", "swiglu", "scalar_mul"],
+            ),
             ("the norms alone", vec!["rmsbfloat16", "add_rms"]),
         ];
         let mut parts = 0.0;
