@@ -33,7 +33,9 @@
 
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
-use ornith_rs::ops::kquant::{KMatrix, KQuant, QK_K, gather_qmm_t, qmm_t, set_mm_half, set_mm_rows};
+use ornith_rs::ops::kquant::{
+    KMatrix, KQuant, QK_K, gather_qmm_t, qmm_t, set_mm_half, set_mm_rows, set_mm_rows_id,
+};
 use ornith_rs::ops::matmul::matmul;
 
 /// Dispatches inside one sync window. `bin/kquant_mm`'s lesson: a single
@@ -253,6 +255,127 @@ fn real(ctx: &Context, ceiling: f64) {
     }
 }
 
+// --- 4. why the routed gemm is eight points down -----------------------------
+
+/// The routed expert gemm reads 72% of the matrix ceiling where its own
+/// family reads 80%, and it is 632 ms of a 1264 ms chunk -- the largest
+/// single object left in prefill. **But the two cells differ in four things
+/// at once**, which is the eighth axis of `measure-the-same-object` exactly:
+///
+///   * routing -- one kernel walks `rhs_indices` and re-runs its K loop per
+///     run of one expert, the other does not;
+///   * `N` -- 512 for the experts against 2048-8192 for the dense shapes, so
+///     a quarter as many column tiles reuse each loaded A fragment;
+///   * the **weight footprint** -- at 256 experts the routed call touches
+///     134 MB of weights for the same flops a dense call does with 0.5 MB,
+///     because each expert's rows are 64 of 16384 and nothing is re-read
+///     from cache;
+///   * the **tile width** -- `mm_rows` is 64 and `mm_rows_id` is 32.
+///
+/// A ratio between two cells that differ in four ways is not evidence about
+/// any one of them. So: `M` and `K` fixed, the tile pinned to 32 in every
+/// arm, and one term moved at a time. The `experts = 1` row is the isolate
+/// that matters -- all the routing machinery, a dense weight footprint.
+fn decompose_routed(ctx: &Context, ceiling: f64) {
+    const M: usize = 16384;
+    const K: usize = 2048;
+    let was_rows = 64usize;
+    set_mm_rows(32);
+    set_mm_rows_id(32);
+    println!(
+        "\nthe routed gemm's eight points, one term at a time \
+         (M={M}, K={K}, 32-row tile in every arm)\n"
+    );
+    let x = Array::from_f32_as_bf16(ctx, &vec![0.01f32; M * K], &[M, K]);
+
+    println!("  {:<34} {:>6} {:>9} {:>9} {:>7}", "arm", "N", "wt MB", "TFLOP/s", "of mma");
+    // (a) N alone, with no routing at all.
+    for n in [512usize, 1024, 2048] {
+        let w = fake(ctx, KQuant::Q4K, n, K);
+        let secs = best_of(ctx, 5, || {
+            let _ = qmm_t(ctx, &x, &w);
+        });
+        let flop = 2.0 * M as f64 * n as f64 * K as f64;
+        let t = tflops(flop, secs);
+        let mb = (n * (K / QK_K) * 128) as f64 / 1e6;
+        println!(
+            "  {:<34} {n:>6} {mb:>9.1} {t:>9.2} {:>6.0}%",
+            "dense, no routing",
+            100.0 * t / ceiling
+        );
+    }
+    // (b) routing and the weight footprint, at one N. Same flops, same tile,
+    //     same shape in every row; only how many experts the rows spread over
+    //     -- and therefore how much of the weight set is touched -- moves.
+    for e in [1usize, 16, 64, 256] {
+        let n = 512usize;
+        let run = M / e;
+        let w = routed(ctx, KQuant::Q4K, e, n, K);
+        let lhs: Vec<u32> = (0..M as u32).collect();
+        let rhs: Vec<u32> = (0..M as u32).map(|r| (r / run as u32) % e as u32).collect();
+        let lhs = Array::from_slice(ctx, &lhs, &[M], Dtype::U32);
+        let rhs = Array::from_slice(ctx, &rhs, &[M], Dtype::U32);
+        let secs = best_of(ctx, 5, || {
+            let _ = gather_qmm_t(ctx, &x, &w, &lhs, &rhs);
+        });
+        let flop = 2.0 * M as f64 * n as f64 * K as f64;
+        let t = tflops(flop, secs);
+        let mb = (e * n * (K / QK_K) * 128) as f64 / 1e6;
+        println!(
+            "  {:<34} {n:>6} {mb:>9.1} {t:>9.2} {:>6.0}%",
+            format!("routed, {e} expert{} of {run}-row runs", if e == 1 { "" } else { "s" }),
+            100.0 * t / ceiling
+        );
+    }
+    // And the one term every row above held fixed, which is therefore the
+    // only one left: the tile width. The dense gemms that read 80% earlier
+    // ran at `mm_rows` = 64; every arm above ran at 32 because that is what
+    // `mm_rows_id` gives the routed path.
+    println!("\n  and the term all seven rows above held constant\n");
+    println!("  {:<34} {:>6} {:>9} {:>9} {:>7}", "arm", "tile", "wt MB", "TFLOP/s", "of mma");
+    for rows in [16usize, 32, 64] {
+        set_mm_rows(rows);
+        let n = 2048usize;
+        let w = fake(ctx, KQuant::Q4K, n, K);
+        let secs = best_of(ctx, 5, || {
+            let _ = qmm_t(ctx, &x, &w);
+        });
+        let flop = 2.0 * M as f64 * n as f64 * K as f64;
+        let t = tflops(flop, secs);
+        println!(
+            "  {:<34} {rows:>6} {:>9.1} {t:>9.2} {:>6.0}%",
+            "dense, N=2048",
+            (n * (K / QK_K) * 128) as f64 / 1e6,
+            100.0 * t / ceiling
+        );
+    }
+    set_mm_rows(32);
+    {
+        let (e, n, run) = (256usize, 512usize, 64usize);
+        let w = routed(ctx, KQuant::Q4K, e, n, K);
+        let lhs: Vec<u32> = (0..M as u32).collect();
+        let rhs: Vec<u32> = (0..M as u32).map(|r| (r / run as u32) % e as u32).collect();
+        let lhs = Array::from_slice(ctx, &lhs, &[M], Dtype::U32);
+        let rhs = Array::from_slice(ctx, &rhs, &[M], Dtype::U32);
+        for rows in [16usize, 32, 64] {
+            set_mm_rows_id(rows);
+            let secs = best_of(ctx, 5, || {
+                let _ = gather_qmm_t(ctx, &x, &w, &lhs, &rhs);
+            });
+            let flop = 2.0 * M as f64 * n as f64 * K as f64;
+            let t = tflops(flop, secs);
+            println!(
+                "  {:<34} {rows:>6} {:>9.1} {t:>9.2} {:>6.0}%",
+                "routed, 256 experts, 64-row runs",
+                (e * n * (K / QK_K) * 128) as f64 / 1e6,
+                100.0 * t / ceiling
+            );
+        }
+    }
+    set_mm_rows(was_rows);
+    set_mm_rows_id(32);
+}
+
 fn main() {
     let ctx = Context::new().unwrap();
     println!("{}", ctx.device_name());
@@ -260,6 +383,7 @@ fn main() {
     let mma = mma_sweep(&ctx);
     println!("\n  matrix units are {:.1}x the scalar ALUs here", mma / alu.max(1e-9));
     real(&ctx, mma);
+    decompose_routed(&ctx, mma);
 
     // The flag the tile carries, on the real kernel, beside the synthetic
     // ratio above. If the matrix unit prefers half and the kernel does not,

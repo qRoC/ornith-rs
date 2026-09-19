@@ -2106,12 +2106,18 @@ In order:
    whole gap is the cost of unpacking 4-bit weights, on the same ALUs the
    multiply needs. So **the total remaining arithmetic headroom in a
    prefill chunk is ~16%**, none of it reachable by scheduling, fusing or
-   removing anything. Two candidates in order: the routed expert gemm's 8
-   points against its own family (72% vs 80%, **3.5% of a chunk**, cause
-   not yet named -- N is 512 there against 2048-8192, which is a hypothesis
-   with an A/B); and the unpack itself, 20% of every quantized gemm, where
-   the first question is how many ALU ops a weight `Q4KFmt::dequantize`
-   spends against how few it could.
+   removing anything. **One candidate, because the other was closed in the
+   same phase.** The routed expert gemm's 8 points against its own family
+   are neither `N` nor routing nor the weight footprint -- all three were
+   moved one at a time and none of them matters -- they are the tile
+   width, 32 on the routed path against 64 on the dense one. And 64 is not
+   available: at perfectly uniform 64-row runs it wins back almost all of
+   it, but on the **real** router, whose expert load is skewed,
+   `ORNITH_KQUANT_TILE_ROWS_ID=64` is **14% worse, 0 of 3 pairs down**. So
+   those eight points are the measured price of routing 16384 rows over
+   256 unevenly loaded experts, not headroom. What is left is the unpack:
+   20% of every quantized gemm, where the first question is how many ALU
+   ops a weight `Q4KFmt::dequantize` spends against how few it could.
 1. **A machine that is not swapping.** This is first because it is what the
    next two are waiting on, and it is not something the code can fix. Every
    GPU-side number in this document is now current and trustworthy -- they

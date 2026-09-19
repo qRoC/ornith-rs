@@ -6142,6 +6142,70 @@ ceiling and a real kernel agreeing to a thousandth is the strongest form
 this port's measurements take, and it turns "we measured no difference"
 into "there is no difference to measure, and here is why".
 
+### The eight points, taken apart -- and they are not headroom
+
+The routed gemm at 72% against its family's 80% looked like the one named
+target left. **Four things differ between those two cells**, which is the
+eighth axis exactly: routing, `N` (512 against 2048-8192), the weight
+footprint (134 MB touched against 0.5, because 64 rows an expert re-read
+nothing from cache) and **the tile width** -- `mm_rows` is 64 and
+`mm_rows_id` is 32. A ratio between cells that differ in four ways is
+evidence about none of them.
+
+`bin/arithmetic` moves one at a time, `M` and `K` fixed, tile pinned to 32
+in every arm:
+
+      arm                                    N    wt MB   TFLOP/s  of mma
+      dense, no routing                    512      0.5     11.02    73%
+      dense, no routing                   1024      1.0     11.01    73%
+      dense, no routing                   2048      2.1     10.98    73%
+      routed, 1 expert of 16384-row runs   512      0.5     10.82    72%
+      routed, 16 experts of 1024-row runs  512      8.4     10.75    71%
+      routed, 64 experts of 256-row runs   512     33.6     10.99    73%
+      routed, 256 experts of 64-row runs   512    134.2     10.93    72%
+
+**All three hypotheses die at once.** `N` does not matter (73% across a 4x
+range), routing costs 1-2 points (73% dense against 72% for the same shape
+with all the routing machinery and one expert), and the weight footprint
+does not matter at all (0.5 MB to 134 MB, still 71-73%).
+
+What every row above held constant was the tile width, so that is what is
+left -- and it is the whole of it:
+
+      arm                                 tile    wt MB   TFLOP/s  of mma
+      dense, N=2048                         16      2.1      8.54    57%
+      dense, N=2048                         32      2.1     11.02    73%
+      dense, N=2048                         64      2.1     11.80    79%
+      routed, 256 experts, 64-row runs      16    134.2      8.46    56%
+      routed, 256 experts, 64-row runs      32    134.2     10.71    71%
+      routed, 256 experts, 64-row runs      64    134.2     11.70    78%
+
+So the routed path is eight points down because `mm_rows_id` gives it a
+32-row tile where the dense path takes 64 -- and at perfectly aligned
+64-row runs a 64-row tile gets almost all of it back.
+
+### And then the real router refuses it
+
+That last table is the *best case for a wide tile*: `(r / 64) % 256` makes
+every run exactly 64 rows. A real router does not. Expert load is skewed --
+Phase 20 found 41% of layer 0's experts dead in the parent -- and a run
+shorter than the tile makes the tile run its whole K loop over rows that
+are not there.
+
+    a 6621-token prompt, q6k-full, three interleaved pairs
+
+      routed tile 32 (default)   4.63  4.57  4.57
+      routed tile 64             5.25  5.17  5.33
+      +0.66 s, +14.4%, 0 of 3 down
+
+**The synthetic was measuring uniform runs; the argument was about this
+model's runs, and they are not uniform.** `ORNITH_KQUANT_TILE_ROWS_ID=64`
+is 14% *worse* on the real thing. Phase 23's choice of 32 stands, the rule
+that produces it is right, and **the eight points are not headroom at all
+-- they are the measured price of routing 16384 rows over 256 unevenly
+loaded experts.** Six minutes of measurement against a day of kernel work
+that would have made the model slower.
+
 ### What it says about where to go, which is mostly "not far"
 
 Prefill is 81% gemm; the gemm is at 72-80% of a ceiling a real kernel
@@ -6150,15 +6214,15 @@ arithmetic headroom in a prefill chunk is ~16%**, all of it inside kernels
 whose job is to unpack 4-bit weights, and none of it reachable by
 scheduling, fusing or removing anything. The two candidates, in order:
 
-- **the routed gemm's 8 points against its own family** -- 3.5% of a chunk,
-  and the first job is to name the cause rather than to tune. N is 512
-  there against 2048-8192 in the dense shapes, so the A fragments are
-  reused across a quarter as many column tiles; that is a hypothesis with
-  an A/B, not a conclusion.
-- **the unpack itself**, which is 20% of every quantized gemm. Halving it
-  is ~10% of 81% of a chunk. That is a kernel-arithmetic problem and the
-  first thing to ask of it is how many ALU ops a weight the current
-  `Q4KFmt::dequantize` spends, against how few it could.
+- ~~the routed gemm's 8 points~~ -- **closed in this phase, above.** They
+  are the tile width, the tile width is already at its optimum for this
+  model's run lengths, and the wider one is 14% worse on the real router.
+- **the unpack itself**, which is 20% of every quantized gemm and is now
+  the only candidate left. Halving it is ~10% of 81% of a chunk. That is a
+  kernel-arithmetic problem and the first thing to ask of it is how many
+  ALU ops a weight the current `Q4KFmt::dequantize` spends, against how
+  few it could -- and the second is whether anything in this port is
+  allowed to be cheaper than ggml's unpack without changing a number.
 
 **None of this touches a decode step**, which reads 1.8-2.8 GB against
 ~250-400 GB/s and is memory-bound end to end. This is a prefill instrument
