@@ -5544,9 +5544,13 @@ bindings, the census, the boundary, every A/B.
     a prefill chunk: 2048 tokens against an empty cache
 
                               GPU ms   clamped   work ms   issue  dispatches
-      the chunk (model_call)  1522.8     204.8    1318.0   13.4%      1425
-      draws               real [1512.9, 1522.8, 1613.2]
-                       clamped [204.6, 204.8, 205.7]
+      the chunk (model_call)  1407.6      76.1    1331.6    5.4%      1505
+      draws               real [1404.5, 1407.6, 1409.3]
+                       clamped [75.8, 76.1, 76.2]
+
+    (1522.8 / 204.8 / 1425 before the sort below was parallelised. The
+    dispatch count rises by 80 because three kernels replace one in each of
+    40 layers, and the chunk still falls.)
 
 ### And the first thing it says is about itself
 
@@ -5554,13 +5558,19 @@ bindings, the census, the boundary, every A/B.
 clamped dispatch costs 2.55 us, which is `dispatch_cost`'s empty dispatch
 plus a pipeline switch, and the bin's free control confirms it -- a kernel
 already dispatched over one threadgroup comes out unchanged. At a prefill
-chunk a clamped dispatch costs **143.7 us**, fifty-six times as much,
-because the surviving threadgroup of a *tile* still walks the whole K
-dimension. The clamp leaves one threadgroup's work, and at this width that
-work is not small.
+chunk a clamped dispatch costs **50.5 us**, twenty times as much, because
+the surviving threadgroup of a *tile* still walks the whole K dimension.
+The clamp leaves one threadgroup's work, and at this width that work is not
+small.
 
-So 13.4% is an upper bound and not a reading. The launch cost itself is
-1425 dispatches at ~2.09 us: **2.9 ms of 1523, 0.2%**.
+So the clamp's **5.4%** is an upper bound and not a reading. The launch
+cost itself is 1505 dispatches at ~2.09 us: **3.1 ms of 1408, 0.22%**.
+
+(The first reading of this was 143.7 us a dispatch and 13.4%, and it was
+inflated by the sort below: `counting_sort_experts` was dispatched over one
+thread, so the clamp could not touch it and its 140 ms sat *inside* the
+"issue floor". An instrument that clamps grids cannot clamp a kernel that
+has no grid. The figures above are after the sort was parallelised.)
 
 **That closes the other half of Phase 33's prefill result.** The fusion
 project took 0.55 ms off a 7.2 ms decode step by removing launches; at
@@ -5697,13 +5707,59 @@ fusion is worth 1.1 us a dispatch at a decode step. The launch is not what
 it buys here; what it buys is one intermediate not written and read back,
 and at this width that is 0.3% rather than 1.3%.
 
-**And the measurement this instrument was built for has not been run yet.**
-`step_inventory prefill border` -- the census and the elementwise chain's
-boundary at a chunk, which is what would price a deferred op layer on
-something other than a decode step's 3.8% -- exists and is one command. The
-sort was found on the way to it and was worth stopping for. The boundary is
-the next number, and it means *bytes* at this width where the same table at
-a decode step means launches.
+**And the measurement this instrument was built for does not transfer.**
+`step_inventory prefill border` -- the census and the chain's boundary at a
+chunk, which is what would price a deferred op layer on something other than
+a decode step's 3.8% -- runs, and its output has to be thrown away. The
+bin's own partition check said so before anything else did: **three disjoint
+buckets summing to 466% of the whole.**
+
+Two confounds, and neither has a counterpart at a decode step.
+
+**The machine throttles across the run.** A cell is 16 chunks of 1.4 s at
+full ALU and eleven cells is four minutes of it. The *base* arm -- the same
+code with nothing neutered -- climbed from **1407 ms at the top of the run
+to 2100-2200 by the middle**, monotonically. Pairs are interleaved so a
+smooth drift largely cancels *inside* a cell, but every comparison
+*between* cells is a comparison of thermal states, and the partition is
+exactly such a comparison. A decode step never provokes this: a cell there
+is 0.19 s of a mostly memory-bound stream.
+
+**And the garbage a ceiling deliberately produces is not free here.** At a
+decode step a dropped elementwise kernel leaves kilobytes of pool memory
+downstream and the ceiling is honest. At a chunk it leaves megabytes, and
+those feed gemms whose cost depends on the values in them. Dropping
+`rms_gated` read **+82 ms, 1 of 8**: removing a kernel cannot make a step
+slower unless what it left behind changed the arithmetic's cost. Phase 31's
+rule was that removal cannot price a dispatch whose output is an *address*;
+at this width it also cannot price one whose output is a *number a gemm
+will multiply*.
+
+So the boundary at prefill is still unmeasured, and it now has a
+specification: a protocol that does not ask this machine for four minutes
+of full-ALU work in one sitting, and a stand-in that writes plausible
+values rather than leaving the pool's.
+
+**What did survive is the paired A/B, early in the run and normalised by
+its own base each draw:**
+
+    a 2048-token chunk, 4 interleaved pairs, near the top of the run
+
+      the gated-delta front end   ten dispatches -> one   -78.4 ms, 4 of 4
+      the MoE block's tail        six -> one              -74.7 ms, 4 of 4
+      RMSNormGated                two -> one              -17.8 ms, 3 of 4
+      the residual add and norm   two -> one              -34.8 ms, spreads overlap
+
+Against a ~1480 ms base that is **-5.3% and -4.7%** for the two block
+kernels, where the same two are worth -4.3% and -3.6% at a decode step. The
+fusion project pays *more* at prefill than at decode, and for the other
+reason: there it removes launches and here it removes intermediates.
+
+**And `rms_gated` reverses.** It measured exactly zero on a decode step over
+two processes and is kept there only for being exact and strictly smaller;
+at a chunk it reads -17.8 ms, 3 of 4. A kernel can be worth nothing on one
+object and worth something on another, which is the same lesson the sort
+taught from the other direction.
 
 ### What is left in it
 
