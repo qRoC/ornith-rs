@@ -1292,20 +1292,30 @@ raw tokens (no chat template, so both sides tokenise it identically), chunk
 
 | the prompt, 6394 tokens | affine parent | `q6k-full` |
 |---|---|---|
-| GPU busy | **4.50-4.61 s**, i.e. 1408 tok/s of GPU work | **5.16-5.19 s**, 1237 tok/s |
+| GPU busy | **4.14-4.21 s**, 1528 tok/s of GPU work (4.50-4.61 before Phase 35) | **4.65 s** (5.16-5.19 before) |
 | wall | 6.26-12.46 s, **37-72% busy** | 5.29-5.71 s, **90-97% busy** |
 | `mlx_lm.generate`, same artifact, same ids | **3.68-3.87 s, 1654-1740 tok/s** | mlx cannot load a k-quant artifact |
 
 Two things in that table, and the first one is the harder news.
 
-**The port is behind mlx on prefill by 22% of *GPU work*, not just on the
-wall.** 4.54 s median against mlx's 3.72 s of wall at what must be near-full
-occupancy. This is the one object left where the port loses to the reference
-it was written against -- decode is 130 tok/s against mlx's 86-92 -- and
-unlike decode it has never been inventoried: `step_inventory` is a decode
-instrument and there is no prefill equivalent. The older row here read "2600
-tokens, ~1230 tok/s of GPU work, mlx_lm 809" and both sides have roughly
-doubled since; the *sign* of the gap is what did not change.
+**The port was behind mlx on prefill by 22% of *GPU work*, not just on the
+wall, and is now behind by 12%.** 4.54 s against mlx's 3.72 s when this was
+first measured; 4.17 s after Phase 35 built the missing instrument and the
+first thing it found paid. It is the one object where the port loses to the
+reference it was written against -- decode is 130 tok/s against mlx's 86-92.
+The older row here read "2600 tokens, ~1230 tok/s of GPU work, mlx_lm 809"
+and both sides have roughly doubled since; the *sign* of the gap is what did
+not change.
+
+**Two things `step_inventory prefill` says that the decode bin does not.**
+The clamp is not a launch floor at this width -- a clamped dispatch costs
+143.7 us against a decode step's 2.55, because the surviving threadgroup of
+a *tile* still walks the whole K -- so the launch cost is the dispatch count
+times ~2.09 us, **2.9 ms of 1523, 0.2%**, and the fusion project has nothing
+to remove here. And one dispatch a command buffer inflates a chunk by 8%
+against a decode step's 29%, because a prefill dispatch fills the machine on
+its own: the per-dispatch table is nearly a decomposition here and
+explicitly is not one there.
 
 **And the idle is sized by the artifact, not by the era.** The same machine
 within one hour ran the 25.5 GB affine artifact at 37-72% busy and the 21.5
@@ -1982,16 +1992,19 @@ question with an instrument attached -- see "What the dispatches cost" above.
 
 In order:
 
-0. **Prefill, which is now the only place the port loses to mlx.** 4.54 s of
-   GPU work against mlx's 3.72 s wall on the same artifact and the same 6394
-   ids -- **22% behind on GPU work alone**, with a memory-pressure idle on
-   top of it that is worth another 40-170% of wall depending on the day.
-   Decode has been inventoried three times and is down to 0.89 ms of
-   elementwise ceiling; prefill has never been inventoried at all, and the
-   one kernel that happened to touch it (Phase 33's `gdn_front`) took 5.7%
-   off it by accident. A prefill `step_inventory` is the missing instrument,
-   and it is also the only way to price the deferred op layer on something
-   other than the 3.8% it is worth on a decode step.
+0. **Prefill, still the only place the port loses to mlx, and now
+   inventoried.** Phase 35 built `step_inventory prefill`, and the first
+   thing it found paid: the expert sort was **one thread** over 16384 keys,
+   11% of a chunk, and parallelising it took the gap from 22% to **12%**.
+   What the inventory points at next is in the same block and is another
+   **10% of a chunk** -- `gather_rows_div` (78.9 ms) and `unsort_rows`
+   (78.2 ms), a 16384-row gather and its inverse at 0.16 and 34 GB/s against
+   a 465 ceiling. A gather is latency-bound rather than bandwidth-bound, so
+   it is a different problem from the sort, and the obvious lever -- fold
+   the gather into the gemm that reads it -- is the one Phase 34 showed does
+   not transfer to a *mat-vec*. At prefill the consumer is a gemm, which is
+   exactly the shape Phase 34 said it had not tested. The memory-pressure
+   idle sits on top of all of it and is item 1.
 1. **A machine that is not swapping.** This is first because it is what the
    next two are waiting on, and it is not something the code can fix. Every
    GPU-side number in this document is now current and trustworthy -- they
@@ -2569,7 +2582,10 @@ reads much more invitingly than it should.
   **`ORNITH_FUSE_NORM_PROJ=1`** folds `RMSNormGated` into `out_proj` and is
   the one switch here that is off by default, because it lost -- it is the
   control that says why, with `ORNITH_RMSGATE_NR0=2|4|8|16` for the width
-  sweep that found its floor; `ORNITH_QMV_SHAPE=<nr0>x<nsg>` and
+  sweep that found its floor; `ORNITH_PARALLEL_SORT=0` puts the one-thread
+  expert sort back in place of the block-parallel one, and is the control
+  for the only change so far that a decode step cannot see at all;
+  `ORNITH_QMV_SHAPE=<nr0>x<nsg>` and
   `ORNITH_GQMV_SHAPE` set the k-quant mat-vec's rows a simdgroup and
   simdgroups a threadgroup, where ggml's `2x2` is the default **and is
   measured rather than inherited**: 4x2, 2x4, 4x4 and 8x4 are all level or
