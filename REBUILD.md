@@ -4710,28 +4710,157 @@ and `tests/mtp` are green, a 200-token `--greedy` run is byte-identical to
 the same run with both controls set, and `--mtp --mtp-depth 1 --frspec`
 prints the same bytes again.
 
+### Every epoch, asked the question the gate answered by accident
+
+The move above was found by eye, in a trace. `tools/epoch_slack.py` asks it of
+every dispatch at once: for each one, what its epoch would cost without it
+(it is worth moving only if it is the slowest thing in there, and only by the
+margin to the second), how far it may legally go -- after the last dispatch it
+collides with, before the first, mlx's rule and the port's -- and what the
+cheapest reachable epoch would cost with it, which is nothing if that epoch
+already holds something longer. `ORNITH_INV_DUMP=<path>` makes
+`step_inventory` write the trace and the per-dispatch times it needs.
+
+**Its calibration is the move that has an answer.** Run on the stream as it
+was before this phase -- both controls set, so the bin dumps the old order --
+it ranks `affine_qmv` first and prices moving all 40 of them at **0.225 ms**
+against the 0.252 measured. The same tool, on the same stream, also reports
+the destination as six epochs later, which is where the move went by hand.
+
+Which makes the rest of its table worth reading, and the reading is that this
+lever is nearly spent:
+
+    the stream before this phase      n   us each   ms/token   slack
+    affine_qmv (the shared gate)     40      5.63      0.225       8
+    affine_qmv_fast                  32      2.50      0.080       5
+    q6k_gather_qmv                    2     15.73      0.031       3
+    q6k_qmv                          16      1.69      0.027       6
+    rms                              30      0.85      0.025       1
+    compute_g                        30      0.84      0.025       5
+    everything, if it could all move           0.432
+
+    the stream after it              n   us each   ms/token   slack
+    affine_qmv_fast                  33      2.57      0.085       6
+    q6k_qmv                          18      1.82      0.033       5
+    compute_g                        30      0.87      0.026       6
+    rms                              30      0.84      0.025       1
+    affine_qmv                        1     10.88      0.011       8
+    everything, if it could all move           0.196
+
+**0.196 ms, 2.8% of the trunk, and no single item in it is worth 0.09.** The
+rows are one dispatch per layer moving one or two epochs, each in a different
+place, and the total assumes every move is free of the others. So the answer
+to "where is the next reorder" is: there is not one. `HANDOFF.md` said the
+remaining encode order was ~3.4% and needed a deferred op layer; that was
+right in size and wrong in shape -- 3.3% of it was a single dispatch, and
+what is behind that dispatch is 2.8% of genuinely spread slack.
+
+(One row is an artifact worth naming: the two `q6k_gather_qmv` in layer 33
+each "save" 16 us by moving into the other's epoch, which is one merge
+counted twice. The model prices one move at a time against an epoch structure
+it assumes stays put; it ranks, it does not predict.)
+
+### The argsort, priced against a stand-in and then replaced
+
+`carg_block_sort` was the other candidate and could not be priced by removal:
+its output is an address, and dropping it makes the step *slower*. So it was
+priced against a **stand-in that is not a sort**: `router_fake_order` writes
+`i * 37 + seed (mod 256)`, a permutation because 37 is coprime with 256, so
+the last k of it are k distinct experts, everything downstream indexes in
+range, and the gather reads the same number of distinct weights. The tokens
+are wrong, which is the point.
+
+    trunk, 8 interleaved draws
+      the sort    7.045  [6.957 6.984 7.056 7.068 6.951 7.045 6.993 7.078]
+      a stand-in  6.640  [6.589 6.647 6.637 6.686 6.575 6.640 6.611 6.667]
+      -0.385 ms as the mean of the pairs, 8 of 8, same dispatch count
+
+**0.385 ms, 5.5% of a decode step, for ordering 256 numbers to read eight of
+them.** That is the number that justifies the kernel, and it is the number
+`HANDOFF.md`'s "Fusing the router's tail" could not have had: that attempt
+measured a *whole fusion* against the wall at 88.4 against 88.9 tok/s on the
+affine artifact, where the sort hid under kernels this artifact no longer has.
+
+The replacement is `router_top_k`: one simdgroup a row, k rounds of selection,
+and its whole correctness is the tie rule. mlx's block sort is stable
+ascending -- `LessThan` compares values alone, `ThreadSort` swaps only on a
+strict `<`, `merge_step` takes from the right run only when `b < a` -- so
+equal values keep their input order and the last k are exactly the k largest
+under "by value, then by index". Selecting the maximum under that same total
+order k times, and writing the r'th into slot `k - 1 - r`, reproduces the
+slice element for element. It replaces three dispatches with one (the sort,
+`slice_tail` and `take_along_last`), and `tests/moe.rs` checks its indices and
+its raw scores against mlx's own at T = 1, 7, 24 and 512.
+
+    trunk, 8 interleaved draws
+      sort, slice, gather  6.985  [6.976 6.989 6.985 6.970 7.009 6.978 6.977 7.038]
+      one selection        6.617  [6.632 6.556 6.611 6.595 6.618 6.561 6.630 6.617]
+      -0.388 ms as the mean of the pairs, 8 of 8, and 80 dispatches fewer
+
+**It takes the whole 0.385 the stand-in promised.** Prefill does not move --
+4320 tokens read 3.79/3.81 s of GPU before and 3.78/3.76 after -- because at
+T = 2048 the router is a rounding error either way.
+
+**And the first version of it bought 0.065.** Same algorithm, same output,
+same dispatch count: it re-read the row from memory every round and carried
+the already-taken experts in a `chosen[]` array it rescanned for every
+candidate. Holding the row in registers, and clearing a taken expert by
+writing `-INF` over the lane that owns it, is worth **6x**. A selection kernel
+that is 6x off its own budget looks exactly like a selection kernel that was
+not worth writing -- which is what the 2026-09-17 attempt concluded, and this
+is a second reason to distrust that conclusion beyond the artifact having
+changed under it.
+
+### What the three came to
+
+    GPU ms/token, 200 greedy tokens, three interleaved pairs
+
+                     control              phase 31
+      GPU busy       8.20 8.13 8.18       7.42 7.45 7.45      -8.9%
+      wall           8.69 8.61 8.67       7.88 7.94 7.94      -8.2%
+      tok/s          115.3                126.0
+      dispatches     1669                 1509
+      barriers       1064                 908
+      commit buffers 14                   12
+
+    the trunk, in one process     before    after
+      as it runs                   7.54      6.74
+      clamped to one threadgroup   3.48      3.09
+      the floor's share            46%       46%
+
+The share does not move, which is the honest summary of the phase: the step
+got 11% shorter and it is made of the same thing it was made of. Exactness is
+unchanged and checked the same way -- `tests/model` at `max_abs == 0.0`,
+`tests/generate`, `tests/moe`, `tests/mtp` and `tests/vision_generate` green,
+a 200-token `--greedy` run byte-identical to the same run with all three
+controls set, and `--mtp --mtp-depth 1 --frspec` byte-identical again.
+
 ### What is left in the step, in the order the measurement puts it
 
 1. **`rms`, still.** 111 dispatches survive the fusion (the q and k norms and
    `RMSNormGated`, which feed `scalar_mul` and `precise_swiglu` rather than a
-   matvec), at 0.163 ms. The same shape of fusion takes them: a gated-delta
-   layer's `rms -> scalar_mul` pair twice and `rms -> precise_swiglu` once.
-   ~90 dispatches, and by the coefficient this phase measured, ~0.08 ms.
-2. **The argsort**, 0.29 ms in the clamped step and unpriceable in the real
-   one. A k-selection kernel was written once before and reverted at +0.5%
-   (`HANDOFF.md`, "Fusing the router's tail") -- on the affine artifact, at
-   10.9 ms a step, where it was hidden under kernels this artifact no longer
-   has. It deserves re-pricing before it is re-written, and the way to price
-   it is a cheap kernel that writes *valid* indices, not a dropped dispatch.
-3. **The gated-delta chain**: `concat_time`, `slice_inner`,
+   matvec), at 0.163 ms of removal. The same shape of fusion takes them: a
+   gated-delta layer's `rms -> scalar_mul` pair twice and `rms ->
+   precise_swiglu` once. ~90 dispatches, and by this phase's own coefficient
+   (a fusion returns about half what removing the dispatch does) **~0.06 ms,
+   0.9%**. The `scalar_mul` half is not worth its kernel on its own: removing
+   all 60 is 0.022 ms.
+2. **The gated-delta chain**: `concat_time`, `slice_inner`,
    `depthwise_conv_1d`, `silu`, `gdn_beta`, `compute_g` are six dispatches
-   over small arrays with a strict dependency between them, 0.35 ms of
-   removal between them and almost no work.
+   over small arrays with a strict dependency between them, ~0.35 ms of
+   removal between them and almost no work. No two of them are the same
+   shape, so this is one fused kernel per pair at best, or a rewrite of the
+   conv path at worst.
+3. **Reordering is spent**, and `tools/epoch_slack.py` is how that is known:
+   0.196 ms left in total, nothing over 0.085, all of it one dispatch at a
+   time in a different layer each. Re-run it after any change that moves the
+   epoch structure; do not go looking by hand again.
 4. **And the structural one.** A gated-delta layer issues 40 dispatches in 27
    epochs to read 37 MB. Nothing in the list above changes that ratio by more
-   than a few percent; what would is fusing the elementwise chain into the
+   than a percent or two; what would is fusing the elementwise chain into the
    matvecs that bracket it, which is a different size of project and wants
-   the deferred op layer `HANDOFF.md` has been circling.
+   the deferred op layer `HANDOFF.md` has been circling. The floor's share of
+   the step is 46% before this phase and 46% after it.
 
 
 ## Disk

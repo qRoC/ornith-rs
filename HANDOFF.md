@@ -212,6 +212,9 @@ src/bin/step_inventory.rs  a decode step's dispatches with their bytes, their
                            where it actually runs
 kernels/ornith_norm.metal  the residual add and the norm that reads it, in
                            one dispatch and two outputs
+tools/epoch_slack.py       which single dispatch is the slowest thing in its
+                           own epoch, how far it may move, and what that
+                           would save
 tools/dump_*.py            golden-reference writers (run against MLX)
 tools/export_probes.py     probe_set.py -> refs/probe_set.json, for the port
 tools/probes_from_logits.py  the port's logits -> probes.bin, and the
@@ -1255,18 +1258,19 @@ under any load and is the number to compare against.
 So the port is now ahead of the reference it was written against rather than
 level with it, by the changes mlx does not have: the MoE block issued
 interleaved, the buffer pool declining to recycle inside a barrier epoch,
-and -- Phase 31 -- the residual add fused into the norm that reads it and the
-shared expert's one-row gate issued where a gather can hide it.
+and -- Phase 31 -- the residual add fused into the norm that reads it, the
+shared expert's one-row gate issued where a gather can hide it, and the
+router's top-k selected rather than sorted.
 And the speculative pairing does 14% less GPU work a token than plain decoding
 while only tying on the wall, for the reason in "It does not pay off here".
 
 | a decode step, now | affine artifact | `q6k-full`, after Phase 31 |
 |---|---|---|
-| GPU busy | 10.3-10.5 ms of a 10.85-11.34 ms wall -- 95-96% | 7.9-8.1 ms of a 8.3-8.6 ms wall |
+| GPU busy | 10.3-10.5 ms of a 10.85-11.34 ms wall -- 95-96% | **7.42-7.45** ms of a 7.88-7.94 ms wall, 126 tok/s |
 | idle between command buffers | 0.47-0.56 ms a token, essentially one round trip | 0.47 ms |
-| dispatches | 1669 per token, in 14 command buffers (1759 before single-row slices became views) | **1589** in 13 |
-| barriers | 1064 per token (1216 at the 1:1 commit, 1669 before the barrier work) | **986** |
-| epochs | 1078 per token, 1.55 dispatches each | 1001 |
+| dispatches | 1669 per token, in 14 command buffers (1759 before single-row slices became views) | **1509** in 12 |
+| barriers | 1064 per token (1216 at the 1:1 commit, 1669 before the barrier work) | **908** |
+| epochs | 1078 per token, 1.55 dispatches each | 922, 1.63 each |
 | host round trips | 1.00 per token | 1.00 |
 | weights read | ~2.83 GB per token, i.e. **272 GB/s** against a measured ceiling of 465 and a sticker of 546 | **1.81 GB** |
 
@@ -1274,8 +1278,10 @@ while only tying on the wall, for the reason in "It does not pay off here".
 measured it rather than estimating it: the same dispatch stream with every
 grid clamped to a single threadgroup -- same barriers, same command buffers,
 no work -- costs **3.4 ms of a 7.5 ms trunk, 46%**, and what is left moves
-1.62 GB at ~400-440 GB/s, which is this machine's ceiling. The section
-"What the dispatches cost" below is the whole of it.
+1.62 GB at ~400-440 GB/s, which is this machine's ceiling. Three changes came
+out of that inventory and took **-8.9% a token** between them; the share of
+the step that is launches is 46% before and after. The section "What the
+dispatches cost" below is the whole of it.
 
 | the prompt, at chunk 2048 | |
 |---|---|
@@ -1319,11 +1325,11 @@ run the *same* dispatch stream with one term taken out of it.
 
 What they say, on `q6k-full`:
 
-| the trunk (`model_call`) | GPU ms |
-|---|---|
-| as it runs | 7.54 |
-| every grid clamped to one threadgroup | **3.48, 46%** |
-| what is left, moving 1.616 GB | 4.05, i.e. 397 GB/s |
+| the trunk (`model_call`) | before Phase 31 | after |
+|---|---|---|
+| as it runs | 7.54 | 6.74 |
+| every grid clamped to one threadgroup | **3.48, 46%** | **3.09, 46%** |
+| what is left, moving 1.616 GB | 4.05, i.e. 397 GB/s | 3.64, i.e. 443 GB/s |
 
 1062 of the 1665 dispatches move under 64 KB each -- 7.4 MB between them --
 and 95% of their isolated time is the floor. There is no slow kernel to
@@ -1343,7 +1349,17 @@ time and the wall takes it straight back.
 **What removal cannot price.** Dropping a dispatch whose output is an
 *address* rather than a number makes the step slower, not faster: without the
 router's argsort the expert gather reads eight experts at random and loses
-0.58 ms. For those, the clamped step gives a bound instead.
+0.58 ms. Those need a **stand-in** rather than a hole -- `ORNITH_FAKE_SORT=1`
+writes a valid order cheaply in place of the sort, and the 0.385 ms that
+measured is what justified replacing it.
+
+**And `tools/epoch_slack.py` asks the reordering question of every dispatch
+at once**, since the one reorder that paid was found by eye: which dispatches
+are the slowest thing in their own epoch, how far they may legally move, and
+what the cheapest reachable epoch would cost with them. It reproduces the
+move that has an answer (0.225 ms priced against 0.252 measured) and says
+what is left after it: **0.196 ms in total, nothing over 0.085**. Reordering
+is spent; re-run it after anything that moves the epoch structure.
 
 ### The barrier between dispatches
 
@@ -1782,9 +1798,13 @@ once instead of one, which is also what the collapsed runs look like.
 the eager encoder plus a commit threshold is that route. Worth knowing before
 anyone reads mlx-lm's loop and sees a divergence, which is what it looks like.
 
-### Fusing the router's tail, and why it is not here
+### Fusing the router's tail, and why it is not here -- **and why it is, now**
 
-Tried and reverted, so that it is not tried again for the same reasons.
+Tried and reverted, so that it is not tried again for the same reasons. Then
+tried again in Phase 31, where the same kernel is worth **5.5%**. Both
+measurements are below, and the second one is the current state; read the
+first for the reasons, which were good ones and were all about *this
+artifact at that time*.
 
 The router's tail is five dispatches a layer -- a full argsort of all 256
 experts, the slice of its last k, a gather, a row sum and a divide -- two
@@ -1808,6 +1828,29 @@ kernels that were waiting on memory.
 
 The lever here is bytes, not launches, and no rearrangement of the small
 kernels changes that.
+
+**Three things about that paragraph were wrong, and `REBUILD.md` Phase 31
+took them apart one at a time.**
+
+- **The artifact moved out from under it.** That was the affine artifact at
+  10.9 ms a step and 2.83 GB a token; `q6k-full` reads 1.8 GB and runs at
+  7.5, so the same small dispatch is a larger share of a step whose big
+  kernels got shorter. A conclusion of the form "it hides under the weight
+  reads" has a shelf life exactly as long as the weight reads.
+- **It was priced on the wall clock**, 88.9 tok/s against 88.4, which is
+  inside this machine's swing. The in-process pair the port uses now
+  separates 0.3% cleanly.
+- **And the sort could not be priced by removing it at all**, which is why
+  no number in that paragraph is of the sort itself. It was measured in
+  Phase 31 against a stand-in that writes a valid order cheaply:
+  **0.385 ms a token, 5.5% of the step**, and a rewritten `router_top_k`
+  takes all of it. The kernel is the same one, down to the tie rule; what
+  changed is that the first version of it was 6x off its own budget by
+  re-reading the row every round, which is a fine way to conclude that a
+  kernel is not worth writing.
+
+The lever is launches *and* bytes, and which one a given dispatch is on is a
+question with an instrument attached -- see "What the dispatches cost" above.
 
 
 ## What is left
