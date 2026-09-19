@@ -5785,6 +5785,215 @@ A gather is latency-bound rather than bandwidth-bound, so it is a different
 problem from the sort, and it is the next thing the inventory points at.
 
 
+## Phase 36 -- the two copies the inventory pointed at, and the one that was a width -- **DONE**
+
+Phase 35 built the prefill inventory and the first thing it found -- a sort
+running on one thread -- took half the gap to `mlx_lm`. It left the next
+thing named and measured: `gather_rows_div` at 78.9 ms and `unsort_rows` at
+78.2 ms a chunk, **~10% of it**, a 16384-row gather and its inverse. This
+phase is those two.
+
+They are gone, and the chunk is faster by roughly what they cost. **But
+almost none of that is because they are gone.** The bulk of it is that both
+kernels were moving 67 and 134 MB *two bytes at a time*, and the phase's
+largest single number is a change of access width that nothing in the
+inventory had asked for.
+
+### First, the table was stale, and re-taking it was not a formality
+
+The 78.9/78.2 came from a per-dispatch run taken **before the sort was
+parallelised** -- its own table lists `counting_sort_experts`, the one
+thread Phase 35 then replaced. Its level was 1752.7 ms against a chunk that
+now runs at 1410. Re-taken on the same artifact, in one run, with the level
+from that same run:
+
+    a prefill chunk, q6k-full, one dispatch a command buffer
+
+      the chunk, real            1410.4 ms   1505 dispatches   clamp 5.7%
+      the same, inflated         1563.8 ms   (8%, as Phase 35 found)
+
+      kernel             count      us     floor   per dispatch      bytes
+      unsort_rows           40  78929.6    110.9      1943.5 us   134.2 MB
+      gather_rows_div       40  71718.3    129.6      1776.8 us    67.1 MB
+      gather_u32            40    128.3     95.0         3.2 us     0.3 MB
+      moe_combine           40  11383.8    238.0       284.6 us     72.0 MB
+
+**The two are 150.6 ms, 10.7% of that run's own 1410.4.** So the object
+Phase 35 named survived re-measurement, and the gather's per-dispatch cost
+had *fallen* by half (3.44 ms to 1.78) now that the serial sort no longer
+runs beside it -- which is the whole reason the re-take was the first
+instruction and not a formality.
+
+The row to stare at is the last column against the clock. **67.1 MB written
+in 1.777 ms is 37.8 GB/s. 134.2 MB moved in 1.943 ms is 69 GB/s. This
+machine does 465.** Nothing in either kernel is scattered enough to explain
+that: a row is 4 KB of contiguous bfloat16 and consecutive threadgroups walk
+one row. That reading is what the phase eventually turned on, and it is
+recorded here before the part that was planned, because it was available
+before it too and nobody had looked.
+
+### What was built, and the precondition that was assumed instead of asked
+
+Two removals, in `src/ops/moe.rs`:
+
+**The front.** `gather_rows_div` writes `xs = x[order]` and hands the gemm
+`lhs_indices = identity`. But a gathered matmul reads its activations
+through `lhs_indices` -- that is `mx.gather_qmm`'s contract, and the
+*unsorted* branch of the same function is built on it. So the gemm can take
+`x` itself and the permutation. `gather_u32`, which already turns `order`
+into the expert of each sorted row, now writes the activation row beside it
+(`order[r] / k`) and is renamed `gather_expert_rows`; the copy is not
+issued at all.
+
+**The back.** `unsort_rows` puts `y` back in token order for one consumer:
+`moe_combine`, which indexes `y` a row at a time anyway. `moe_combine_rows`
+takes `inv_order` and reads `y[rows[token * k + j]]`. The accumulation is
+untouched -- `j` still ascends over the same rows of the same numbers into a
+bfloat16 accumulator -- so only the address moves.
+
+Both are addressing, not arithmetic, so both are bit-exact and the only
+question was speed. **And the front had a precondition that "`gather_matmul`
+already accepts arbitrary `lhs_indices`" hides.**
+
+> `mlx`'s sorted kernel takes no `lhs_indices` at all.
+> `affine_gather_qmm_rhs` reads row `r` of `x` for output row `r` and
+> nothing else -- which is exactly *why* mlx-lm gathers first. The k-quant
+> tile does index every row it loads (`kquant_mm_tile`'s `GATHER`), so on a
+> k-quant artifact the copy goes and on an affine one it stays.
+
+That is now a question asked of the weight rather than assumed of the call:
+`Linear::gather_reads_lhs(rows, sorted)`, which for the mlx family is the
+dispatcher's own predicate negated. On the **default affine parent the front
+fusion does not engage at prefill width**, and the A/B's dispatch column
+says so by reading zero.
+
+### The first A/B, and why its headline is wrong
+
+Eight interleaved pairs at a 2048-token chunk, q6k-full, against the copies
+as they were:
+
+      the control, twice     +1.9 ms   5 of 8   -0.05%
+      the gather indexed    -42.8 ms   7 of 8   -3.32%   -40 dispatches
+      the unsort indexed    -57.1 ms   8 of 8   -3.95%   -40 dispatches
+      both indexed         -135.0 ms   8 of 8   -8.28%   -80 dispatches
+
+and on the prompt, three interleaved pairs of whole runs:
+
+      6621 tokens, GPU s     affine parent 4.27 4.22 4.26 -> 4.02 3.96 3.96
+                             q6k-full      4.88 5.01 4.91 -> 4.47 4.43 4.53
+
+-6.1% and -9.2%, 3 of 3 each, byte-identical. That is the result this phase
+would have shipped, and **the control is what is wrong with it.**
+
+### The width, which nothing had asked about
+
+38 GB/s on a 465 GB/s machine is not a gather being a gather. `dim` is 2048
+bfloat16, so a row is 4 KB and a threadgroup of 256 threads copies 512
+contiguous bytes -- **two bytes a thread**. Sixteen bytes a thread is the
+same copy at a width the machine is built for, and it is fifteen lines:
+`gather_rows_div_wide` and `unsort_rows_wide`, a 16-byte vector each,
+guarded by a row being a whole number of them. A copy may not round
+anything, so both are under the same `max_abs == 0.0` as everything else.
+
+    the same prompt, affine parent, three interleaved pairs, both indexed
+
+      one element a thread   3.98  4.00  3.99
+      sixteen bytes          3.84  3.78  3.80
+      -0.19 s, -4.6%, 3 of 3 down, byte-identical
+
+**That is four times what removing the copy outright was worth**, and it
+came from reading a bandwidth column rather than from the plan.
+
+### And then the first A/B has to be run again, against the better control
+
+A control has to be the best version of what it replaces, or the change is
+being ranked against a kernel's access width. Same cell, same eight pairs,
+with the copies widened in the control arm:
+
+    q6k-full                                       affine parent
+
+      the control, twice   +0.4 ms  3/8  +0.23%     +1.1 ms  4/8  +0.09%
+      the gather indexed  -12.2 ms  4/8  -1.09%    +13.5 ms  2/8   (no-op)
+      the unsort indexed   -9.4 ms  6/8  -0.83%    -16.8 ms  6/8  -1.04%
+      both indexed        -14.8 ms  7/8  -0.57%    -43.6 ms  6/8
+
+**-8.3% becomes -0.6%.** Between seven and nine tenths of what the first
+table credited to removing two copies was the copies' access width, and the
+two changes were only ever separable because the second one exists as a
+flag.
+
+Three things in that table are worth keeping.
+
+- **The removals are real and small.** 7 of 8 and 6 of 8 pairs down on two
+  artifacts, against a control-against-itself row of 3 of 8 and 4 of 8.
+  They are kept for being strictly less work -- 80 dispatches and two whole
+  passes over memory a layer -- and not for being the large half.
+- **The affine `gather indexed` row is a free control and it reads +13.5
+  ms.** That arm changes nothing on that artifact (the dispatch column says
+  zero), so its +13.5 ms is what a no-op cell reads that far into a run.
+  Every other number in the affine column has to clear it, and -16.8 only
+  just does.
+- **The parts do not sum to the whole and do not have to.** -12.2 and -9.4
+  against -14.8; the affine pair drifted from a 1332 ms base to 1610 inside
+  one cell. At this size the cells are near the instrument's floor.
+
+### What it came to
+
+      a 6621-token prompt (`baseline/ppl_corpus.txt`), GPU seconds
+
+                                     affine parent      q6k-full
+        Phase 35's stream                 4.26             4.91
+        the copies indexed                3.97             4.47
+        ... and widened                   3.80              --
+        -0.46 s, -10.8%
+
+The affine column is two interleaved pairs sharing an arm, not one pair of
+its ends, and the shared arm reproduced across them (3.97 against 3.99). The
+q6k column's second row is against the narrow copies, so its own width term
+is still in front of it.
+
+**And `mlx_lm`, re-run in the same sitting on the same 6621 ids and the same
+affine artifact**, came back at 1638, 1541 and 1666 tok/s -- **4.04, 4.30
+and 3.98 s of wall**. The port's 3.80 s is GPU busy. Read it the way Phase
+35 says to: mlx's own GPU time can only be below its wall, so this is not
+"the port is now ahead", it is **the port's GPU work has gone from 7% above
+mlx's best wall to about 5% below it**, and what is left is inside the
+spread of mlx's own three draws.
+
+### Two traps, both new shapes of old ones
+
+**A renamed kernel had a second call site, and the check that should have
+caught it compared two empty files.** `gather_u32` was the MoE block's, so
+renaming it looked local; `src/frspec.rs` maps a draft's local row back to a
+vocabulary id with the same kernel. The suite passed -- nothing covers
+frspec -- and the `--mtp --mtp-depth 1 --frspec` byte-identity check
+reported both arms identical, because both had panicked and written zero
+bytes. `md5` of nothing equals `md5` of nothing. The working note "check
+that a control actually applied, and check it by a count" has a second half
+now: **check that the output exists**, and print the byte count beside the
+hash. The kernel is back under its own name.
+
+**And a negative result's control expires when the thing it controls gets
+faster.** Nothing was wrong with the first A/B when it was run. It stopped
+being right fifteen lines later, and the only reason it was re-run is that
+the width change landed in the same phase. A removal measured against a
+kernel that is later improved is a number that quietly becomes wrong, and
+there is no instrument that reports this -- which is the same lesson as
+"a negative result expires when its artifact or its instrument moves", from
+the side where *the control itself* is the thing that moved.
+
+### What is left in it
+
+`gather_rows_div_wide` is still issued 40 times a chunk on the affine
+parent, because mlx's sorted kernel cannot be handed a permutation. Giving
+it one means a port-local copy of `affine_gather_qmm_rhs` with a
+row-indexing `BlockLoader` -- ~200 lines of Metal for the measured **1%**
+that the k-quant side's `gather indexed` row bought. **Priced and not
+built.** If it is ever built, the bit-exact test it needs already exists in
+two copies: `tests/q4k.rs` and `tests/q6k.rs`,
+`indexing_the_rows_is_gathering_them`.
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

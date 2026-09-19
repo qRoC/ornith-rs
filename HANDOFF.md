@@ -1296,6 +1296,25 @@ raw tokens (no chat template, so both sides tokenise it identically), chunk
 | wall | 6.26-12.46 s, **37-72% busy** | 5.29-5.71 s, **90-97% busy** |
 | `mlx_lm.generate`, same artifact, same ids | **3.68-3.87 s, 1654-1740 tok/s** | mlx cannot load a k-quant artifact |
 
+**Phase 36 re-measured this on a different text and the row above is not
+comparable to the one below.** The prompt there is `baseline/ppl_corpus.txt`
+at **6621** raw tokens -- the 6394-token text is not in the repository, and
+`--tokenizer-json` does not produce it from this one. Same protocol, three
+interleaved pairs of whole runs, and `mlx_lm` re-run in the same sitting:
+
+| the prompt, 6621 tokens | affine parent | `q6k-full` |
+|---|---|---|
+| GPU busy, Phase 35's stream | 4.22-4.27 s | 4.88-5.01 s |
+| GPU busy, after Phase 36 | **3.78-3.84 s** | **4.43-4.53 s** (its width term is still in front of it) |
+| `mlx_lm.generate`, same ids, same sitting | 3.98-4.30 s of **wall**, 1541-1666 tok/s | mlx cannot load a k-quant artifact |
+
+The affine figure is two interleaved pairs sharing an arm (the copies
+indexed, then widened), and the shared arm reproduced across them at 3.97
+and 3.99. **The port's GPU busy is now below mlx's best wall on this text,
+which is not the same as being faster than mlx**: its GPU time can only be
+under its wall, so what this says is that the remaining difference is inside
+the spread of mlx's own three draws.
+
 **Read that last row as a floor on the gap, not a measurement of it.**
 `mlx_lm` reports a wall clock and the port's row is GPU busy; a wall swings
 with load where GPU busy does not, and re-running mlx in a later sitting
@@ -1346,6 +1365,13 @@ most of it is about reading an instrument on a second object.
   Phase 31's rule was that removal cannot price a dispatch whose output is
   an *address*; at this width it also cannot price one whose output is a
   number a gemm will multiply.
+- **Read the bandwidth column, not only the milliseconds.** Phase 35 left
+  two kernels named at 78.9 and 78.2 ms and the plan that followed was to
+  remove them. The same rows said 38 and 69 GB/s on a 465 GB/s machine, and
+  that was the larger finding: the copies were **two bytes a thread**, and
+  a 16-byte access was worth four times what removing them was
+  (`REBUILD.md` Phase 36). A kernel an order of magnitude under the
+  machine's ceiling is not yet a kernel you know the cost of.
 
 **And the idle is sized by the artifact, not by the era.** The same machine
 within one hour ran the 25.5 GB affine artifact at 37-72% busy and the 21.5
@@ -1447,6 +1473,14 @@ that is the one that got a kernel.
 **A fusion returns about half of what removing its dispatches measures.**
 Phase 31's add+rms: 0.068 of 0.145, 47%. Phase 32's `moe_combine`: 0.21 of
 0.375, 56%. Price the next one at half.
+
+**That coefficient is about launches, and it does not hold for a pass over
+memory.** Phase 36 removed two whole copies whose isolated cost was 150.6 ms
+of a 1410 ms chunk and measured **-135 ms, 90%**, not 50%. The half comes
+from neighbours overlapping into the hole a removed *launch* leaves; a
+kernel that is 134 MB of traffic and 1.9 ms long has nothing small enough
+nearby to fill it. Price a launch at half and a pass at most of itself --
+and check which one is in front of you before applying either.
 
 **What is left after `moe_combine`**: 611 dispatches and 1.14 ms of ceiling,
 of which the gated-delta chain is 200 and 0.29, and everything a general
@@ -2022,19 +2056,32 @@ question with an instrument attached -- see "What the dispatches cost" above.
 
 In order:
 
-0. **Prefill, still the only place the port loses to mlx, and now
-   inventoried.** Phase 35 built `step_inventory prefill`, and the first
-   thing it found paid: the expert sort was **one thread** over 16384 keys,
-   9.6% of a chunk, and parallelising it took the gap from 22% to **12%**.
-   What the inventory points at next is in the same block and is another
-   **9% of a chunk** -- `gather_rows_div` (78.9 ms a chunk, 19.5 GB/s a
-   dispatch) and `unsort_rows` (78.2 ms, 73 GB/s), a 16384-row gather and
-   its inverse against a 465 GB/s ceiling. A gather is latency-bound rather than bandwidth-bound, so
-   it is a different problem from the sort, and the obvious lever -- fold
-   the gather into the gemm that reads it -- is the one Phase 34 showed does
-   not transfer to a *mat-vec*. At prefill the consumer is a gemm, which is
-   exactly the shape Phase 34 said it had not tested. The memory-pressure
-   idle sits on top of all of it and is item 1.
+0. **Prefill, and the port is no longer measurably behind mlx on it.**
+   Phase 35 built `step_inventory prefill` and the first thing it found --
+   a sort on one thread -- took the gap from 22% to 12%. Phase 36 took the
+   two kernels it pointed at next, `gather_rows_div` and `unsort_rows`, and
+   on a 6621-token prompt the affine parent went **4.26 -> 3.80 GPU
+   seconds, -10.8%**, against `mlx_lm`'s 3.98-4.30 s of *wall* on the same
+   ids in the same sitting. Since mlx's own GPU time can only be below its
+   wall, the honest reading is "inside the spread of mlx's draws", not
+   "ahead".
+   **But read Phase 36 before reusing its mechanism, because its headline
+   is not its plan.** Both copies are gone where the kernels allow it, and
+   that is worth **-0.6% of a chunk**. What was worth -4.6% of the prompt
+   was noticing that both kernels moved 67 and 134 MB **two bytes a
+   thread** -- 38 and 69 GB/s against this machine's 465 -- and giving them
+   a 16-byte access. The first A/B of the removals read -8.3% and was
+   measuring the control's access width; it had to be run again once the
+   control was widened. **A control has to be the best version of what it
+   replaces.**
+   What is left of it: `gather_rows_div_wide` still runs 40 times a chunk
+   on the affine parent, because mlx's sorted kernel `gather_qmm_rhs` takes
+   no `lhs_indices` at all -- the k-quant tile does, which is why the front
+   removal engages on one artifact and not the other
+   (`Linear::gather_reads_lhs`). Handing mlx's kernel a permutation is ~200
+   lines of Metal for the 1% the k-quant side measured, and is **priced and
+   not built**. The memory-pressure idle sits on top of all of it and is
+   item 1.
 1. **A machine that is not swapping.** This is first because it is what the
    next two are waiting on, and it is not something the code can fix. Every
    GPU-side number in this document is now current and trustworthy -- they
@@ -2624,7 +2671,16 @@ reads much more invitingly than it should.
   kernel, and `ORNITH_FAKE_SORT=1` swaps the argsort for a stand-in that
   keeps its contract and does not sort (**the output is wrong while it is
   on**; it exists because removal cannot price a dispatch whose output is an
-  address). `step_inventory` A/Bs all of them in one process.
+  address); `ORNITH_FUSE_MOE_GATHER=0` puts `gather_rows_div` back in front
+  of the expert gemm and `ORNITH_FUSE_MOE_UNSORT=0` puts `unsort_rows` back
+  in front of the block's tail, and **`ORNITH_MOE_GATHER_WIDE=0` narrows
+  both of those copies back to one element a thread** -- which is the
+  control that has to be *off* for the other two to be ranked against
+  anything but a kernel's access width (`REBUILD.md` Phase 36).
+  `step_inventory` A/Bs all of them in one process, and
+  `step_inventory prefill only` runs the Phase 36 cell alone with eight
+  interleaved pairs and stops, which is the protocol prefill's thermal
+  drift asks for.
 - **A short generation puts the prompt on the denominator.** `ORNITH_PROF`'s
   per-token figures divide by the tokens actually generated, not by `-m`, and
   the prefill call's dispatches and GPU time are in the numerator. A run that
@@ -2641,6 +2697,18 @@ reads much more invitingly than it should.
   so except the dispatch count, which was the same 753 in both arms. Every
   control here changes a *counter*, so read the counter before reading the
   result; it is the same reflex `Context::prof_dropped` exists for.
+- **And check that the output exists.** Phase 36 renamed `gather_u32`,
+  which had a second call site in `src/frspec.rs`; the whole suite passed,
+  because nothing covers frspec, and the `--mtp --frspec` byte-identity
+  check then reported both arms identical. Both had panicked and written
+  **zero bytes**, and `md5` of nothing equals `md5` of nothing. Print the
+  byte count beside the hash -- `md5 -q f` alone cannot tell "the same" from
+  "neither ran". The same applies to any diff-based check whose inputs a
+  crash can empty.
+- **Grep a kernel's name before renaming it.** The metallib is looked up by
+  string at dispatch time, so a missed call site is not a compile error; it
+  is a panic the first time that path runs, which may be a path no test
+  takes.
 - **A failed command buffer panics rather than timing as zero.** An
   `MTLCommandBuffer` that fails reports `GPUStartTime == GPUEndTime == 0`,
   so by the only clock here it costs **0 ms of GPU** and the arrays it owned
