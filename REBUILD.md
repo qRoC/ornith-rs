@@ -5385,6 +5385,42 @@ worth 0.145.** 2 of 16 pairs down. The sweep is a U and both of its sides are
 named: leftward the prologue repeats more often, rightward the mat-vec itself
 degrades as a threadgroup takes more output rows.
 
+### The budget check, which is where the mechanism stops being an inference
+
+The rule from Phase 31 is to check a disappointing kernel's *isolated* time
+against its *clamped floor* before believing the disappointment, because the
+first `router_top_k` was 6x off its own budget. This one is not off its
+budget -- it is doing more work, and the inventory says how much:
+
+    30 dispatches each, one command buffer apiece
+
+                                              isolated   floor   us each
+      q4k_qmv (out_proj) + rms_gated, apart    575.7     319.0     19.2
+      q4k_rmsgate_qmv, nr0 = 2, 512 groups     852.2     436.6     28.4
+      q4k_rmsgate_qmv, nr0 = 4, 128 groups     634.5     413.8     21.1
+
+**+276.5 us and +58.8 us of isolated time against the two it replaces, and
+the ratio between those is 4.70 for a 4x change in the threadgroup count.**
+That is the redundancy measured rather than argued: the extra cost is very
+nearly proportional to how many threadgroups repeat the prologue, which is
+the one thing `nr0` changes.
+
+(The residual is a hint and not a result: fitting `extra = G * p + d` to the
+two points puts the plain mat-vec ~10 us a dispatch *cheaper* at nr0 = 4 than
+at ggml's 2, which would be a free change to every k-quant matvec in the
+model. It rests on assuming the per-group prologue cost does not move with
+the width, and the plain kernel was never instantiated at those widths to
+check. Two A/Bs would settle it; this phase did not run them.)
+
+**And the isolated extra is what the step paid, within the noise**: 0.277 ms
+predicted against +0.304 measured at nr0 = 2, 0.059 against +0.079 and
++0.146 at nr0 = 4. That is a coefficient of about **one**, where every
+fusion in Phases 31-33 returned about a half. The asymmetry is the same
+dependency chain seen from the other side: taking a launch *out* of a stream
+lets its neighbours overlap into the hole, so half of it comes back, but
+putting work *into* a kernel that nothing overlaps with is paid in full.
+**Price a removal at a half and an addition at one.**
+
 ### Why, and it is not about this kernel
 
 **A mat-vec parallelises over output rows, and every threadgroup reads the
@@ -5396,9 +5432,10 @@ only knob is how few threadgroups the mat-vec can be made to run with, and
 that is the same knob that decides whether the mat-vec is any good.
 
 That is why the U has a floor above zero, and the floor is not a property of
-this kernel. It is arithmetic: the producer is O(K) work, the consumer is
+this kernel. It is arithmetic -- the producer is O(K) work, the consumer is
 O(K*O/G) work spread over G threadgroups, and the fusion multiplies the
-producer by G while leaving the consumer alone.
+producer by G while leaving the consumer alone -- and the 4.70-against-4
+above is that arithmetic measured.
 
 ### What it says about the deferred op layer, which is that it is closed
 

@@ -2575,6 +2575,14 @@ reads much more invitingly than it should.
   keeps its contract and does not sort (**the output is wrong while it is
   on**; it exists because removal cannot price a dispatch whose output is an
   address). `step_inventory` A/Bs all of them in one process.
+- **A short generation puts the prompt on the denominator.** `ORNITH_PROF`'s
+  per-token figures divide by the tokens actually generated, not by `-m`, and
+  the prefill call's dispatches and GPU time are in the numerator. A run that
+  stopped after 9 tokens reported **1121 dispatches and 11.0 GPU ms a token**
+  where the same build on a 44-token prompt for 200 tokens reports 1009 and
+  7.2 -- `(1000 + 9 * 1009) / 9 = 1120`, and nothing had changed. Compare
+  per-token figures only across runs that generated a comparable number of
+  tokens.
 - **Check that a control actually applied, and check it by a count.** Phase
   33 ran an MTP pair whose two arms were both fused -- `zsh` does not
   word-split an unquoted `$VAR`, so two environment variables reached the
