@@ -5593,9 +5593,17 @@ explicitly is not one.
       swiglu                           80    17319.1      193.2
 
 The gemms are ~74% of it and they are the work. **The router's bookkeeping
-is 324.7 ms -- 21% of the chunk** -- and two of its three kernels move
-almost nothing while doing it. The whole gap to mlx is 0.82 s over 6394
-tokens, i.e. **0.26 s a chunk**; the sort alone is 0.17.
+is 324.7 ms -- 18.5% of the chunk.** The whole gap to mlx is 0.82 s over
+6394 tokens, i.e. **0.26 s a chunk**; the sort alone is 0.17.
+
+**The denominator is that run's own level and not the other run's**, which
+this section got wrong once and is worth saying plainly: the level table
+above reads 1522.8 ms and the per-dispatch run's own real chunk reads
+1752.7, a 15% difference between two sittings on this machine. Shares taken
+from the per-dispatch table have to be divided by 1752.7 -- 9.6% for the
+sort, 18.5% for the three -- and dividing them by the *other* run's level
+inflates them to 11% and 21%. Same rule as the tok/s column in Phase 33:
+counters travel between sittings, levels do not.
 
 ### The single thread, and the comment that predicted it
 
@@ -5663,14 +5671,30 @@ issues exactly what it issued before.
 identical on both artifacts, the whole suite green, and a decode step is
 untouched at 1009 dispatches and 609 barriers.
 
+Two things about that ratio. `mlx_lm` was re-run in the same sitting and
+came back at 1650 and 1192 tok/s -- 3.87 s and 5.36 s -- against the port's
+4.13 and 4.26 of GPU: **its number is a wall clock and swings with load
+where the port's GPU figure does not**, so the best of its draws is the
+estimator and 3.68-3.87 s stands. And the comparison is generous to mlx by
+construction: mlx's own GPU time can only be *below* its wall, so 12% is a
+floor on what is left rather than a ceiling.
+
 ### What is left in it
 
-`gather_rows_div` (78.9 ms) and `unsort_rows` (78.2 ms) are another **10% of
-a chunk**, and neither is a serial kernel -- they are a 16384-row gather and
-its inverse, moving 12.5 MB and 2562 MB at 0.16 and 34 GB/s against a 465
-ceiling. A gather is latency-bound rather than bandwidth-bound, so those are
-a different problem from this one and they are the next thing the inventory
-points at.
+`gather_rows_div` (78.9 ms) and `unsort_rows` (78.2 ms) are another **9% of
+a chunk**, and neither is a serial kernel: they are a 16384-row gather and
+its inverse. Per dispatch the gather writes 67.1 MB in 3.44 ms (**19.5
+GB/s**) and the unsort moves 134.2 MB in 1.83 ms (**73 GB/s**), against a
+465 GB/s ceiling.
+
+(The inventory's `MB` column is *read* bytes from the bindings, and for a
+gather it reads 327 KB -- the index array -- while the rows it actually
+touches are counted nowhere. So its 0.16 GB/s for that row is an artefact
+of a column built for mat-vecs, not a reading. The per-dispatch figures
+above are the ones to use.)
+
+A gather is latency-bound rather than bandwidth-bound, so it is a different
+problem from the sort, and it is the next thing the inventory points at.
 
 
 ## Disk

@@ -1315,7 +1315,9 @@ times ~2.09 us, **2.9 ms of 1523, 0.2%**, and the fusion project has nothing
 to remove here. And one dispatch a command buffer inflates a chunk by 8%
 against a decode step's 29%, because a prefill dispatch fills the machine on
 its own: the per-dispatch table is nearly a decomposition here and
-explicitly is not one there.
+explicitly is not one there. **Divide its rows by that run's own level** --
+two prefill runs an hour apart read 1522.8 and 1752.7 ms for the same chunk,
+and crossing them inflates every share by 15%.
 
 **And the idle is sized by the artifact, not by the era.** The same machine
 within one hour ran the 25.5 GB affine artifact at 37-72% busy and the 21.5
@@ -1995,11 +1997,11 @@ In order:
 0. **Prefill, still the only place the port loses to mlx, and now
    inventoried.** Phase 35 built `step_inventory prefill`, and the first
    thing it found paid: the expert sort was **one thread** over 16384 keys,
-   11% of a chunk, and parallelising it took the gap from 22% to **12%**.
+   9.6% of a chunk, and parallelising it took the gap from 22% to **12%**.
    What the inventory points at next is in the same block and is another
-   **10% of a chunk** -- `gather_rows_div` (78.9 ms) and `unsort_rows`
-   (78.2 ms), a 16384-row gather and its inverse at 0.16 and 34 GB/s against
-   a 465 ceiling. A gather is latency-bound rather than bandwidth-bound, so
+   **9% of a chunk** -- `gather_rows_div` (78.9 ms a chunk, 19.5 GB/s a
+   dispatch) and `unsort_rows` (78.2 ms, 73 GB/s), a 16384-row gather and
+   its inverse against a 465 GB/s ceiling. A gather is latency-bound rather than bandwidth-bound, so
    it is a different problem from the sort, and the obvious lever -- fold
    the gather into the gemm that reads it -- is the one Phase 34 showed does
    not transfer to a *mat-vec*. At prefill the consumer is a gemm, which is
