@@ -1726,6 +1726,24 @@ which kernels exist and what they cost in isolation; for what removing one
 what a kernel can have: one that only reads, at several sizes, and then the
 real `quantized_matmul` at M = 1 on real weights.
 
+**And since Phase 37 there is an arithmetic ceiling beside it**, which
+prefill needs and decode does not: `cargo run --release --bin arithmetic`,
+no model load. Scalar fp32 FMA sustains **14.1 TFLOP/s** and a simdgroup
+8x8x8 `multiply_accumulate` sustains **14.5** (float32 fragments), **14.9**
+(float16), **15.1** (bfloat16). Three things follow and all three matter:
+
+- **`simdgroup_multiply_accumulate` is not a separate unit on this machine.**
+  Matrix is 1.03x scalar and sixteen-bit fragments buy 3%, not 2x. That is
+  why `ORNITH_KQUANT_TILE_HALF` measured free -- the machine gives 3%, the
+  synthetic says 1.03x and the real kernel says 1.036x.
+- **Sweep the accumulator count or the number is a fifth of the truth.** One
+  dependent FMA chain reads 2.6 TFLOP/s; thirty-two independent ones read
+  14.1. The same kernel, and only one of those is the machine.
+- **The ceiling is validated by a kernel nobody here wrote**: mlx's dense
+  bf16 steel gemm reaches 95-96% of it at this model's own shapes. The
+  quantized gemms reach 79-80%, the routed one 72%, and that 20% gap is the
+  dequantize, paid in arithmetic on the same ALUs the multiply wants.
+
 | a kernel that only reads | GB/s | of peak |
 |---|---|---|
 | 64 MB | 202 | 37% |
@@ -2082,6 +2100,18 @@ In order:
    lines of Metal for the 1% the k-quant side measured, and is **priced and
    not built**. The memory-pressure idle sits on top of all of it and is
    item 1.
+   **And Phase 37 then measured how much room is left at all, which is not
+   much.** A chunk is 81% quantized gemm; those gemms run at 72-80% of an
+   arithmetic ceiling that mlx's own dense bf16 gemm reaches at 96%; the
+   whole gap is the cost of unpacking 4-bit weights, on the same ALUs the
+   multiply needs. So **the total remaining arithmetic headroom in a
+   prefill chunk is ~16%**, none of it reachable by scheduling, fusing or
+   removing anything. Two candidates in order: the routed expert gemm's 8
+   points against its own family (72% vs 80%, **3.5% of a chunk**, cause
+   not yet named -- N is 512 there against 2048-8192, which is a hypothesis
+   with an A/B); and the unpack itself, 20% of every quantized gemm, where
+   the first question is how many ALU ops a weight `Q4KFmt::dequantize`
+   spends against how few it could.
 1. **A machine that is not swapping.** This is first because it is what the
    next two are waiting on, and it is not something the code can fix. Every
    GPU-side number in this document is now current and trustworthy -- they
@@ -2631,6 +2661,15 @@ reads much more invitingly than it should.
 - `cargo run --release --bin bandwidth` measures what this machine sustains:
   a read-only kernel at several sizes, then `quantized_matmul` at M = 1 on real
   weights. Run it before believing any "% of peak" claim.
+- **`cargo run --release --bin arithmetic` is its sibling for FLOPs**, and
+  needs no model load, which makes it the one performance bin that can be
+  run on a busy machine (it reproduced to 1% at load average 11, because
+  `best_of` takes a minimum and nothing in it competes for DRAM). Scalar
+  FMA and simdgroup 8x8x8, each swept over how many independent
+  accumulators a thread carries, then the real gemms at a chunk's shapes
+  against the result. **Sweep, always:** one dependent FMA chain reads 2.6
+  TFLOP/s where thirty-two independent ones read 14.1, so an unswept
+  "peak" here is wrong by 5x and looks perfectly reasonable.
 - **`--bin draft_cost` and `--bin window_mv` are the speculative pair**, both
   `ORNITH_PROF=1` and both in GPU seconds. The first runs a draft level and a
   verify forward apart from each other, at every window width, and reports

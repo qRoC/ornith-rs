@@ -6047,6 +6047,125 @@ two copies: `tests/q4k.rs` and `tests/q6k.rs`,
 `indexing_the_rows_is_gathering_them`.
 
 
+## Phase 37 -- an arithmetic ceiling, and this machine has no matrix unit -- **DONE**
+
+Phase 36 left prefill **81% quantized gemm** -- 1264 ms of a 1564 ms
+isolated chunk, against 13% of data movement and 6% of everything else. So
+the next question about prefill is not "which kernel is slow" but "is the
+gemm near its ceiling", and there was no ceiling to ask against.
+`bin/bandwidth` has answered the memory side since Phase 19; the arithmetic
+side had a number off a box.
+
+`bin/arithmetic` is the sibling. It needs no model load, which is also how
+it got measured on a night when nothing else could be.
+
+### The two ceilings, and the sweep that makes them ceilings
+
+    Apple M4 Max, best of 5, chains of 10 dispatches, two runs 1% apart
+
+      independent FMA chains a thread       simdgroup 8x8x8, float32 acc
+        1 chain     2.6 TFLOP/s               1 tile    13.3 TFLOP/s
+        2           5.6                       2         14.2
+        4          10.0                       4         14.5
+        8          12.6                       8         14.5
+       16          13.6                      16         14.5
+       32          14.1
+
+The left column is the trap this kernel is shaped around: a *dependent*
+`fma(a, b, c)` chain cannot issue the next one until the last retires, so at
+one chain it reads **2.6 TFLOP/s** -- a fifth of the truth, and a number
+that would have been reported as the machine's peak by anyone who did not
+sweep. The right column is flat from four accumulators on, so it is a
+plateau and not a slope.
+
+    fragment type, simdgroup 8x8x8, 16 accumulators
+
+      float32   14.5 TFLOP/s
+      float16   14.9
+      bfloat16  15.1
+
+**And that is the finding: `simdgroup_multiply_accumulate` on this machine
+is not a separate unit.** 14.5 TFLOP/s of matrix against **14.1 of scalar
+fp32 FMA** is 1.03x. Sixteen-bit fragments buy **3%**, not 2x. Whatever the
+matrix instruction is doing, it is doing it on the same ALUs at the same
+rate, and the only thing it saves is the addressing and the register
+shuffling around them.
+
+(An arithmetic check, as corroboration rather than as the measurement: 40
+cores x 128 ALUs x 2 flops x ~1.4 GHz is ~14.3 TFLOP/s, which is what both
+columns converge to.)
+
+**The ceiling is real, and a kernel nobody here wrote is what says so.**
+mlx's dense bf16 steel gemm -- tuned by Apple, not by this port -- reaches
+**95-96% of the synthetic number** at two of this model's own shapes. A
+synthetic ceiling that a heavily-tuned real kernel nearly touches is a
+ceiling; one that every real kernel misses by 2x is a bug in the synthetic.
+This one has its control built in.
+
+### What the 81% is actually running at
+
+    a 2048-token chunk's own shapes, TFLOP/s and share of the 14.5 ceiling
+
+      dense bf16      [8192, 2048]   14.17   95%   <- the ceiling, reached
+      dense bf16      [2048, 4096]   14.39   96%
+      q4k_qmm_t       [8192, 2048]   11.83   79%
+      q4k_qmm_t       [2048, 4096]   11.94   80%
+      q6k_qmm_t       [8192, 2048]   11.91   80%
+      q6k_qmm_t       [2048, 4096]   11.98   80%
+      q4k_gather_qmm_t experts       10.70   72%   <- 16384 rows, 256 experts
+
+**The price of the format is 20%, in arithmetic, and it is now a
+measurement.** Same M, N and K, same machine, same sitting: 4.85 ms dense
+against 5.81 ms quantized, and 2.39 against 2.88. That is what unpacking
+4-bit weights costs, and it costs it *on the same ALUs the multiply needs*,
+which is exactly why it shows up as arithmetic and not as bytes.
+
+**And the routed gemm is eight points worse than the dense ones**, at 72%,
+on perfectly aligned 64-row expert runs -- so it is not the straddling
+Phase 23 tuned the tile width for. It is 632 ms of the chunk's 1264, the
+single largest object left in prefill, and 72% against the 80% its own
+family reaches elsewhere is **~50 ms a chunk, 3.5%**, with a cause that is
+not yet named.
+
+### The standing result this explains
+
+`ORNITH_KQUANT_TILE_HALF=1` swaps the tile's `S = float` fragments for
+ggml's `half`. Phase 34 priced it and recorded "**free**: 0-4% on every
+shape, which is inside the measurement", and left the flag in because the
+decision had been taken on a contract and never measured.
+
+It is free because **the machine gives 3% for half fragments**. The
+synthetic says 1.03x; the same A/B on the real kernel, with the tile width
+pinned to 32 in both arms because that is the only width `half` is
+instantiated at, says **11.00 against 11.40 TFLOP/s, 1.036x**. A synthetic
+ceiling and a real kernel agreeing to a thousandth is the strongest form
+this port's measurements take, and it turns "we measured no difference"
+into "there is no difference to measure, and here is why".
+
+### What it says about where to go, which is mostly "not far"
+
+Prefill is 81% gemm; the gemm is at 72-80% of a ceiling a real kernel
+reaches at 96%; the whole gap is the dequantize. So **the entire remaining
+arithmetic headroom in a prefill chunk is ~16%**, all of it inside kernels
+whose job is to unpack 4-bit weights, and none of it reachable by
+scheduling, fusing or removing anything. The two candidates, in order:
+
+- **the routed gemm's 8 points against its own family** -- 3.5% of a chunk,
+  and the first job is to name the cause rather than to tune. N is 512
+  there against 2048-8192 in the dense shapes, so the A fragments are
+  reused across a quarter as many column tiles; that is a hypothesis with
+  an A/B, not a conclusion.
+- **the unpack itself**, which is 20% of every quantized gemm. Halving it
+  is ~10% of 81% of a chunk. That is a kernel-arithmetic problem and the
+  first thing to ask of it is how many ALU ops a weight the current
+  `Q4KFmt::dequantize` spends, against how few it could.
+
+**None of this touches a decode step**, which reads 1.8-2.8 GB against
+~250-400 GB/s and is memory-bound end to end. This is a prefill instrument
+and its numbers are prefill numbers -- the same two-objects rule Phase 35
+was built on.
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
