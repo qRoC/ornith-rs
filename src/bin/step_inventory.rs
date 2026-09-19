@@ -616,6 +616,29 @@ fn main() {
     // partition is the check on that -- three disjoint buckets whose union is
     // the whole, and a sum far from the whole would be the interaction this
     // reasoning missed.
+    // **The boundary does not transfer to a prefill chunk, and this is where
+    // that was found.** Two confounds appear at this width and neither has a
+    // counterpart at a decode step:
+    //
+    //  - **the machine throttles across the run.** A cell is 16 chunks of
+    //    1.4 s at full ALU; eleven cells is four minutes of it, and the
+    //    *base* arm -- the same code with nothing neutered -- climbed from
+    //    1407 ms at the top of the run to 2100-2200 by the middle. Pairs are
+    //    interleaved so a smooth drift cancels inside a cell, but comparing
+    //    cells is comparing thermal states, and the partition check said so
+    //    at once: three disjoint buckets summing to **466%** of the whole.
+    //  - **the garbage a ceiling deliberately produces is not free here.**
+    //    At a decode step a dropped elementwise kernel leaves kilobytes of
+    //    pool memory downstream; at a chunk it leaves megabytes, and it
+    //    feeds gemms whose cost depends on the values in them. Dropping
+    //    `rms_gated` read **+82 ms, 1 of 8** -- removing a kernel cannot
+    //    make the step slower unless what it left behind changed the
+    //    arithmetic's cost.
+    //
+    // So this section stays decode-shaped. A prefill boundary needs a
+    // protocol that does not ask the machine for four minutes of full-ALU
+    // work in one sitting, and until it has one the honest reading of this
+    // table is the partition check refusing it.
     if std::env::args().any(|a| a == "border") {
         // Patterns match the instantiated kernel name as a substring, so
         // `swiglu` takes `precise_swiglu` with it, which is what the chain
@@ -651,7 +674,7 @@ fn main() {
         for pat in &all {
             ctx.set_neuter_many(&[pat], true);
             step(&ctx, &mut caches, false);
-            let n = ctx.prof_dropped() as f64 / REPS as f64;
+            let n = ctx.prof_dropped() as f64 / reps as f64;
             ctx.set_neuter(None);
             println!("  {pat:<24} {n:>6.0}");
         }
@@ -698,7 +721,7 @@ fn main() {
                 base.push(step(&ctx, &mut caches, false).0);
                 ctx.set_neuter_many(pats, true);
                 gone.push(step(&ctx, &mut caches, false).0);
-                dropped = ctx.prof_dropped() as f64 / REPS as f64;
+                dropped = ctx.prof_dropped() as f64 / reps as f64;
             }
             ctx.set_neuter(None);
             let pairs: Vec<f64> = gone.iter().zip(&base).map(|(g, b)| g - b).collect();
