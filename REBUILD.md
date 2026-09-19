@@ -4194,7 +4194,7 @@ did move: the same configuration read 6.79 GPU ms a token this morning and
 
 That looked like a 9% compiler regression until it was controlled, and the
 control is cheap enough to be the rule rather than the exception:
-`target/kernels-xcode26.3.metallib` is the old compiler's output, and
+`refs/toolchain/kernels-xcode26.3.metallib` is the old compiler's output, and
 `include_bytes!` means swapping that one file and relinking gives **the same
 Rust binary over two metallibs**. On the machine as it stood in the afternoon,
 26.3's kernels read **7.44 / 7.30 / 7.65** against 27.0's **7.45 / 7.38 /
