@@ -2427,6 +2427,13 @@ reads much more invitingly than it should.
 - `refs/` is not in the repository -- 510 MB of raw tensors, and every case
   has a writer. A fresh checkout has to run the `dump_*.py` above before
   `cargo test` has anything to compare against.
+- **One unit test is artifact-specific and fails on a k-quant model.**
+  `weights::tests::loads_a_quantized_matrix_with_the_right_config` derives a
+  packed width from `bits` the way mlx's affine layout does, so it fails
+  under `ORNITH_MODEL=...-q6k-full` and passes on every affine artifact
+  including the default. It is not a regression and nothing else in the
+  suite depends on it; run the suite on the default model, and read a
+  failure of that one name under a k-quant `ORNITH_MODEL` as expected.
 - `cargo test --release` runs everything but the full-model and end-to-end
   tests. Those need `--ignored` *and* `--test-threads=1`, because each one
   loads the whole 25.5 GB model and two at once do not fit:
@@ -2509,6 +2516,14 @@ reads much more invitingly than it should.
   keeps its contract and does not sort (**the output is wrong while it is
   on**; it exists because removal cannot price a dispatch whose output is an
   address). `step_inventory` A/Bs all of them in one process.
+- **Check that a control actually applied, and check it by a count.** Phase
+  33 ran an MTP pair whose two arms were both fused -- `zsh` does not
+  word-split an unquoted `$VAR`, so two environment variables reached the
+  process as one and neither matched -- and the run reported "byte-identical"
+  because it was comparing a build against itself. Nothing in the output said
+  so except the dispatch count, which was the same 753 in both arms. Every
+  control here changes a *counter*, so read the counter before reading the
+  result; it is the same reflex `Context::prof_dropped` exists for.
 - `ORNITH_PROF=1` prints the per-token breakdown at the end of a run;
   `ORNITH_COMMIT_EVERY=N` sets the commit size (`N=1` attributes GPU time per
   kernel, and is ~3x slower); `ORNITH_SERIAL=1` puts back the serial encoder

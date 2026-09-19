@@ -5165,10 +5165,16 @@ replaces used to.
       command buffers     11                      8
       distinct kernels    33                      28
 
-**-300 dispatches, -178 barriers, -181 epochs, -3 command buffers, and
--0.35 GPU ms a token, 3 of 3 pairs and 16 of 16 pairs.** 125 tok/s to 130.
-All of it is the front-end kernel: the trunk A/B puts it at -0.330 and
--0.346, and what is left over for `rms_gated` is zero.
+**-300 dispatches, -178 barriers, -181 epochs, -3 command buffers, and -0.35
+GPU ms a token** -- 3 of 3 end-to-end pairs, and 16 of 16 on the trunk. All
+of it is the front-end kernel: the trunk A/B puts that at -0.330 and -0.346
+and what is left over for `rms_gated` is zero.
+
+The tok/s column is read within its own sitting and not against Phase 32's:
+**123-125 to 130 here**, where Phase 32's control arm read 117 and its fused
+arm 125 on a differently loaded machine. The counters are the numbers that
+travel between sittings, and the paired GPU ms is the number that travels
+inside one.
 
 ### The forecast, and why it was wrong by more than two
 
@@ -5230,8 +5236,9 @@ arithmetic: `rmsbfloat16` 111 -> **21** (60 absorbed into `gdn_front`, 30 into
 50 -> **20**, and `concat_time`, `depthwise_conv_1d`, `silu_`, `gdn_beta`,
 `compute_g` all -> **0**.
 
-`swiglu` is now 0.78 us a dispatch, which is Phase 32's 0.64 again: the
-textbook fusion is still the worst-paid one in the step.
+`swiglu` is 0.78 us a dispatch against Phase 32's 0.64: the textbook fusion,
+an activation into its consumer matvec, is still the worst-paid one in the
+step and is the last thing here worth a kernel.
 
 ### The decision this phase was to make: the deferred op layer
 
