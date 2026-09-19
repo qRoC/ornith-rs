@@ -55,6 +55,8 @@ const PROMPT: &str = "Explain in one paragraph why a mixture-of-experts model \
 const WARM_STEPS: usize = 8;
 /// Whole-step repetitions. A step is ~8 ms, so this is ~0.2 s a cell.
 const REPS: usize = 24;
+/// The same for a prefill chunk, which is ~0.45 s on its own.
+const PREFILL_REPS: usize = 1;
 /// Draws of each whole-step cell, interleaved; the median is the number.
 const DRAWS: usize = 3;
 
@@ -195,22 +197,55 @@ fn main() {
     drop(ws);
     println!("{}\n{}", dir.display(), ctx.device_name());
 
+    // The two objects this bin can measure, and they are the same
+    // `model_call` at two widths: **a decode step** is one token against a
+    // warm cache, and **a prefill chunk** is `prefill_step_size` tokens
+    // against an empty one -- the first call `prefill` makes, and the one
+    // every later chunk is a longer-context version of. Everything below --
+    // the clamp and its free control, the per-dispatch join, the census, the
+    // boundary, every A/B -- applies to both without knowing which it has.
+    //
+    // They are not the same shape of computation, which is the point:
+    // `REBUILD.md` Phase 33 found one kernel worth 5.7% of a prompt where it
+    // was worth 4.3% of a step, and for a different reason.
+    let prefill_mode = std::env::args().any(|a| a == "prefill");
+    let width = prefill_step_size();
+    let reps = if prefill_mode { PREFILL_REPS } else { REPS };
+
     let hsize = cfg.hidden_size;
     let ids = tok.encode(PROMPT);
     let mut caches = model.make_cache();
-    let processed =
-        prefill(&ctx, &model, &mut caches, &ids, prefill_step_size(), None, &mut |_, _| {});
-    let (mut hidden, _) = model_call(&ctx, &model, &mut caches, &ids[processed..], None);
-    let rows = hidden.numel() / hsize;
-    let h = hidden.reshape(&[rows, hsize]).slice_leading(rows - 1, 1);
-    let mut primary = ornith_rs::ops::sample::greedy_token(&ctx, &model.lm_head.matmul(&ctx, &h));
-    for _ in 0..WARM_STEPS {
-        let (nh, _) = model_call(&ctx, &model, &mut caches, &[primary], None);
-        hidden = nh;
+    let work: Vec<u32> = if prefill_mode {
+        // A chunk's worth of real text rather than random ids: the router
+        // sends tokens to experts by what they are, and the expert gather's
+        // traffic is most of what a chunk reads.
+        let mut long = String::new();
+        let mut w: Vec<u32> = Vec::new();
+        while w.len() < width {
+            long.push_str(PROMPT);
+            long.push(' ');
+            w = tok.encode(&long);
+        }
+        w.truncate(width);
+        println!("\na prefill chunk: {width} tokens against an empty cache");
+        w
+    } else {
+        let processed =
+            prefill(&ctx, &model, &mut caches, &ids, prefill_step_size(), None, &mut |_, _| {});
+        let (mut hidden, _) = model_call(&ctx, &model, &mut caches, &ids[processed..], None);
         let rows = hidden.numel() / hsize;
         let h = hidden.reshape(&[rows, hsize]).slice_leading(rows - 1, 1);
-        primary = ornith_rs::ops::sample::greedy_token(&ctx, &model.lm_head.matmul(&ctx, &h));
-    }
+        let mut primary =
+            ornith_rs::ops::sample::greedy_token(&ctx, &model.lm_head.matmul(&ctx, &h));
+        for _ in 0..WARM_STEPS {
+            let (nh, _) = model_call(&ctx, &model, &mut caches, &[primary], None);
+            hidden = nh;
+            let rows = hidden.numel() / hsize;
+            let h = hidden.reshape(&[rows, hsize]).slice_leading(rows - 1, 1);
+            primary = ornith_rs::ops::sample::greedy_token(&ctx, &model.lm_head.matmul(&ctx, &h));
+        }
+        vec![primary]
+    };
     ctx.sync();
     let base = snapshot(&caches);
     // The trace and the times describe whichever code paths are in force, so
@@ -249,13 +284,20 @@ fn main() {
                     ctx,
                     &model,
                     caches,
-                    &[primary],
+                    &work[work.len() - 1..],
                     &mut ornith_rs::generate::Greedy,
                     None,
                 );
                 std::hint::black_box(y);
+            } else if prefill_mode {
+                // `prefill` runs its chunks inside `without_window`, so the
+                // measured stream is the one the model really issues.
+                let hh = ornith_rs::ops::invariant::without_window(|| {
+                    model_call(ctx, &model, caches, &work, None).0
+                });
+                std::hint::black_box(&hh);
             } else {
-                let (hh, _) = model_call(ctx, &model, caches, &[primary], None);
+                let (hh, _) = model_call(ctx, &model, caches, &work, None);
                 std::hint::black_box(&hh);
             }
         };
@@ -263,13 +305,13 @@ fn main() {
         restore(caches, &base);
         ctx.sync();
         ctx.prof_reset();
-        for _ in 0..REPS {
+        for _ in 0..reps {
             run(caches);
             restore(caches, &base);
         }
         ctx.sync();
         let (_, disp, gpu, _) = ctx.prof_totals();
-        (gpu * 1e3 / REPS as f64, disp as f64 / REPS as f64)
+        (gpu * 1e3 / reps as f64, disp as f64 / reps as f64)
     };
 
     println!("\nthe step, and the same dispatches with their work removed\n");
@@ -278,9 +320,14 @@ fn main() {
         "", "GPU ms", "clamped", "work ms", "issue", "dispatches"
     );
     let mut level = [(0.0f64, 0.0f64, 0.0f64); 2];
-    for (j, (name, head)) in [("trunk (model_call)", false), ("a decode step, head and all", true)]
-        .into_iter()
-        .enumerate()
+    // A prefill chunk has no head: `prefill` throws the logits away and only
+    // the last chunk's last row is ever sampled from.
+    let objects: &[(&str, bool)] = if prefill_mode {
+        &[("the chunk (model_call)", false)]
+    } else {
+        &[("trunk (model_call)", false), ("a decode step, head and all", true)]
+    };
+    for (j, (name, head)) in objects.iter().copied().enumerate()
     {
         let (mut real, mut floor) = (Vec::new(), Vec::new());
         let (mut dr, mut df) = (0.0, 0.0);
@@ -834,7 +881,13 @@ fn main() {
     restore(&mut caches, &base);
     ctx.sync();
     ctx.prof_trace_start();
-    let (hh, _) = model_call(&ctx, &model, &mut caches, &[primary], None);
+    let hh = if prefill_mode {
+        ornith_rs::ops::invariant::without_window(|| {
+            model_call(&ctx, &model, &mut caches, &work, None).0
+        })
+    } else {
+        model_call(&ctx, &model, &mut caches, &work, None).0
+    };
     std::hint::black_box(&hh);
     ctx.sync();
     let trace = ctx.prof_trace();
@@ -844,7 +897,13 @@ fn main() {
     let time_one = |ctx: &Context, caches: &mut [LayerCache]| -> Vec<(String, f64)> {
         ctx.sync();
         ctx.prof_trace_start();
-        let (hh, _) = model_call(ctx, &model, caches, &[primary], None);
+        let hh = if prefill_mode {
+            ornith_rs::ops::invariant::without_window(|| {
+                model_call(ctx, &model, caches, &work, None).0
+            })
+        } else {
+            model_call(ctx, &model, caches, &work, None).0
+        };
         std::hint::black_box(&hh);
         ctx.sync();
         ctx.prof_per_dispatch()
