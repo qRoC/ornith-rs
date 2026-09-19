@@ -188,6 +188,19 @@ fn the_indexed_moe_block_is_the_copied_one() {
             if sg.gather_reads_lhs(t * k, true) { "reads" } else { "ignores" },
         );
     }
+    // And whether the copy that is left takes its wide path here. The `wide`
+    // arm of the loop below is only a control if this says yes -- a guard
+    // that answers "narrow" to both arms makes the pair green and empty.
+    {
+        let x = case.array(&ctx, &format!("x_t{}", sorted[0]));
+        let dim = x.dim(-1);
+        let x2 = x.reshape(&[sorted[0], dim]);
+        assert!(
+            ornith_rs::ops::moe::gather_would_widen(&x2, dim),
+            "the wide gather is guarded off here, so the `wide` arm below is not a control"
+        );
+        eprintln!("the copy takes its 16-byte path (offset {}, dim {dim})", x2.offset);
+    }
 
     for &t in &sorted {
         let x = case.array(&ctx, &format!("x_t{t}"));

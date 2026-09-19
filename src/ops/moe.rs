@@ -354,7 +354,7 @@ fn glu(
 /// touches a value.
 fn gather_rows(ctx: &Context, x: &Array, order: &Array, xs: &Array, dim: usize, k: usize) {
     let lanes = 16 / x.dtype.size();
-    let wide = gather_wide() && lanes > 0 && dim % lanes == 0;
+    let wide = gather_wide() && vec16(x, dim) && vec16(xs, dim);
     let n = if wide { xs.numel() / lanes } else { xs.numel() };
     let (grid, tg) = flat(n);
     let name = if wide { "gather_rows_div_wide" } else { "gather_rows_div" };
@@ -365,6 +365,32 @@ fn gather_rows(ctx: &Context, x: &Array, order: &Array, xs: &Array, dim: usize, 
         .bytes(&(dim as u32))
         .bytes(&(k as u32))
         .threads(grid, tg);
+}
+
+/// Whether a 16-byte vector access is legal on this array at this row width.
+///
+/// Two conditions and the first version of the wide copy only had the
+/// second. A row must be a whole number of vectors, **and the base must be
+/// 16-byte aligned** -- and an [`Array`] is not always at the start of its
+/// buffer. `slice_leading`, `slice_inner` and the expert views all carry a
+/// byte `offset`, which `setBuffer:offset:` passes straight through, so the
+/// pointer the kernel sees is `base + offset`. A bf16 view starting at an
+/// odd element is 2-byte aligned, and reading a 16-byte vector from it is
+/// undefined rather than slow. Nothing in the model reaches these kernels
+/// through such a view today; this is so that nothing has to check again.
+fn vec16(a: &Array, dim: usize) -> bool {
+    let lanes = 16 / a.dtype.size();
+    lanes > 0 && dim % lanes == 0 && a.offset % 16 == 0
+}
+
+/// Whether [`gather_rows`] would take the wide path for this array and row
+/// width, exposed so a test can say which path it covered.
+///
+/// A green A/B between "wide" and "narrow" proves nothing if the guard has
+/// quietly answered "narrow" to both, which is the working note about
+/// checking that a control actually applied, one level down.
+pub fn gather_would_widen(a: &Array, dim: usize) -> bool {
+    gather_wide() && vec16(a, dim)
 }
 
 /// Whether the gather moves sixteen bytes a thread. See [`gather_rows`].
@@ -392,7 +418,7 @@ fn unsort_rows(ctx: &Context, y: &Array, inv: &Array) -> Array {
     let (rows, dim) = (y.shape[0], y.shape[1]);
     let out = Array::empty(ctx, &[rows, dim], y.dtype);
     let lanes = 16 / y.dtype.size();
-    let wide = gather_wide() && lanes > 0 && dim % lanes == 0;
+    let wide = gather_wide() && vec16(y, dim) && vec16(&out, dim);
     let n = if wide { out.numel() / lanes } else { out.numel() };
     let (grid, tg) = flat(n);
     let name = if wide { "unsort_rows_wide" } else { "unsort_rows" };

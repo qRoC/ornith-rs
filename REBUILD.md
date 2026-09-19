@@ -6039,6 +6039,24 @@ that a control actually applied, and check it by a count" has a second half
 now: **check that the output exists**, and print the byte count beside the
 hash. The kernel is back under its own name.
 
+**A 16-byte load needs a 16-byte base, and an `Array` is not always at the
+start of its buffer.** The wide copies cast to a 16-byte vector type, and
+the first version guarded only on the *row* being a whole number of
+vectors. An `Array` carries a byte `offset` -- `slice_leading`,
+`slice_inner` and every expert view set one, and `setBuffer:offset:`
+passes it straight to the kernel -- so a bf16 view starting at an odd
+element is 2-byte aligned and a 16-byte read from it is undefined rather
+than slow. Nothing in the model reaches these kernels through such a view,
+which is why every test passed; the guard is now `offset % 16 == 0` as
+well, so nothing has to check again.
+
+**And the guard then needs its own check, one level down.** A guard that
+answers "narrow" to both arms makes the wide/narrow pair green and empty
+-- the working note about controls, applied to the thing that chooses the
+control. `moe::gather_would_widen` exists so the test can *assert* the
+wide path is live and print the offset it saw (`offset 0, dim 2048`),
+rather than leaving it to the reader to believe.
+
 **And a negative result's control expires when the thing it controls gets
 faster.** Nothing was wrong with the first A/B when it was run. It stopped
 being right fifteen lines later, and the only reason it was re-run is that
@@ -6082,13 +6100,22 @@ all of them the way Phase 36 widened the copies might return ~2% of a
 chunk. Everything else is already at the ceiling: `add_rms` 425 GB/s,
 `block_softmax` 404, `gdn_front` 298.
 
-The one thing still unmeasured is the direct old-against-new prompt pair,
-which was attempted and thrown away because the machine went to a load
-average of 15 with another session's Spotlight index and four Python
-processes on it -- the same control arm that had read 4.22-4.27 GPU s an
-hour earlier read 4.57-5.48. The affine figure above is composed from the
-two clean pairs instead, and says so. It is confirmatory now: the
-inventory's own counters say the same thing from the other side.
+The direct old-against-new prompt pair was attempted once and thrown away,
+because the machine went to a load average of 15 with another session's
+Spotlight index and four Python processes on it -- the same control arm
+that had read 4.22-4.27 GPU s an hour earlier read 4.57-5.48. **Taken
+again on a quiet machine (load 3.8) it is:**
+
+    a 6621-token prompt, affine parent, three interleaved pairs
+
+      Phase 35's stream   4.45  4.47  4.45
+      as it ships now     3.99  3.96  3.99
+      -0.48 s, -10.7%, 3 of 3 down, byte-identical
+
+which is the composed chain's -10.8% measured directly, one pair of its
+ends. (The level is 5% above the earlier sitting's in both arms -- 4.45
+against 4.26 -- so the ratio travels and the level does not, as usual.)
+**Every measurement this phase owed is now taken.**
 
 `gather_rows_div_wide` is still issued 40 times a chunk on the affine
 parent, because mlx's sorted kernel cannot be handed a permutation. Giving
