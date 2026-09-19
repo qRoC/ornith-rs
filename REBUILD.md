@@ -6050,16 +6050,45 @@ the side where *the control itself* is the thing that moved.
 
 ### What is left in it
 
-**Two things this phase measured and two it did not** (one of which Phase
-37 then spent -- `add_rms` above is settled). The per-dispatch
-inventory was re-taken *before* the change and not after, so what a chunk
-is made of now -- and what the next-largest row in it is -- is unmeasured;
-and the direct old-against-new prompt pair was attempted and thrown away,
-because the machine went to a load average of 15 with another session's
-Spotlight index and four Python processes on it, and the same control arm
-that had read 4.22-4.27 GPU s an hour earlier read 4.57-5.48. The affine
-figure above is composed from the two clean pairs instead, and says so.
-Both are a sitting's work on a quiet machine, not a question.
+**Two things this phase measured and two it did not**, and Phase 37 later
+spent both of the second pair but one. `add_rms` above is settled (zero).
+And the per-dispatch inventory has now been re-taken *after* the change,
+on the same artifact:
+
+    a prefill chunk, q6k-full, after -- against the same table before
+
+                        before              after
+      the chunk, real   1410.4 ms   1505    1351.4 ms   1425 dispatches
+      inflated          1563.8              1574.6
+      gemm / matvec        80.9%               89.4%
+      data moving          12.8%                3.8%
+      everything else       6.3%                6.7%
+
+`gather_rows_div` and `unsort_rows` are not in the table at all, and the
+movement bucket falls from 12.8% of the stream to **3.8%** -- which is the
+change, counted by the instrument rather than by the A/B.
+
+**And the indirection's own price, which the A/B could only see net.**
+`moe_combine_rows` costs **328 us a dispatch against `moe_combine`'s
+284.6**, so reading `y` through a permutation costs ~1.75 ms a chunk --
+against the 78.9 ms of `unsort_rows` it removes. (Two runs at nearly the
+same inflated level, 1574.6 against 1563.8, so the comparison is about as
+fair as this table gets.)
+
+**What is left in the movement bucket, and it is small.** `swiglu` 21.4 ms
+at 106 GB/s, `slice_inner` 13.0 at 78, the two transposes 12.4 at 54-68,
+`sigmoid_gate` 4.8 at 105 -- ~52 ms, **3.3% of the stream**, and widening
+all of them the way Phase 36 widened the copies might return ~2% of a
+chunk. Everything else is already at the ceiling: `add_rms` 425 GB/s,
+`block_softmax` 404, `gdn_front` 298.
+
+The one thing still unmeasured is the direct old-against-new prompt pair,
+which was attempted and thrown away because the machine went to a load
+average of 15 with another session's Spotlight index and four Python
+processes on it -- the same control arm that had read 4.22-4.27 GPU s an
+hour earlier read 4.57-5.48. The affine figure above is composed from the
+two clean pairs instead, and says so. It is confirmatory now: the
+inventory's own counters say the same thing from the other side.
 
 `gather_rows_div_wide` is still issued 40 times a chunk on the affine
 parent, because mlx's sorted kernel cannot be handed a permutation. Giving
