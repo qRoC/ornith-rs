@@ -506,6 +506,52 @@ fn main() {
     ornith_rs::ops::kquant::set_rmsgate_nr0(want_nr0);
     ornith_rs::ops::kquant::set_fuse_norm_proj(want_norm_proj);
 
+    // --- and the width ggml chose for the mat-vec, which nobody re-checked --
+    //
+    // `N_SG = N_R0 = 2` has been in this port since Q4_K landed, on the
+    // assumption that ggml tuned it. It was not tuned on this machine. The
+    // sweep is free of the exactness question -- the width decides which
+    // threadgroup owns which output row and nothing else, which `tests/q4k`
+    // holds to `max_abs == 0.0` -- so this is a pure schedule measurement.
+    for (what, set, get) in [
+        (
+            "the plain mat-vec",
+            ornith_rs::ops::kquant::set_qmv_shape
+                as fn(usize, usize) -> (usize, usize),
+            ornith_rs::ops::kquant::qmv_shape as fn() -> (usize, usize),
+        ),
+        (
+            "the routed mat-vec",
+            ornith_rs::ops::kquant::set_gather_qmv_shape
+                as fn(usize, usize) -> (usize, usize),
+            ornith_rs::ops::kquant::gather_qmv_shape as fn() -> (usize, usize),
+        ),
+    ] {
+        println!("\n{what}: rows a simdgroup x simdgroups a threadgroup\n");
+        println!("  {:<26} {:>9} {:>11} {:>7}", "shape", "GPU ms", "mean pair", "down");
+        let want = get();
+        for (nr0, nsg) in [(2usize, 2usize), (4, 2), (2, 4), (4, 4), (8, 4)] {
+            let (mut on, mut base) = (Vec::new(), Vec::new());
+            for _ in 0..ab_draws {
+                set(2, 2);
+                base.push(step(&ctx, &mut caches, false).0);
+                set(nr0, nsg);
+                on.push(step(&ctx, &mut caches, false).0);
+            }
+            let pairs: Vec<f64> = on.iter().zip(&base).map(|(f, a)| f - a).collect();
+            let mean = pairs.iter().sum::<f64>() / pairs.len() as f64;
+            println!(
+                "  {:<26} {:>9.3} {mean:>11.3} {:>4}/{}{}",
+                format!("{nr0} x {nsg}"),
+                median(&mut on.clone()),
+                pairs.iter().filter(|d| **d < 0.0).count(),
+                pairs.len(),
+                if (nr0, nsg) == (2, 2) { "   <- ggml's, and its own zero" } else { "" },
+            );
+        }
+        set(want.0, want.1);
+    }
+
     // --- the boundary, measured before anything is built --------------------
     //
     // Everything else here prices one class at a time, and a fusion returns
