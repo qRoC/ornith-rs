@@ -124,7 +124,7 @@ pub fn gated_delta_kernel_unpacked(
     beta: &Array,
     state: &Array,
 ) -> (Array, Array) {
-    gated_delta_impl(ctx, q, k, v, g, beta, state, None, false)
+    gated_delta_impl(ctx, q, k, v, g, beta, state, None, false, None)
 }
 
 /// `gated_delta_kernel`: `_gated_delta_kernel_impl` with `allow_packed=true`.
@@ -138,7 +138,53 @@ pub fn gated_delta_kernel(
     state: &Array,
     mask: Option<&Array>,
 ) -> (Array, Array) {
-    gated_delta_impl(ctx, q, k, v, g, beta, state, mask, true)
+    gated_delta_impl(ctx, q, k, v, g, beta, state, mask, true, None)
+}
+
+/// The same, writing `y` into a caller's array instead of a fresh one.
+///
+/// For a speculative capture, which runs this once per token and then has to
+/// put the `T` one-token outputs back together: handed a row of a `[B, T, Hv,
+/// Dv]` buffer, the kernel writes where the concatenation would have copied
+/// it to, and there is nothing left to concatenate. The kernel is the same
+/// kernel and the arithmetic is the same arithmetic -- only the destination
+/// address moves, so this cannot change a value.
+///
+/// `dst` must have the shape `y` would have had; a row of a larger buffer
+/// qualifies, since an `Array` carries its own offset.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_kernel_into(
+    ctx: &Context,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    mask: Option<&Array>,
+    dst: &Array,
+) -> (Array, Array) {
+    gated_delta_impl(ctx, q, k, v, g, beta, state, mask, true, Some(dst))
+}
+
+/// [`gated_delta_update`] writing into a caller's array. See
+/// [`gated_delta_kernel_into`].
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_update_into(
+    ctx: &Context,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    a: &Array,
+    b: &Array,
+    a_log: &Array,
+    dt_bias: &Array,
+    state: &Array,
+    dst: &Array,
+) -> (Array, Array) {
+    let beta = beta(ctx, b);
+    let g = compute_g(ctx, a_log, a, dt_bias);
+    gated_delta_kernel_into(ctx, q, k, v, &g, &beta, state, None, dst)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -152,6 +198,7 @@ fn gated_delta_impl(
     state: &Array,
     mask: Option<&Array>,
     allow_packed: bool,
+    dst: Option<&Array>,
 ) -> (Array, Array) {
     let (b, t, hk, dk) = (k.shape[0], k.shape[1], k.shape[2], k.shape[3]);
     let (hv, dv) = (v.shape[2], v.shape[3]);
@@ -159,7 +206,14 @@ fn gated_delta_impl(
     assert_eq!(state.dtype, Dtype::F32, "mamba_ssm_dtype is float32");
     assert_eq!(g.dtype, Dtype::F32);
 
-    let y = Array::empty(ctx, &[b, t, hv, dv], q.dtype);
+    let y = match dst {
+        Some(d) => {
+            assert_eq!(d.shape, vec![b, t, hv, dv], "gated delta: dst is the wrong shape");
+            assert_eq!(d.dtype, q.dtype, "gated delta: dst is the wrong dtype");
+            d.clone()
+        }
+        None => Array::empty(ctx, &[b, t, hv, dv], q.dtype),
+    };
     let state_out = Array::empty(ctx, &state.shape, state.dtype);
 
     // `packed_eligible` from mlx-lm: no mask, scalar gate, Dk == 128,

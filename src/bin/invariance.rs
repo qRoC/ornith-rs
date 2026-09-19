@@ -358,7 +358,7 @@ fn rewound(
         restore(&mut caches, &snap);
         let ids = Array::from_slice(ctx, &chunk[..w], &[w], Dtype::U32);
         let (_, _, cap) = model.forward_capture(ctx, &ids, &mut caches);
-        cap.rewind(&mut caches, keep);
+        cap.rewind(&ctx, &mut caches, keep);
 
         // The next token, from a rewound cache against an untouched one.
         let (l, h) = forward_rows(ctx, model, &mut caches, &[chunk[keep]], false);

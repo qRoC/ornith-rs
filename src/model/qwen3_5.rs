@@ -18,7 +18,7 @@ use crate::array::{Array, Dtype};
 use crate::metal::Context;
 use crate::ops::elementwise::{add, precise_swiglu, scalar_mul, sigmoid_gate, silu};
 use crate::ops::embedding::embedding;
-use crate::ops::gdn::{concat_time, depthwise_conv1d, gated_delta_update};
+use crate::ops::gdn::{concat_time, depthwise_conv1d, gated_delta_update, gated_delta_update_into};
 use crate::ops::layout::{slice_inner, transpose_hl, transpose_lh};
 use crate::ops::moe::sparse_moe_block;
 use crate::ops::norm::rms_norm;
@@ -183,20 +183,29 @@ impl TextModel {
     ) -> (Array, Array, TrunkCapture) {
         let n = ids.numel();
         let base_offsets: Vec<usize> = caches.iter().map(|c| c.offset()).collect();
-        let mut gdn: Vec<Vec<(Array, Array)>> = vec![Vec::new(); caches.len()];
+        let mut gdn: Vec<Option<GdnSnaps>> = (0..caches.len()).map(|_| None).collect();
         let mut h = embedding(ctx, &self.embed_tokens, ids).reshape(&[1, n, self.cfg.hidden_size]);
         for (i, layer) in self.layers.iter().enumerate() {
             h = match &layer.mixer {
                 Mixer::Linear(_) => {
                     let (out, snaps) = layer.forward_capture(ctx, &self.cfg, &h, &mut caches[i]);
-                    gdn[i] = snaps;
+                    gdn[i] = Some(snaps);
                     out
                 }
                 Mixer::Full(_) => layer.forward(ctx, &self.cfg, &h, &mut caches[i]),
             };
         }
         let normed = rms_norm(ctx, &h, Some(&self.norm), self.cfg.rms_norm_eps);
-        (normed, h, TrunkCapture { gdn, base_offsets, tokens: n })
+        (
+            normed,
+            h,
+            TrunkCapture {
+                gdn,
+                base_offsets,
+                tokens: n,
+                n_keep: self.cfg.linear_conv_kernel_dim - 1,
+            },
+        )
     }
 
     pub fn forward_hidden(
@@ -242,21 +251,39 @@ impl TextModel {
 /// This is only affordable because the packed recurrence kernel is a strict
 /// `for (t = 0; t < T; ++t)` over tokens carrying the state in registers, so
 /// stepping it one token at a time is bit-identical to one T-token call -- and
-/// each step already allocates its own state and conv window, so a snapshot is
-/// a reference, not a copy.
+/// each step already allocates its own state, so *that* snapshot is a
+/// reference rather than a copy.
+///
+/// **The conv window was not, until Phase 29.** It used to be sliced out of
+/// `conv_input` once per token -- `T` dispatches a layer, of which `rewind`
+/// reads exactly one, since a cycle commits one prefix. `conv_input` is
+/// already materialised and is 114 KB a layer against the 49 KB a snapshot,
+/// so keeping it whole and slicing at rewind is both fewer dispatches and
+/// less memory.
 pub struct TrunkCapture {
-    /// Per layer, per token: the gated-delta `(conv, state)` after that token.
-    /// Empty for a full-attention layer.
-    gdn: Vec<Vec<(Array, Array)>>,
+    /// Per gated-delta layer: the whole conv input, and the recurrent state
+    /// after each token. `None` for a full-attention layer.
+    gdn: Vec<Option<GdnSnaps>>,
     /// Each cache's offset before the forward.
     base_offsets: Vec<usize>,
     pub tokens: usize,
+    /// `linear_conv_kernel_dim - 1`: the rows of `conv_input` a cache keeps.
+    n_keep: usize,
+}
+
+/// What one gated-delta layer hands the capture.
+pub struct GdnSnaps {
+    /// `[B, T + n_keep, qkv]`: the conv window the layer entered with,
+    /// followed by this window's tokens. Any token's conv state is a slice.
+    conv_input: Array,
+    /// The recurrent state after each token, as the kernel wrote it.
+    states: Vec<Array>,
 }
 
 impl TrunkCapture {
     /// Rewind every cache to the state it would have had after `keep` of the
     /// `tokens` this forward consumed.
-    pub fn rewind(&self, caches: &mut [LayerCache], keep: usize) {
+    pub fn rewind(&self, ctx: &Context, caches: &mut [LayerCache], keep: usize) {
         assert!(keep <= self.tokens);
         for (i, cache) in caches.iter_mut().enumerate() {
             match cache {
@@ -269,9 +296,13 @@ impl TrunkCapture {
                         // does, since the primary is always committed.
                         panic!("a speculative window always commits its first token");
                     }
-                    let (conv, state) = &self.gdn[i][keep - 1];
-                    c.conv = Some(conv.clone());
-                    c.state = Some(state.clone());
+                    let snaps = self.gdn[i].as_ref().expect("a gdn layer without snapshots");
+                    // The conv window after token `keep - 1` is the last
+                    // `n_keep` rows of everything consumed up to and including
+                    // it -- one slice, taken now that `keep` is known, instead
+                    // of `T` slices taken when it was not.
+                    c.conv = Some(slice_time(ctx, &snaps.conv_input, keep, self.n_keep));
+                    c.state = Some(snaps.states[keep - 1].clone());
                     c.offset = self.base_offsets[i] + keep;
                 }
             }
@@ -320,7 +351,7 @@ impl DecoderLayer {
         cfg: &TextConfig,
         x: &Array,
         cache: &mut LayerCache,
-    ) -> (Array, Vec<(Array, Array)>) {
+    ) -> (Array, GdnSnaps) {
         let Mixer::Linear(g) = &self.mixer else { panic!("not a gated-delta layer") };
         let normed = rms_norm(ctx, x, Some(&self.input_layernorm), cfg.rms_norm_eps);
         let (r, snaps) = g.forward_capture(ctx, cfg, &normed, cache.as_gdn());
@@ -463,7 +494,7 @@ impl GatedDeltaNet {
         cfg: &TextConfig,
         x: &Array,
         cache: &mut super::cache::GdnCache,
-    ) -> (Array, Vec<(Array, Array)>) {
+    ) -> (Array, GdnSnaps) {
         let (b, s) = (x.shape[0], x.shape[1]);
         let hk = cfg.linear_num_key_heads;
         let hv = cfg.linear_num_value_heads;
@@ -493,10 +524,14 @@ impl GatedDeltaNet {
         let k = scalar_mul(ctx, &rms_norm(ctx, &k, None, 1e-6), inv_scale);
 
         let mut state = cache.state_or_zeros(ctx, cfg, b);
-        let mut snaps: Vec<(Array, Array)> = Vec::with_capacity(s);
-        let mut outs: Vec<Array> = Vec::with_capacity(s);
+        let mut states: Vec<Array> = Vec::with_capacity(s);
+        // The `T` one-token outputs, written where a concatenation would have
+        // copied them: each step is handed row `t` of this buffer, so the
+        // window comes out assembled. Same kernel, same arithmetic, different
+        // destination address.
+        let out = Array::empty(ctx, &[b, s, hv, dv], x.dtype);
         for t in 0..s {
-            let (out_t, next) = gated_delta_update(
+            let (_, next) = gated_delta_update_into(
                 ctx,
                 &slice_head(ctx, &q, t),
                 &slice_head(ctx, &k, t),
@@ -506,25 +541,32 @@ impl GatedDeltaNet {
                 &self.a_log,
                 &self.dt_bias,
                 &state,
-                None,
+                &out_row(&out, t),
             );
-            // The conv window after token t is the last `kernel - 1` rows of
-            // everything consumed up to and including it.
-            let conv_t = slice_time(ctx, &conv_input, t + 1, n_keep);
-            snaps.push((conv_t, next.clone()));
-            outs.push(out_t);
+            // The conv window after token `t` is a slice of `conv_input`,
+            // and `rewind` needs exactly one of them -- so it is not taken
+            // here. See `TrunkCapture`.
+            states.push(next.clone());
             state = next;
         }
         cache.conv = Some(slice_time(ctx, &conv_input, s, n_keep));
         cache.state = Some(state);
         cache.offset += s;
 
-        let out = concat_all_time(ctx, &outs);
         let normed = rms_norm(ctx, &out, Some(&self.norm), cfg.rms_norm_eps);
         let gated = precise_swiglu(ctx, &z, &normed);
         let y = self.out_proj.matmul(ctx, &gated.reshape(&[b, s, hv * dv]));
-        (y, snaps)
+        (y, GdnSnaps { conv_input, states })
     }
+}
+
+/// Row `t` of a `[B, T, Hv, Dv]` output buffer, as a `[1, 1, Hv, Dv]` view.
+///
+/// The buffer is contiguous and an `Array` carries its own offset, so this
+/// costs nothing and a kernel handed it writes into the middle of the window.
+fn out_row(out: &Array, t: usize) -> Array {
+    let (tt, hv, dv) = (out.shape[1], out.shape[2], out.shape[3]);
+    out.reshape(&[tt, hv * dv]).slice_leading(t, 1).reshape(&[1, 1, hv, dv])
 }
 
 /// `x[:, t:t + 1]` for a `[B, T, H, D]` array, which is contiguous, so this is
@@ -537,29 +579,11 @@ fn slice_head(ctx: &Context, x: &Array, t: usize) -> Array {
     x.reshape(&[tt, h * d]).slice_leading(t, 1).reshape(&[1, 1, h, d])
 }
 
-/// `mx.concatenate(parts, axis=1)`.
-fn concat_all_time(ctx: &Context, parts: &[Array]) -> Array {
-    assert!(!parts.is_empty());
-    let mut it = parts.iter();
-    let mut acc = it.next().unwrap().clone();
-    for p in it {
-        acc = concat_time_4d(ctx, &acc, p);
-    }
-    acc
-}
-
-/// `concat_time` for the `[B, T, H, D]` recurrence output, which is the same
-/// move over a flattened inner dimension.
-fn concat_time_4d(ctx: &Context, a: &Array, b: &Array) -> Array {
-    let (bs, h, d) = (a.shape[0], a.shape[2], a.shape[3]);
-    let (ta, tb) = (a.shape[1], b.shape[1]);
-    let joined = concat_time(
-        ctx,
-        &a.reshape(&[bs, ta, h * d]),
-        &b.reshape(&[bs, tb, h * d]),
-    );
-    joined.reshape(&[bs, ta + tb, h, d])
-}
+/// (`concat_all_time` and `concat_time_4d` lived here until Phase 29. They
+/// put the capture's `T` one-token recurrence outputs back together, which is
+/// work that only existed because the outputs arrived apart: the kernel now
+/// writes each one into its row of the window buffer, so there is nothing
+/// left to join. Nothing else called them.)
 
 /// `x[:, -n:, :]` for a `[B, T, D]` array.
 fn keep_tail(ctx: &Context, x: &Array, n: usize) -> Array {

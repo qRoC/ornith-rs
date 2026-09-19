@@ -280,7 +280,7 @@ pub fn generate_step_mtp(
 
         // The window put `drafts.len() + 1` tokens into the caches and
         // `k + 1` of them are committed.
-        capture.rewind(caches, k + 1);
+        capture.rewind(ctx, caches, k + 1);
         let vrows = vh.numel() / hsize;
         if policy == HistoryPolicy::Committed {
             // Drop every row this cycle drafted except the first -- that one

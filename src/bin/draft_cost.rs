@@ -379,7 +379,7 @@ fn main() {
         let (row_ms, _) = gpu_ms_n(&ctx, VERIFY_REPS, || {
             let (vh, _, capture) = model.forward_capture(&ctx, &window, &mut caches);
             let _ = model.lm_head.matmul(&ctx, &vh);
-            capture.rewind(&mut caches, 1);
+            capture.rewind(&ctx, &mut caches, 1);
         });
         verify_row_ms[w] = row_ms;
         let (by_row, _) = ctx.prof_kernel_times();
@@ -390,7 +390,7 @@ fn main() {
         let (shared_ms, _) = gpu_ms_n(&ctx, VERIFY_REPS, || {
             let (vh, _, capture) = model.forward_capture(&ctx, &window, &mut caches);
             let _ = model.lm_head.matmul(&ctx, &vh);
-            capture.rewind(&mut caches, 1);
+            capture.rewind(&ctx, &mut caches, 1);
         });
 
         let (by_shared, _) = ctx.prof_kernel_times();
@@ -400,7 +400,7 @@ fn main() {
         let (ms, disp) = gpu_ms_n(&ctx, VERIFY_REPS, || {
             let (vh, _, capture) = model.forward_capture(&ctx, &window, &mut caches);
             let _ = model.lm_head.matmul(&ctx, &vh);
-            capture.rewind(&mut caches, 1);
+            capture.rewind(&ctx, &mut caches, 1);
         });
         verify_ms[w] = ms;
         println!(

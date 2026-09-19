@@ -218,7 +218,7 @@ fn capture_matches_the_packed_forward_inner() {
     let d = compare(&ha.to_vec_f32(&ctx), &hb.to_vec_f32(&ctx));
     assert_eq!(d.max_abs, 0.0, "captured forward vs packed forward: {d}");
 
-    capture.rewind(&mut a, window.len());
+    capture.rewind(&ctx, &mut a, window.len());
     for (i, (ca, cb)) in a.iter().zip(b.iter()).enumerate() {
         use ornith_rs::model::cache::LayerCache;
         assert_eq!(ca.offset(), cb.offset(), "layer {i} offset");
