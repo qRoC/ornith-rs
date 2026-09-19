@@ -225,11 +225,14 @@ fn main() {
     let want_moe_tail = std::env::var("ORNITH_FUSE_MOE_TAIL").as_deref() != Ok("0");
     let want_gdn_front = std::env::var("ORNITH_FUSE_GDN_FRONT").as_deref() != Ok("0");
     let want_gdn_norm = std::env::var("ORNITH_FUSE_GDN_NORM").as_deref() != Ok("0");
+    // The one switch here that is off by default, because it lost.
+    let want_norm_proj = std::env::var("ORNITH_FUSE_NORM_PROJ").as_deref() == Ok("1");
     ornith_rs::ops::norm::set_fuse_add_rms(want_fuse);
     ornith_rs::ops::moe::set_shared_gate_pos(want_gate_pos);
     ornith_rs::ops::moe::set_fuse_moe_tail(want_moe_tail);
     ornith_rs::ops::gdn::set_fuse_gdn_front(want_gdn_front);
     ornith_rs::ops::norm::set_fuse_gdn_norm(want_gdn_norm);
+    ornith_rs::ops::kquant::set_fuse_norm_proj(want_norm_proj);
 
 
     // --- the step, and the same step with the work taken out ---------------
@@ -407,6 +410,10 @@ fn main() {
     println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
     let (mut gon, mut goff) = (Vec::new(), Vec::new());
     let (mut dgon, mut dgoff) = (0.0, 0.0);
+    // With the norm folded into `out_proj` there is no `rms_gated` left for
+    // this cell to fuse, and both arms would be the same stream -- which the
+    // dispatch column would show as a zero difference and nothing else would.
+    let was_np = ornith_rs::ops::kquant::set_fuse_norm_proj(false);
     for _ in 0..ab_draws {
         ornith_rs::ops::norm::set_fuse_gdn_norm(false);
         let (ms, d) = step(&ctx, &mut caches, false);
@@ -417,6 +424,7 @@ fn main() {
         gon.push(ms);
         dgon = d;
     }
+    ornith_rs::ops::kquant::set_fuse_norm_proj(was_np);
     ornith_rs::ops::norm::set_fuse_gdn_norm(want_gdn_norm);
     let pairs: Vec<f64> = gon.iter().zip(&goff).map(|(f, a)| f - a).collect();
     let (a, b) = (median(&mut goff.clone()), median(&mut gon.clone()));
@@ -432,6 +440,71 @@ fn main() {
         pairs.len(),
         100.0 * (b - a) / a,
     );
+
+    // --- and the norm folded into the projection that reads it -------------
+    //
+    // Not a fusion of two elementwise ops but of an elementwise op into a
+    // *matvec*, which is the deferred op layer's own mechanism. The price of
+    // doing it in the consumer rather than in a layer is redundancy: every
+    // threadgroup of the mat-vec normalises the whole activation row.
+    println!("\nthe layer's norm, inside its projection and beside it\n");
+    println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
+    let (mut inside, mut beside) = (Vec::new(), Vec::new());
+    let (mut din, mut dbe) = (0.0, 0.0);
+    for _ in 0..ab_draws {
+        ornith_rs::ops::kquant::set_fuse_norm_proj(false);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        beside.push(ms);
+        dbe = d;
+        ornith_rs::ops::kquant::set_fuse_norm_proj(true);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        inside.push(ms);
+        din = d;
+    }
+    ornith_rs::ops::kquant::set_fuse_norm_proj(want_norm_proj);
+    let pairs: Vec<f64> = inside.iter().zip(&beside).map(|(f, a)| f - a).collect();
+    let (a, b) = (median(&mut beside.clone()), median(&mut inside.clone()));
+    println!("  {:<24} {a:>9.3} {dbe:>11.0}  {beside:.3?}", "its own dispatch");
+    println!("  {:<24} {b:>9.3} {din:>11.0}  {inside:.3?}", "inside out_proj");
+    println!(
+        "  {:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down, {:+.2}%",
+        "so",
+        b - a,
+        din - dbe,
+        pairs.iter().sum::<f64>() / pairs.len() as f64,
+        pairs.iter().filter(|d| **d < 0.0).count(),
+        pairs.len(),
+        100.0 * (b - a) / a,
+    );
+
+    // The one knob the fusion has: how many output rows a threadgroup takes,
+    // which is how many times the prologue repeats. Each width paired against
+    // the unfused arm in the same draw, since that is the thing it has to beat.
+    println!("\n  and by how many times the prologue repeats\n");
+    println!("  {:<26} {:>7} {:>9} {:>11} {:>7}", "rows a threadgroup", "groups", "GPU ms", "mean pair", "down");
+    let want_nr0 = ornith_rs::ops::kquant::rmsgate_nr0();
+    for nr0 in [2usize, 4, 8, 16] {
+        let (mut on, mut off) = (Vec::new(), Vec::new());
+        for _ in 0..ab_draws {
+            ornith_rs::ops::kquant::set_fuse_norm_proj(false);
+            off.push(step(&ctx, &mut caches, false).0);
+            ornith_rs::ops::kquant::set_fuse_norm_proj(true);
+            ornith_rs::ops::kquant::set_rmsgate_nr0(nr0);
+            on.push(step(&ctx, &mut caches, false).0);
+        }
+        let pairs: Vec<f64> = on.iter().zip(&off).map(|(f, a)| f - a).collect();
+        let mean = pairs.iter().sum::<f64>() / pairs.len() as f64;
+        let nsg = if nr0 == 2 { 2 } else { 4 };
+        println!(
+            "  nr0 = {nr0:<20} {:>7} {:>9.3} {mean:>11.3} {:>4}/{}",
+            2048 / (nr0 * nsg),
+            median(&mut on.clone()),
+            pairs.iter().filter(|d| **d < 0.0).count(),
+            pairs.len(),
+        );
+    }
+    ornith_rs::ops::kquant::set_rmsgate_nr0(want_nr0);
+    ornith_rs::ops::kquant::set_fuse_norm_proj(want_norm_proj);
 
     // --- the boundary, measured before anything is built --------------------
     //
