@@ -206,6 +206,12 @@ src/bin/draft_cost.rs      a speculative cycle's two halves measured apart --
 src/bin/window_mv.rs       what a window of rows costs one module: the
                            mat-vec as dispatched against the tile, and
                            against mlx's own choice on an affine module
+src/bin/step_inventory.rs  a decode step's dispatches with their bytes, their
+                           grids, their time and their time with the work
+                           clamped away -- and what one class of them costs
+                           where it actually runs
+kernels/ornith_norm.metal  the residual add and the norm that reads it, in
+                           one dispatch and two outputs
 tools/dump_*.py            golden-reference writers (run against MLX)
 tools/export_probes.py     probe_set.py -> refs/probe_set.json, for the port
 tools/probes_from_logits.py  the port's logits -> probes.bin, and the
@@ -1247,20 +1253,29 @@ under any load and is the number to compare against.
 | `mlx_lm.generate`, same prompt text | 86 | -- |
 
 So the port is now ahead of the reference it was written against rather than
-level with it, by the two changes mlx does not have: the MoE block issued
-interleaved and the buffer pool declining to recycle inside a barrier epoch.
+level with it, by the changes mlx does not have: the MoE block issued
+interleaved, the buffer pool declining to recycle inside a barrier epoch,
+and -- Phase 31 -- the residual add fused into the norm that reads it and the
+shared expert's one-row gate issued where a gather can hide it.
 And the speculative pairing does 14% less GPU work a token than plain decoding
 while only tying on the wall, for the reason in "It does not pay off here".
 
-| a decode step, now | |
-|---|---|
-| GPU busy | 10.3-10.5 ms of a 10.85-11.34 ms wall -- 95-96% |
-| idle between command buffers | 0.47-0.56 ms a token, essentially one round trip |
-| dispatches | 1669 per token, in 14 command buffers (1759 before single-row slices became views) |
-| barriers | 1064 per token (1216 at the 1:1 commit, 1669 before the barrier work) |
-| epochs | 1078 per token, 1.55 dispatches each |
-| host round trips | 1.00 per token |
-| weights read | ~2.83 GB per token, i.e. **272 GB/s** against a measured ceiling of 465 and a sticker of 546 |
+| a decode step, now | affine artifact | `q6k-full`, after Phase 31 |
+|---|---|---|
+| GPU busy | 10.3-10.5 ms of a 10.85-11.34 ms wall -- 95-96% | 7.9-8.1 ms of a 8.3-8.6 ms wall |
+| idle between command buffers | 0.47-0.56 ms a token, essentially one round trip | 0.47 ms |
+| dispatches | 1669 per token, in 14 command buffers (1759 before single-row slices became views) | **1589** in 13 |
+| barriers | 1064 per token (1216 at the 1:1 commit, 1669 before the barrier work) | **986** |
+| epochs | 1078 per token, 1.55 dispatches each | 1001 |
+| host round trips | 1.00 per token | 1.00 |
+| weights read | ~2.83 GB per token, i.e. **272 GB/s** against a measured ceiling of 465 and a sticker of 546 | **1.81 GB** |
+
+**And half of that step is not weight traffic at all.** `REBUILD.md` Phase 31
+measured it rather than estimating it: the same dispatch stream with every
+grid clamped to a single threadgroup -- same barriers, same command buffers,
+no work -- costs **3.4 ms of a 7.5 ms trunk, 46%**, and what is left moves
+1.62 GB at ~400-440 GB/s, which is this machine's ceiling. The section
+"What the dispatches cost" below is the whole of it.
 
 | the prompt, at chunk 2048 | |
 |---|---|
@@ -1281,6 +1296,54 @@ every dispatch is the barrier, and 1669 of them would be **~1.6 ms of the
 dependencies it actually has; that was the one real divergence in the dispatch
 path, and it was about the size of the gap to `mlx_lm`. It is ported now, and
 the rest of this section is what that took.
+
+### What the dispatches cost, measured instead of counted
+
+`REBUILD.md` Phase 31. Three knobs, and the one idea behind all three is to
+run the *same* dispatch stream with one term taken out of it.
+
+- `ORNITH_GRID1=1` / `Context::set_grid1` issues every dispatch with a single
+  threadgroup: it launches, it pays its barrier, and it does none of its
+  work. Its control is free -- a kernel already dispatched over one
+  threadgroup is not clamped, so its two times are one measurement twice, and
+  the 553 such dispatches differ by a median 0.13 us on a mean of 4.5.
+- `Context::set_neuter` does the same to one *class* of kernel, or drops that
+  class's dispatches outright while still counting them and still handing
+  their bindings to the tracker -- so barriers, epochs and commits are
+  untouched and only the dispatch is gone. Its zero is a pattern that matches
+  nothing: 0.02-0.06 ms.
+- `cargo run --release --bin step_inventory` joins `ORNITH_COMMIT_EVERY=1`
+  per-dispatch times to `ORNITH_TRACE`'s per-dispatch bindings, grids and
+  layer markers, so every dispatch in a layer has its bytes, its grid, its
+  time and its time with the work clamped away.
+
+What they say, on `q6k-full`:
+
+| the trunk (`model_call`) | GPU ms |
+|---|---|
+| as it runs | 7.54 |
+| every grid clamped to one threadgroup | **3.48, 46%** |
+| what is left, moving 1.616 GB | 4.05, i.e. 397 GB/s |
+
+1062 of the 1665 dispatches move under 64 KB each -- 7.4 MB between them --
+and 95% of their isolated time is the floor. There is no slow kernel to
+find; there is a very large number of launches.
+
+**The floor and the marginal dispatch are different numbers.** 3.48 ms over
+1665 is 2.09 us each, but that is the cost of a stream with nothing to
+overlap: removing dispatches one class at a time returns **0.85 us** each,
+which is Phase 30's 0.72 us measured again. Price a fusion with the second
+number and a decomposition with the first.
+
+**A command buffer costs ~6.6 us, not the ~60 the code said.** Sweeping the
+commit size with the work clamped away puts 52 buffers a token 0.34 ms above
+none. The default stays at 128: between it and 1024 there is ~0.1 ms of GPU
+time and the wall takes it straight back.
+
+**What removal cannot price.** Dropping a dispatch whose output is an
+*address* rather than a number makes the step slower, not faster: without the
+router's argsort the expert gather reads eight experts at random and loses
+0.58 ms. For those, the clamped step gives a bound instead.
 
 ### The barrier between dispatches
 
@@ -1766,13 +1829,25 @@ In order:
    "Where the 1216 barriers come from" above says the dependency chain is 947
    dispatches deep and at best 1.76 wide, so scheduling cannot get there. Two
    things are still worth doing, in this order.
-   - **Encode order. Half of it is done and the rest is not worth it yet.**
-     Interleaving the shared expert with the router took 122 of the 223
-     available epochs and 3.3% of GPU busy -- see "Interleaving the MoE block"
-     above. What is left is ~3.4%, spread one epoch at a time over every
-     kernel in the step, and taking it means reordering across block and layer
-     boundaries, which needs a deferred op layer rather than another dozen
-     lines. Worth doing only if something else wants that layer anyway.
+   - **Encode order, and it was not spent.** Interleaving the shared expert
+     with the router took 122 of the 223 available epochs and 3.3% of GPU
+     busy -- see "Interleaving the MoE block" above -- and the schedule model
+     said ~3.4% was left, spread one epoch at a time, needing a deferred op
+     layer to reach. **Phase 31 took another 3.3% by moving one dispatch.**
+     The model was averaging over dispatches; the inventory says they are not
+     interchangeable, and the shared expert's one-row gate was 12.6 us alone
+     in an epoch with six epochs of slack in front of it. So the remaining
+     question is not "how many epochs" but "which dispatch is the longest
+     thing in its own epoch, and does anything nearby have room for it" --
+     which `step_inventory` answers directly and the model cannot.
+   - **The launch floor, which is half the step.** Phase 31: the same
+     dispatch stream with its work clamped away is 46% of a decode step, and
+     what is left runs at the machine's ceiling. The fusions that take it
+     back are worth ~0.85 us a removed dispatch, and the list of what is
+     still fusable -- `rms` into `scalar_mul` and `precise_swiglu`, the
+     router's argsort, the gated-delta chain -- is at the end of `REBUILD.md`
+     Phase 31 with a price against each. Past that the ratio only moves with
+     a decomposition into fewer, longer kernels.
    - **The bytes are spent, but the *rounding* was not, and it paid.**
      `REBUILD.md` Phase 7: GPTQ over the same 91 modules, same bits, same
      coverage, same kernels, **same 2.0761 GB a token and the same 1078-epoch

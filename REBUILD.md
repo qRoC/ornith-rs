@@ -4442,6 +4442,298 @@ here, a named term turned out to be four terms.
 
 ---
 
+---
+
+## Phase 31 -- a decode step, dispatch by dispatch -- **DONE**
+
+Phases 28-30 took a verify-window row apart. This asks the same question of
+the autoregressive step, which had been described only from the outside:
+**7.56 GPU ms a token, 1669 dispatches, 1064 barriers, ~1.8 GB of weights --
+240 GB/s against the 520 this machine's own largest kernel sustains.** Half
+the step was not weight traffic and nothing had said what it was. By the
+0.72 us a dispatch Phase 30 measured, issue would be ~1.2 ms, 16%; that was
+an estimate borrowed from another experiment, not a term of a decomposition.
+
+It is measured now, and the estimate was low by a factor of three -- while
+being right about what one dispatch is worth. Both of those are the result.
+
+### Three instruments, and what each one's zero is
+
+**The clamp.** `Context::set_grid1` issues every dispatch with a single
+threadgroup: same dispatches, same bindings, same barriers, same command
+buffers, and none of the work. The output is wrong by construction and the
+time is the point. Its control is built in: a kernel whose grid was one
+threadgroup already is not clamped, so its two times are one measurement
+taken twice. **553 of 1665 dispatches are in that class, and the median
+difference between their clamped and unclamped times is +0.13 us on a mean of
+4.5** -- that number is the bias between the two runs and nothing else.
+
+**The inventory.** `ORNITH_COMMIT_EVERY=1` gives each dispatch its own
+command buffer, so its timestamps belong to one kernel; `ORNITH_TRACE` now
+records each dispatch's grid and threadgroup beside its bindings, and
+`Context::prof_section` marks where one layer's dispatches end and the next
+begin. Joining the two by position gives every dispatch its bytes, its grid,
+its time and its time with the work clamped away. `src/bin/step_inventory.rs`
+is the whole of it; three interleaved draws a cell, median per dispatch,
+since a 2 us command buffer is not a measurement.
+
+**The removal.** `Context::set_neuter` does to *one class* of dispatch what
+the clamp does to all of them, inside the real step at the real commit size,
+and in two strengths: clamp the grid (leave the launch, take the work) or
+drop the dispatch (take both). A dropped dispatch is still counted and still
+hands its bindings to the tracker, so the barriers, the epochs and the commit
+boundaries are exactly what they were. Its zero is a pattern that matches no
+kernel: **0.02-0.06 ms**, which is this instrument's noise.
+
+### The answer: the floor is 3.4 ms, and the rest is at the ceiling
+
+    q6k-full, greedy, in one process from one cache state, medians of 3
+
+                                    GPU ms   clamped   work   dispatches
+    trunk (model_call)               7.538     3.484   4.054      1665
+    a decode step, head and all      8.214     3.714   4.500      1669
+    per dispatch, clamped                      2.09 us
+
+**46% of a decode step is what the dispatch stream costs with no work in it.**
+The other 54% moves 1.616 GB, which is 397 GB/s -- against 465 for a long
+bare read and 520 for the one kernel that reaches it. On a quieter machine
+later the same day the trunk read 7.020 / 3.335 / 3.685, i.e. 47.5% and
+438 GB/s; the level moves between sittings and the split does not.
+
+Two things make that more than an identity. The bytes are **checked against a
+second accounting**: `tools/step_bytes.py` reads the safetensors headers and
+says 1.8051 GB a token, 1.5191 of it outside `lm_head`, where the bindings
+say 1.616 -- the difference is the gated-delta state (60.5 MB a token, read
+and written), the KV cache and the activations, which that tool excludes by
+design. And the residual **cannot be much larger than it is**: 1.616 GB at
+this machine's best measured 520 GB/s is 3.11 ms, so the floor is at most
+7.538 - 3.11 = 4.4 ms however the work is counted. The measured 3.48 fits
+under that, which is what says there is no third term hiding in the step.
+
+**But 2.09 us a dispatch is not what removing a dispatch returns.** That
+number is the cost of *being a stream of 1665 dispatches with nothing to
+overlap*; taken one at a time, a removed dispatch gives back far less, because
+its launch partly pipelines against its neighbours' work. The fusion below
+removed 80 dispatches and returned **0.85 us each** -- which is Phase 30's
+0.72 us a dispatch, measured again on a different change. The block figure and
+the marginal figure are different quantities and both are right; quoting
+either as the other is the mistake this phase was built to avoid.
+
+### One layer, dispatch by dispatch
+
+A gated-delta layer, 42 dispatches, `q6k-full`, one dispatch a command buffer
+(so every line carries ~2 us of its own command buffer, and the floor column
+carries the same; read the difference):
+
+    #  grid    tg   read KB   us   floor   GB/s  kernel
+    0   512   512       8.0  3.46   3.33     --  rms              input_layernorm
+    1  2048    64    9220.0 23.75   5.29    511  q4k_qmv          in_proj_qkvz
+    2  1024    64    4612.0 14.13   5.33    537  q4k_qmv          in_proj_ba
+    3     8   256     132.0  4.33   4.00     --  gemv             A_log / dt
+    4     8   256     132.0  4.00   3.75     --  gemv
+    5 32768   256      64.0  3.50   2.88     --  concat_time      conv window
+    6 24576   256      64.0  2.88   2.50     --  slice_inner
+    7  8192  1024     128.0  3.63   3.38     --  depthwise_conv_1d
+    8  8192   256      16.0  2.13   1.88     --  silu
+    9   512    32       4.0  3.29   3.33     --  rms              q norm
+   10  2048   256       4.0  2.50   2.25     --  scalar_mul
+   11   512    32       4.0  3.25   3.38     --  rms              k norm
+   12  2048   256       4.0  2.38   2.04     --  scalar_mul
+   13    32    32       0.1  1.92   1.88     --  gdn_beta
+   14    32    32       0.2  3.25   3.13     --  compute_g
+   15 16384    64    2064.2  8.71   4.38    488  gated_delta_packed
+   16  1024    32       8.2  3.29   3.25     --  rms              RMSNormGated
+   17  4096   256      16.0  2.13   2.04     --  precise_swiglu
+   18   512    64    4616.0 13.83   6.38    634  q4k_qmv          out_proj
+   19  2048   256       8.0  1.96   2.00     --  add_elem         residual
+   20   512   512       8.0  3.50   3.42     --  rms              post_attention
+   21    64    64     424.0  7.42   6.50    474  q6k_qmv          router gate
+   22    64    64     644.0  7.00   5.67    495  affine_qmv_fast  shared gate_proj
+   23    64    64     644.0  6.33   5.54    833  affine_qmv_fast  shared up_proj
+   24     1    64       6.1 12.63  12.67     --  affine_qmv       shared_expert_gate
+   25    64    64       0.5  3.38   3.00     --  block_softmax_precise
+   26   512   256       2.0  2.00   1.96     --  swiglu           shared
+   27     1    64       0.5 10.63   9.92     --  carg_block_sort  256 experts
+   28     8     8       1.0  2.83   2.50     --  slice_tail
+   29     8     8       0.5  2.50   2.50     --  take_along_last
+   30   256    64     641.0  4.58   4.13   1432  affine_qmv_fast  shared down_proj
+   31     1     1       0.0  3.38   3.21     --  row_reduce_small
+   32     8     8       0.0  2.67   2.25     --  div_by_row
+   33  2048   256       4.0  2.42   2.38     --  sigmoid_gate
+   34  1024    64    4612.1 14.00   5.63    564  q4k_gather_qmv   experts gate
+   35  1024    64    4612.1 13.63   5.67    593  q4k_gather_qmv   experts up
+   36  4096   256      16.0  2.08   1.92     --  swiglu
+   37  4096    64    4616.1 16.54   5.13    414  q4k_gather_qmv   experts down
+   38 16384   256      32.0  2.42   2.25     --  mul_by_row
+   39    16   256      32.0  3.88   3.63     --  col_reduce_small
+   40  2048   256       8.0  2.08   1.96     --  add_elem
+   41  2048   256       8.0  2.00   1.88     --  add_elem
+                       37416.6 236.17 160.04    503
+
+Seven of the 42 move 34 of the layer's 37.4 MB. The other 35 move 3.4 MB
+between them and pay the same floor as the seven. Sorted into bands over the
+whole step:
+
+    bytes read        count       MB    us  of it floor   work us   GB/s
+    >= 4 MB             231   1342.7  3912       1326      2586      544
+    1 .. 4 MB            30     60.5   262        117       145      437
+    64 KB .. 1 MB       342    130.1  1819       1611       209      654
+    < 64 KB            1062      7.4  3514       3328       186       43
+
+**1062 dispatches a token move 7.4 MB and cost 3.5 ms of isolated time, 95%
+of it floor.** That is the shape of the thing: not a slow kernel anywhere, a
+very large number of launches.
+
+### The epochs are the unit, and a layer has 27 of them
+
+`ORNITH_TRACE` with grids makes the epoch structure readable directly. In the
+layer above, a barrier closes an epoch at 27 places, and only seven of those
+epochs contain a weight read. The rest are one small dispatch each, in a
+strict chain: `add -> rms -> qmv`, `rms -> scalar_mul`, `argsort ->
+slice_tail -> take_along_last -> row_reduce -> div`. Where the epoch holds
+more than one dispatch it is because the block was already interleaved by
+hand -- the in-projections with the `gemv`s, the router gate with the shared
+expert's projections, the two expert gathers with the score division.
+
+### The commit size is not a lever, and the comment saying it was is wrong
+
+`max_dispatches_per_commit` carried "a command buffer costs ~60 us of GPU
+time". The clamped step is exactly where a fixed per-buffer cost shows up,
+since nothing else in it is doing anything:
+
+    commit   buffers   GPU ms   clamped   wall ms
+        32      52.0    7.451     3.593     7.863
+        64      26.0    7.355     3.551     7.742
+       128      13.0    7.404     3.378     7.734
+       256       6.5    7.402     3.353     7.757
+       512       3.3    7.343     3.316     7.723
+      1024       1.7    7.297     3.287     7.822
+      4096       0.4    7.317     3.252     8.010
+
+From 52 buffers to none the clamped step falls 0.34 ms: **~6.6 us a command
+buffer, not 60.** Between the default 128 and 1024 there is ~0.1 ms of GPU
+time on the table and the wall gives it straight back, which is the same
+answer the old wall-clock table gave for a different reason. The default
+stays at 128; the comment is corrected.
+
+### The list, priced where the dispatches actually run
+
+`drop ms` is the whole step with that class of dispatch gone; `work ms` is
+the same with its grid clamped, so the difference between them is what the
+class pays for being dispatched. Sorted by what removal returns, the classes
+that do no work:
+
+    kernel                      count   work ms   drop ms   isolated
+    rms                           191    -0.030     0.334      0.635
+    affine_qmv (shared gate)       40     0.040     0.233      0.521
+    add_elem                      120     0.054     0.217      0.242
+    precise_swiglu                 30     0.057     0.132      0.065
+    col_reduce_small               40    -0.022     0.110      0.163
+    concat_time                    30     0.131     0.102      0.101
+    swiglu                         80     0.026     0.068      0.162
+    row_reduce_small               40    -0.059     0.060      0.136
+    slice_inner                    50    -0.015     0.054      0.143
+    block_softmax_precise          40    -0.011     0.051      0.134
+    depthwise_conv_1d              30    -0.016     0.047      0.113
+    gemv                           60    -0.005     0.031      0.246
+    scalar_mul                     60     0.066     0.027      0.142
+
+Two readings of that table matter. The `work` column is ~0 all the way down,
+which is the point: **these dispatches cost what they cost because they are
+dispatches.** And `isolated` is not `drop`: `gemv` costs 0.246 ms of isolated
+time and 0.031 ms where it runs, because it shares an epoch with the
+in-projection it follows. A per-kernel table cannot tell you which is which.
+
+**Two kernels the instrument cannot price this way**, and the reason is worth
+keeping: dropping `carg_block_sort` or `slice_tail` makes the step **slower**
+(-0.58 and -0.98 ms, i.e. it gains time), because their output is not a number
+but an *address* -- the expert gather then reads eight experts chosen at
+random instead of eight the router chose, and that is measurably worse for
+the memory system. Removal prices a dispatch only when nothing downstream
+uses its output to index with. For those two the clamped step gives a bound
+instead: dropping the argsort there, where nothing else is running, saves
+**0.289 ms**, 7.2 us each, and it is one threadgroup sorting 256 numbers.
+
+### What was built, and what it came to
+
+**One fusion, first on the list.** `rms` is 191 dispatches a token that do no
+work, and `rms after add_elem` is the most frequent barrier pair in the step
+(78 a token): every layer adds its residual and then normalises the sum.
+`kernels/ornith_norm.metal` does both in one dispatch and writes both arrays,
+since the sum is the residual the layer needs again. Exact by construction:
+`h = a + b` is evaluated in T exactly as `add_elem` does, the **rounded** h is
+what the sum of squares accumulates, and the write-back is `rms_single_row`'s
+line unchanged. `TextModel`'s trunk loop now hands each layer its normalised
+input and takes back `(h, m)` unadded, so the add that closes layer `i` is
+fused with the norm that opens layer `i + 1` -- and with the model's own final
+norm after the last one. `ORNITH_FUSE_ADD_RMS=0` is the control.
+
+    dispatches 1669 -> 1589,  barriers 1064 -> 986
+
+    trunk, 8 interleaved draws in one process
+      separate  7.566  [7.548 7.449 7.570 7.647 7.615 7.509 7.566 7.501]
+      fused     7.460  [7.467 7.452 7.458 7.600 7.539 7.455 7.460 7.428]
+      -0.068 ms as the mean of the 8 pairs, 7 of 8 in the right direction
+
+**One reorder, and no kernel at all.** `shared_expert_gate` is the second
+line of the list: 40 dispatches, 0.233 ms, and every one of them is a
+**one-row matrix** -- 2048 weights in, one number out, 6 KB read in 12.6 us.
+A one-row `qmv` is 32 threads walking K in a chain of sixteen dependent
+loads, and mlx picks it for the same shape, so there is no faster kernel here
+that is still the same arithmetic. What there is, is slack: it depends on
+`x2` alone and nothing reads it until `sigmoid_gate`, six epochs later. It is
+now issued beside the routed experts' gathers, which are 14-16 us of memory
+each and have the latency to absorb it.
+
+    trunk, 8 interleaved draws in one process
+      beside the router   7.380  [7.365 7.380 7.358 7.324 7.481 7.388 7.298 7.537]
+      beside the gathers  7.138  [7.067 7.161 7.126 7.052 7.130 7.138 7.144 7.267]
+      -0.252 ms as the mean of the 8 pairs, 8 of 8 in the right direction
+
+The same instrument that priced it at 0.233 ms now prices it at **0.109**,
+which is the mechanism confirming itself: the dispatch still runs and still
+takes 12.6 us, and most of that is now underneath a gather. Moving the shared
+expert's *down* projection along with it measured the same to a thousandth of
+a millisecond, so that one stays where it is. `ORNITH_MOE_EARLY_GATE=1` is
+the control.
+
+**Together, on the 200-token loop**, three interleaved pairs, same binary,
+controls by environment variable:
+
+    GPU ms/token   control            phase 31
+                   8.46 8.45 8.18     8.08 7.94 7.89     -4.7%
+    wall ms/token  8.95 8.96 8.58     8.59 8.37 8.33     -4.6%
+
+Exactness, as usual, is not a tolerance: `tests/model` is `max_abs == 0.0`
+against MLX over the whole 40-layer forward, `tests/generate`, `tests/moe`
+and `tests/mtp` are green, a 200-token `--greedy` run is byte-identical to
+the same run with both controls set, and `--mtp --mtp-depth 1 --frspec`
+prints the same bytes again.
+
+### What is left in the step, in the order the measurement puts it
+
+1. **`rms`, still.** 111 dispatches survive the fusion (the q and k norms and
+   `RMSNormGated`, which feed `scalar_mul` and `precise_swiglu` rather than a
+   matvec), at 0.163 ms. The same shape of fusion takes them: a gated-delta
+   layer's `rms -> scalar_mul` pair twice and `rms -> precise_swiglu` once.
+   ~90 dispatches, and by the coefficient this phase measured, ~0.08 ms.
+2. **The argsort**, 0.29 ms in the clamped step and unpriceable in the real
+   one. A k-selection kernel was written once before and reverted at +0.5%
+   (`HANDOFF.md`, "Fusing the router's tail") -- on the affine artifact, at
+   10.9 ms a step, where it was hidden under kernels this artifact no longer
+   has. It deserves re-pricing before it is re-written, and the way to price
+   it is a cheap kernel that writes *valid* indices, not a dropped dispatch.
+3. **The gated-delta chain**: `concat_time`, `slice_inner`,
+   `depthwise_conv_1d`, `silu`, `gdn_beta`, `compute_g` are six dispatches
+   over small arrays with a strict dependency between them, 0.35 ms of
+   removal between them and almost no work.
+4. **And the structural one.** A gated-delta layer issues 40 dispatches in 27
+   epochs to read 37 MB. Nothing in the list above changes that ratio by more
+   than a few percent; what would is fusing the elementwise chain into the
+   matvecs that bracket it, which is a different size of project and wants
+   the deferred op layer `HANDOFF.md` has been circling.
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
