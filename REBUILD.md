@@ -5524,6 +5524,155 @@ this one has an obvious expiry date on it: the sentence above about tiles.
 Keeping it makes the re-price a measurement instead of a rebuild.
 
 
+## Phase 35 -- a prefill inventory, and the single thread it found -- **DONE**
+
+Phase 34 left one object open and it was the only one where this port loses
+to the reference it was written against: a 6394-token prompt is **4.54 s of
+GPU work** against `mlx_lm.generate`'s 3.68-3.87 s of wall, 22% behind, where
+a decode step is 130 tok/s against mlx's 86-92. Decode had been inventoried
+three times. Prefill had never been inventoried at all.
+
+### The instrument, which is the decode one told a wider unit of work
+
+A prefill chunk is `model_call` over `prefill_step_size` tokens against an
+empty cache -- the same function `step_inventory` already measured at one
+token. So `step_inventory prefill` is that bin with its unit of work
+parameterised, and every part of it applies unchanged: the clamp, the
+per-dispatch join of `ORNITH_COMMIT_EVERY=1` times to `ORNITH_TRACE`
+bindings, the census, the boundary, every A/B.
+
+    a prefill chunk: 2048 tokens against an empty cache
+
+                              GPU ms   clamped   work ms   issue  dispatches
+      the chunk (model_call)  1522.8     204.8    1318.0   13.4%      1425
+      draws               real [1512.9, 1522.8, 1613.2]
+                       clamped [204.6, 204.8, 205.7]
+
+### And the first thing it says is about itself
+
+**`set_grid1` is not a launch floor at this width.** At a decode step a
+clamped dispatch costs 2.55 us, which is `dispatch_cost`'s empty dispatch
+plus a pipeline switch, and the bin's free control confirms it -- a kernel
+already dispatched over one threadgroup comes out unchanged. At a prefill
+chunk a clamped dispatch costs **143.7 us**, fifty-six times as much,
+because the surviving threadgroup of a *tile* still walks the whole K
+dimension. The clamp leaves one threadgroup's work, and at this width that
+work is not small.
+
+So 13.4% is an upper bound and not a reading. The launch cost itself is
+1425 dispatches at ~2.09 us: **2.9 ms of 1523, 0.2%**.
+
+**That closes the other half of Phase 33's prefill result.** The fusion
+project took 0.55 ms off a 7.2 ms decode step by removing launches; at
+prefill there are no launches to remove. What Phase 33 measured there
+(-5.7% from one block-shaped kernel) was bytes, as its arithmetic claimed,
+and this is the same conclusion reached from the instrument's side.
+
+One more property of this width, and it is convenient: one dispatch a
+command buffer inflates the total to **1893 ms against 1753 real, 8%**,
+where at decode it inflates 8.71 against 6.75, **29%**. A prefill dispatch
+is big enough to fill the machine on its own, so there is little overlap to
+lose and the per-dispatch table is nearly a decomposition. At decode it
+explicitly is not one.
+
+### Where a chunk goes
+
+    isolated time, 40-layer chunk, one dispatch a command buffer
+
+      kernel                        count    us        floor      what
+      q4k_gather_qmm_t_r32             96   552805.8    14802.1   the experts
+      q4k_qmm_t_r64                    90   450656.7    21069.6
+      counting_sort_experts            40   167623.1   153219.5   <-
+      q6k_gather_qmm_t_r32             24   152517.7     3270.0
+      q6k_qmm_t_r64                   104   147480.5    18010.2
+      gather_rows_div                  40    78927.0      207.0   <-
+      unsort_rows                      40    78240.4      124.1   <-
+      gated_delta_packed               30    54132.9    37199.6
+      affine_qmm_t                     96    40359.2     3653.8
+      steel_gemm_fused_nt / _nn        20    59423.8     1540.9
+      swiglu                           80    17319.1      193.2
+
+The gemms are ~74% of it and they are the work. **The router's bookkeeping
+is 324.7 ms -- 21% of the chunk** -- and two of its three kernels move
+almost nothing while doing it. The whole gap to mlx is 0.82 s over 6394
+tokens, i.e. **0.26 s a chunk**; the sort alone is 0.17.
+
+### The single thread, and the comment that predicted it
+
+    counting_sort_experts   grid=1  tg=1   3508 us a dispatch   x40
+
+`threads((1, 1, 1), (1, 1, 1))`. The kernel's own comment says why, and says
+it honestly:
+
+> A single thread per row keeps the counting exact and the code obvious;
+> **the arrays here are at most tokens x 8 entries.**
+
+At a decode step `tokens` is 1 and that is eight entries. At a prefill chunk
+`rows = tokens * k = 16384`, and the sorted path starts at `rows >= 64`. One
+thread, 16384 keys, 40 times a chunk. Its "floor" reads *above* its real
+time (153.2 against 167.6) because clamping a one-threadgroup kernel is a
+no-op -- the bin's free control, saying the same thing from the other side.
+
+**And none of the three exists at a decode step: zero dispatches, not a
+small number of them.** The sorted expert path is a prefill path entirely.
+So the assumption in that comment was true for the object it was written
+for, false for another object, and there was no instrument that could see
+the difference. That is what this phase was for.
+
+### What was built
+
+Not mlx's argsort: `argsort_last_axis` asserts a single block and this port
+does not carry `multi_block_sort`, so 16384 keys are out of its reach. But a
+general sort is not what is needed -- a **stable counting sort over 256
+buckets** is, and that parallelises over the *input*. (Over the experts it
+does not: each expert's thread would still walk every key, so the serial
+depth would not move.)
+
+Three dispatches replace the one, in `kernels/moe.metal`:
+
+    sort_block_hist      one threadgroup a block, a histogram in threadgroup
+                         memory -> counts[expert][block]
+    sort_block_offsets   one threadgroup: each expert sums its blocks, one
+                         thread scans the expert totals, each expert turns
+                         its blocks into starting slots
+    sort_block_scatter   one thread a block, walking its own 256 elements in
+                         input order
+
+**Serial depth falls from `n` to one block.** Stability -- the whole content
+of the claim, since 16384 keys over 256 experts are mostly ties -- survives
+because a slot is decided by (expert, block, position in block) in that
+order, which is the order the single thread visited them in.
+`tests/moe::the_parallel_sort_is_the_serial_one` holds the two paths to an
+identical permutation, and `sort_permutation_matches_mlx` -- which at
+T = 512 now runs the parallel path -- still holds it to mlx's own
+`mx.argsort`. Below a block the one-thread kernel stays, so a decode step
+issues exactly what it issued before.
+
+### What it came to
+
+    a 6394-token prompt, three interleaved pairs, affine parent
+
+      prompt GPU s   one thread  4.61  4.61  4.64
+                     parallel    4.16  4.14  4.21
+                     -0.45 s, -9.8%, 3 of 3 down
+
+    and on q6k-full, one pair:  5.05 -> 4.65
+
+**The gap to `mlx_lm` on the same artifact and the same 6394 ids goes from
+22% to 12%**, from one kernel that never runs in a decode step. Byte-
+identical on both artifacts, the whole suite green, and a decode step is
+untouched at 1009 dispatches and 609 barriers.
+
+### What is left in it
+
+`gather_rows_div` (78.9 ms) and `unsort_rows` (78.2 ms) are another **10% of
+a chunk**, and neither is a serial kernel -- they are a 16384-row gather and
+its inverse, moving 12.5 MB and 2562 MB at 0.16 and 34 GB/s against a 465
+ceiling. A gather is latency-bound rather than bandwidth-bound, so those are
+a different problem from this one and they are the next thing the inventory
+points at.
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
