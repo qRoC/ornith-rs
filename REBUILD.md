@@ -5977,6 +5977,32 @@ and 3.98 s of wall**. The port's 3.80 s is GPU busy. Read it the way Phase
 mlx's best wall to about 5% below it**, and what is left is inside the
 spread of mlx's own three draws.
 
+### How it is held
+
+The whole suite green with `--include-ignored --test-threads=1` (122 tests,
+0 failed, 0 ignored), `tests/model` at `max_abs == 0.0`, and a decode step
+**untouched at 1019 dispatches and 621 barriers in every arm on both
+artifacts** -- which it has to be, because `rows = 8 < 64` never reaches
+the sorted path at all.
+
+Four new bit-exact tests, and they cover the three claims separately:
+
+- `tests/moe::the_indexed_moe_block_is_the_copied_one` runs the block at
+  every sorted width in all eight combinations of the three controls and
+  holds each to mlx's own output. It also prints, per width, whether the
+  expert gemm reads `lhs_indices` on this artifact, so a green run on an
+  affine one is not read as covering the front removal.
+- `indexing_the_rows_is_gathering_them`, in `tests/q4k.rs` and
+  `tests/q6k.rs`: the gemm over `x` with a permutation against the gemm
+  over a gathered `xs` with the identity, `max_abs == 0.0`. This is the
+  front removal's whole claim, on the family that takes it.
+- The wide copies ride the same `max_abs == 0.0`: a copy may not round
+  anything.
+
+End to end: 200 tokens `--greedy` byte-identical under every control on
+both artifacts, on a short prompt and on the 6621-token one, and
+`--mtp --mtp-depth 1 --frspec` likewise.
+
 ### Two traps, both new shapes of old ones
 
 **A renamed kernel had a second call site, and the check that should have
