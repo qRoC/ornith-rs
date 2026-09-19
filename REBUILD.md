@@ -6530,6 +6530,24 @@ chunk and the paired chunk cell's noise floor is larger than that.
       transpose_hl, 16 heads out  0.462      0.080     419   3.8
                                                             8.5 ms a chunk
 
+**And the cell has a control against itself, which is the only reason these
+numbers are readable at all.** Every run in this phase was taken with a
+neighbour's VM at 260-300% and load average 7 to 14 -- the state Phase 37's
+own rule says to throw a cell away in. What licenses reading this table
+anyway is that the *same bin's* four elementwise rows, measured quiet in
+Phase 37, come out of these runs unchanged:
+
+      kernel                      Phase 37, quiet    here, load 7-12
+      swiglu, experts             0.100 ms  504      0.100-0.101  500-505
+      swiglu, shared expert       0.023     274      0.022-0.023  269-292
+      sigmoid_gate, output gate   0.078     430      0.076-0.081  416-442
+      slice_inner, q/gate split   0.078     431      0.078-0.080  420-430
+
+A `best_of` over a kernel with no reduction and nothing else competing for
+DRAM is robust to a busy machine in a way a paired chunk is not, and this
+is that claim being *checked* rather than repeated: four rows measured a
+day apart under a 30% load shift, reproducing to 1-3%.
+
 And then in the stream, which is available here in a way it was not for the
 elementwise kernels: `step_inventory`'s census times **one dispatch to a
 command buffer**, so it resolves a single kernel where the paired chunk

@@ -2820,6 +2820,17 @@ reads much more invitingly than it should.
   string at dispatch time, so a missed call site is not a compile error; it
   is a panic the first time that path runs, which may be a path no test
   takes.
+- **`ORNITH_INV_DUMP=<path>` writes the per-dispatch inventory *and stops
+  the bin right after the census***, which makes it the cheap question
+  "which kernel does the model actually dispatch, at what grid" rather than
+  the hour the class sweep takes. It is how Phase 38 showed the wide
+  transposes were live in the model and not merely correct in a test
+  (`transpose_lh_wide_bfloat16` x30, `transpose_hl_wide_bfloat16` x10, grid
+  1048576 = 8388608 / 8) -- a wide/narrow control that both arms decline is
+  green and empty, and no test can see which kernel a *model* run reached.
+  It writes `<path>.tsv` (one row a dispatch: section, kernel, grid, tg,
+  bytes read, bytes written, us) and `<path>.trace` for
+  `tools/epoch_schedule.py`.
 - **On a shared machine the census's mean is not the kernel.**
   `step_inventory`'s per-kernel table averages, and in Phase 38 the wide
   `transpose_hl`'s ten dispatches read 71-82 us seven times and 885, 913
