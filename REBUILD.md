@@ -4075,6 +4075,145 @@ cost 5.8x what the levels do.
 
 ---
 
+## Phase 28 -- the re-read was free and the dequantize was not -- **DONE**
+
+Phase 27 named the lever and priced it: a multi-row k-quant mat-vec, one read
+of a weight block accumulated into M row accumulators, `-21%` a token at depth
+1 and depth 3 stopping losing. It is written -- `q4k_qmv_m{2,3,4}` and
+`q6k_qmv_m{2,3,4}`, `kquant::qmv_rows` -- and it is **bit-exact and worth
+nothing**:
+
+    the verify forward, by window width (GPU ms, `q6k-full`)
+
+    width   a row each   one read for all   per-row cost
+      1        7.749          7.534
+      2       10.467         10.122
+      4       17.164         17.041
+    each extra row            3.14  vs  3.14
+
+The contract held exactly as predicted -- `tests/q4k.rs` and `tests/q6k.rs`
+compare every row of an M-row call against that row computed alone and measure
+`max_abs == 0.0` at M = 2, 3, 4, 5 and 8, and a 200-token run accepts the same
+82 of 118 drafts under both kernels, byte for byte. So the part of Phase 27
+that was about *invariance* was right. The part that was about *time* was not.
+
+### Why: past the first row the kernel is not reading-bound
+
+`src/bin/window_mv.rs` grew an `ORNITH_SERIAL=1` mode -- drain the queue
+between repetitions, so the mat-vecs run in a chain the way a verify runs them
+rather than sixteen at a time serving each other out of cache. `lm_head`,
+286 MB of Q4_K, one dispatch at a time:
+
+    M    a row each    one read for all    bytes read   GB/s at that time
+    1       0.550           0.538            286 MB          520
+    2       0.828           0.767            286 MB          373
+    3       1.240           1.124            286 MB          254
+    4       1.651           1.488            286 MB          192
+    8       3.321           2.963            286 MB           97
+
+**A single row already runs at 520 GB/s, which is this machine's ceiling**
+(546 theoretical, 465 on a long read). Four rows through a kernel that reads
+the matrix *once* take 2.7x as long as one row while reading the same bytes.
+The shape of the whole table is `max(one read, M x arithmetic)`: 0.55 ms of
+traffic against 0.365 ms of arithmetic a row, so the read wins at M = 1 and
+nothing else. The three reads the new kernel saves were already hidden
+underneath the arithmetic that consumes them -- and the old kernel's re-reads
+were partly served from cache besides (at M = 4 it sustains 694 GB/s of
+apparent traffic, which no DRAM here can do).
+
+So Phase 27's 41% was real and its explanation was not. What grows with the
+window in that kernel is not the traffic; it is the work.
+
+### What does pay, and only on one of the two formats
+
+The other thing that repeats per row is the **dequantize**, and unlike the
+read it is not hidden. So: unpack a block's codes into registers once and
+spend them M times. Both formats got it (`q6k_qmv_mh*`, `q4k_qmv_mh*`,
+`kquant::qmv_hoist`), both are bit-exact, and they do not agree. Per kernel
+inside one width-4 verify, `ORNITH_COMMIT_EVERY=1`, two draws:
+
+    ms a verify        a row each    one read     + unpacked once
+    q6k dense mat-vec   2.118/2.112  2.505/2.475  **1.677/1.653**
+    q4k dense mat-vec   5.297/5.372  **5.220/5.192**  5.789/5.322
+
+Q6_K unpacks five operations a weight -- two masks, a shift, an or and the
+bias of 32 -- against the one multiply-add that spends it, so hoisting it is
+most of the inner loop: **-21%**. Q4_K unpacks one mask and one conversion,
+and the hoist costs more than it saves: holding 32 unpacked weights and 32
+activations at once does not fit, so the output row has to move outside the
+row-of-`x` loop, which doubles the activation reads to one per multiply-add.
+**+9%.** `ORNITH_QMV_HOIST` therefore defaults to Q6_K alone, and `=all`
+keeps the Q4_K kernel reachable so the next session can re-measure it instead
+of re-deriving it.
+
+### What it is worth
+
+Two draws each, 200 tokens, greedy, GPU ms a token. This machine reads 7.56
+for autoregression today where Phase 27 read 8.56 -- it is shared, and it
+moves every level together; the ratios are what carry.
+
+    config                   a row each    this phase
+    autoregressive              7.56          7.56
+    --mtp-depth 1 --frspec   6.78 / 6.80   **6.60 / 6.60**    -2.8%
+    --mtp-depth 3 --frspec   8.72 / 8.72   **8.28 / 8.30**    -5.0%
+
+Against a prediction of -12% -> -21% at depth 1 and +13% -> -8% at depth 3.
+The knee stays at depth 1, which Phase 27 did get right and for the right
+reason: a cheaper row cannot outrun a geometric decay in acceptance.
+
+### Which compiler these numbers came out of
+
+Every table above was measured on Xcode 26.3's `metal`. Xcode **27.0** landed
+on this machine an hour later (a background install, and it also moved the
+Metal compiler into a separately downloaded component), so the suite and the
+A/B were re-run on `metalfe-32023.921.6`. **The bit-exact floor did not move**
+-- the whole suite is green, including `q4k_dequantize` against ggml's own
+bytes at `max_abs == 0.0`, and a 200-token run still accepts the same 82 of
+118 drafts. Neither did the ordering the code rests on, measured under a
+neighbour's VM at 350% CPU, so read the ranks and not the levels:
+
+    ms a verify, width 4     a row each   one read   + unpacked once
+    q6k dense mat-vec           2.136       2.529      **1.839**
+    q4k dense mat-vec           5.959     **5.228**      5.406
+
+The magnitudes are a different question from the ranks and this machine could
+not answer it that hour: `--mtp-depth 1 --frspec` read 7.78 GPU ms a token
+against the 6.78 of an hour before, with both kernels inside the noise of each
+other. The `-2.8%` and `-5.0%` above stand as measured on 26.3 on a quieter
+machine, and they are the numbers to re-take first if this phase is ever
+doubted. `target/kernels-xcode26.3.metallib` is the old compiler's output,
+kept for exactly that comparison.
+
+### The lesson, and it is Phase 27's own, one level down
+
+Phase 27 caught Phase 26 charging a difference between two configurations to
+the one thing in its name, when two things differed. Then it wrote:
+
+> `q4k_qmv` is dispatched 91 times whatever the width, and takes 2.8x as long
+> at four rows as at one. [...] **The dense half is a pure re-read.**
+
+A fixed dispatch count says the work *inside* a dispatch grew. It does not say
+which work, and **both** the traffic and the arithmetic grow with M. The
+sentence picked one of the two and the next paragraph priced it. The only
+instrument that separates them is a kernel that removes one and leaves the
+other -- which took a day to write, a minute to run, and says the removed one
+was not the cost.
+
+Generalised, and it is worth carrying: **a quantity that grows with a
+parameter is not evidence about *which* term grows with it.** Phase 26
+differenced two configurations, Phase 27 differenced two widths; the same
+correction applies both times, and the second time it was made by the phase
+that named the first.
+
+What survives from Phase 27 unchanged: the draft is 0.587 ms and not 4.31, its
+MoE is 1.4% of a cycle, the tile and `qmv_wide` and the grid axis order are
+refuted, and the window's other two thirds -- the expert gather paying for 32
+rows where ~23 are distinct, and `forward_capture` stepping the recurrence per
+token -- have not been touched. Those two are now the whole of what is left in
+a window row, and nothing here says what *their* growth is made of either.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

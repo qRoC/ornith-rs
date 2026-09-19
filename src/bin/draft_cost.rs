@@ -45,6 +45,7 @@ use ornith_rs::ops::matmul::{gather_mv, matmul};
 use ornith_rs::ops::moe::{
     mix_experts, normalize_scores, sparse_moe_block_dense, switch_glu_dense, top_k,
 };
+use ornith_rs::ops::kquant;
 use ornith_rs::ops::norm::rms_norm;
 use ornith_rs::ops::sample::greedy_argmax_into;
 use ornith_rs::ops::softmax::softmax;
@@ -349,14 +350,52 @@ fn main() {
     // the caches advance by one per rep, exactly as a real cycle would.
     println!("\nthe verify forward, by window width\n");
     println!(
-        "  {:>5} {:>11} {:>11} {:>11} {:>9}",
-        "width", "verify ms", "vs width 1", "per token", "dispatch"
+        "  {:>5} {:>11} {:>11} {:>11} {:>8} {:>11} {:>11} {:>9}",
+        "width",
+        "a row each",
+        "M inside",
+        "+ unpacked",
+        "saved",
+        "vs width 1",
+        "per token",
+        "dispatch"
     );
+    // Both mat-vec kernels at every width, in one process and back to back:
+    // the token axis on the grid (`kquant::set_qmv_rows(1)`, one read of the
+    // matrix a row) against the token axis inside it (one read for all of
+    // them). `vs width 1`, `per token` and everything downstream are the
+    // second kernel's -- it is the one the runtime takes.
     let mut verify_ms = [0.0f64; 5];
+    let mut verify_row_ms = [0.0f64; 5];
     let mut tables: Vec<(usize, Vec<(String, usize, f64)>)> = Vec::new();
+    let mut tables_row: Vec<(usize, Vec<(String, usize, f64)>)> = Vec::new();
+    let mut tables_shared: Vec<(usize, Vec<(String, usize, f64)>)> = Vec::new();
     for w in 1..=4usize {
         let win: Vec<u32> = (0..w).map(|_| primary).collect();
         let window = Array::from_slice(&ctx, &win, &[w], Dtype::U32);
+
+        kquant::set_qmv_rows(1);
+        let (row_ms, _) = gpu_ms_n(&ctx, VERIFY_REPS, || {
+            let (vh, _, capture) = model.forward_capture(&ctx, &window, &mut caches);
+            let _ = model.lm_head.matmul(&ctx, &vh);
+            capture.rewind(&mut caches, 1);
+        });
+        verify_row_ms[w] = row_ms;
+        let (by_row, _) = ctx.prof_kernel_times();
+        tables_row.push((w, by_row));
+
+        kquant::set_qmv_rows(4);
+        kquant::set_qmv_hoist(kquant::Hoist::Off);
+        let (shared_ms, _) = gpu_ms_n(&ctx, VERIFY_REPS, || {
+            let (vh, _, capture) = model.forward_capture(&ctx, &window, &mut caches);
+            let _ = model.lm_head.matmul(&ctx, &vh);
+            capture.rewind(&mut caches, 1);
+        });
+
+        let (by_shared, _) = ctx.prof_kernel_times();
+        tables_shared.push((w, by_shared));
+
+        kquant::set_qmv_hoist(kquant::Hoist::Q6K);
         let (ms, disp) = gpu_ms_n(&ctx, VERIFY_REPS, || {
             let (vh, _, capture) = model.forward_capture(&ctx, &window, &mut caches);
             let _ = model.lm_head.matmul(&ctx, &vh);
@@ -364,13 +403,20 @@ fn main() {
         });
         verify_ms[w] = ms;
         println!(
-            "  {w:>5} {ms:>11.3} {:>11.3} {:>11.3} {disp:>9.0}",
+            "  {w:>5} {row_ms:>11.3} {shared_ms:>11.3} {ms:>11.3} {:>8.3} {:>11.3} {:>11.3} \
+             {disp:>9.0}",
+            row_ms - ms,
             ms - verify_ms[1],
             ms / w as f64,
         );
         let (by, _) = ctx.prof_kernel_times();
         tables.push((w, by));
     }
+    println!(
+        "  each extra row: {:.3} ms a row each, {:.3} ms with M inside",
+        (verify_row_ms[4] - verify_row_ms[1]) / 3.0,
+        (verify_ms[4] - verify_ms[1]) / 3.0
+    );
     // What grew, per kernel, over the widths. A kernel whose dispatch count
     // does not move but whose time does is re-reading the same weights once
     // per row; one whose count moves with the width is doing new work.
@@ -396,6 +442,54 @@ fn main() {
                 .unwrap_or_else(|| "        --      ".to_string())
         };
         println!("  {} {} {}  {n}", cell(&tables[0]), cell(&tables[1]), cell(&tables[3]));
+    }
+
+    // The two mat-vecs against each other inside one width-4 verify, which is
+    // the only place the question is asked in its own terms: same forward,
+    // same weights, same dispatch counts, one kernel reading the matrix per
+    // row and the other once. Needs `ORNITH_COMMIT_EVERY=1` for the GPU
+    // column; the counts are right either way.
+    println!("\ninside a width-4 verify, kernel by kernel (ms/verify, count)\n");
+    println!(
+        "  {:>16} {:>16} {:>16}  kernel",
+        "a row each", "M inside", "+ unpacked"
+    );
+    let pick = |t: &Vec<(String, usize, f64)>, want: &str| -> Option<(usize, f64)> {
+        t.iter().find(|(n, _, _)| n == want).map(|(_, c, s)| (*c, *s * 1e3 / VERIFY_REPS as f64))
+    };
+    let mut seen: Vec<String> = Vec::new();
+    for t in [&tables_row[3].1, &tables_shared[3].1, &tables[3].1] {
+        for (n, _, _) in t {
+            if !seen.contains(n) {
+                seen.push(n.clone());
+            }
+        }
+    }
+    type Cell = Option<(usize, f64)>;
+    let mut rows: Vec<(String, Cell, Cell, Cell)> = seen
+        .iter()
+        .map(|n| {
+            (
+                n.clone(),
+                pick(&tables_row[3].1, n),
+                pick(&tables_shared[3].1, n),
+                pick(&tables[3].1, n),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let m = |r: &(String, Cell, Cell, Cell)| {
+            r.1.map_or(0.0, |(_, s)| s)
+                .max(r.2.map_or(0.0, |(_, s)| s))
+                .max(r.3.map_or(0.0, |(_, s)| s))
+        };
+        m(b).total_cmp(&m(a))
+    });
+    for (n, a, b, c) in rows.iter().take(14) {
+        let cell = |v: &Cell| {
+            v.map(|(c, s)| format!("{s:>9.3} x{c:<5}")).unwrap_or_else(|| "        --      ".into())
+        };
+        println!("  {} {} {}  {n}", cell(a), cell(b), cell(c));
     }
 
     // --- what the cycle is made of ------------------------------------------

@@ -243,6 +243,332 @@ template <typename T, short nr0, short NSG>
       sgitg);
 }
 
+// The same mat-vec with the token axis moved **inside**.
+//
+// `q4k_qmv` carries M on the grid, so an M-row call reads the weight matrix M
+// times; at a speculative verify window that re-read is 41% of what an extra
+// window row costs (`REBUILD.md` Phase 27). Here one threadgroup takes `MW`
+// rows of `x` at once: the block loop reads a block's weights once into
+// registers and feeds all `MW` of them.
+//
+// **Every row still accumulates exactly what it would alone.** The `ib` loop
+// order, the four-block lane split, the per-block expression and the final
+// `simd_sum` are the ones above, copied; only the surrounding loops move, and
+// `sumf[m]` sees the same blocks in the same order as `sumf` does in a one-row
+// call. That is what makes this a batch-invariant kernel rather than a tile --
+// `ops::invariant`'s window mode can keep it on.
+//
+// The weights hoisted per block are small (eight codes, four packed fields and
+// two halves a row), so the registers go to the `MW` activation loads instead;
+// activations are the cheap side, they stay in cache, and the ratio of loads
+// to FMAs is the one-row kernel's.
+template <typename T, short nr0, short NSG, short MW>
+[[kernel]] void q4k_qmv_m(
+    const device uint16_t* qs [[buffer(0)]],
+    const device uint16_t* scales [[buffer(1)]],
+    const device half* dm [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& O [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint16_t kmask1 = 0x3f3f;
+  constexpr uint16_t kmask2 = 0x0f0f;
+  constexpr uint16_t kmask3 = 0xc0c0;
+
+  const short ix = tiisg / 8; // 0...3, which block of the four in flight
+  const short it = tiisg % 8; // 0...7, where in the block
+  const short iq = it / 4; // 0 or 1, which half of the super-block
+  const short ir = it % 4; // 0...3
+
+  const int nb = K / QK_K;
+  const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
+  const int r1 = int(tgpig.y) * MW;
+
+  const int qs_row = nb * Q4K_QS_U16;
+  const int sc_row = nb * Q4K_SC_U16;
+  const int dm_row = nb * Q4K_DM_F16;
+
+  // A tail threadgroup clamps its spare rows onto the last real one. They
+  // compute an answer nobody stores, which keeps a bound test out of the
+  // inner loops; only the last group of a window does it, and only when M is
+  // not a multiple of MW.
+  const device T* y4[MW];
+  for (short m = 0; m < MW; ++m) {
+    y4[m] = x + (int64_t)min(r1 + m, M - 1) * K + ix * QK_K + 64 * iq + 8 * ir;
+  }
+
+  float sumf[MW][nr0];
+  for (short m = 0; m < MW; ++m) {
+    for (short row = 0; row < nr0; ++row) {
+      sumf[m][row] = 0.f;
+    }
+  }
+
+  for (int ib = ix; ib < nb; ib += 4) {
+    // This block's weights, once, for every row of `x` below.
+    const device uint16_t* sc = scales + first_row * sc_row + ib * Q4K_SC_U16 + iq;
+    const device uint16_t* q1 = qs + first_row * qs_row + ib * Q4K_QS_U16 + 16 * iq + 4 * ir;
+    const device half* dh = dm + first_row * dm_row + ib * Q4K_DM_F16;
+
+    uint16_t wl[nr0][4];
+    uint16_t wh[nr0][4];
+    uint8_t sc8[nr0][8];
+    float2 dv[nr0];
+
+    for (short row = 0; row < nr0; ++row) {
+      // `sc16` as the one-row kernel builds it, unpacked into its bytes here
+      // rather than read through a pointer alias -- the same eight values.
+      const uint16_t s0 = sc[0] & kmask1;
+      const uint16_t s1 = sc[2] & kmask1;
+      const uint16_t s2 = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+      const uint16_t s3 = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+      sc8[row][0] = uint8_t(s0 & 0xff);
+      sc8[row][1] = uint8_t(s0 >> 8);
+      sc8[row][2] = uint8_t(s1 & 0xff);
+      sc8[row][3] = uint8_t(s1 >> 8);
+      sc8[row][4] = uint8_t(s2 & 0xff);
+      sc8[row][5] = uint8_t(s2 >> 8);
+      sc8[row][6] = uint8_t(s3 & 0xff);
+      sc8[row][7] = uint8_t(s3 >> 8);
+
+      for (short i = 0; i < 4; ++i) {
+        wl[row][i] = q1[i];
+        wh[row][i] = q1[32 + i];
+      }
+      dv[row] = float2(float(dh[0]), float(dh[1]));
+
+      q1 += qs_row;
+      sc += sc_row;
+      dh += dm_row;
+    }
+
+    for (short m = 0; m < MW; ++m) {
+      const device T* y4m = y4[m];
+
+      float yl[16];
+      float yh[16];
+      float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+      for (short i = 0; i < 8; ++i) {
+        yl[i + 0] = float(y4m[i + 0]);
+        sumy[0] += yl[i + 0];
+        yl[i + 8] = float(y4m[i + 32]);
+        sumy[1] += yl[i + 8];
+        yh[i + 0] = float(y4m[i + 128]);
+        sumy[2] += yh[i + 0];
+        yh[i + 8] = float(y4m[i + 160]);
+        sumy[3] += yh[i + 8];
+      }
+
+      for (short row = 0; row < nr0; ++row) {
+        float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 4; ++i) {
+          acc1[0] += yl[2 * i + 0] * (wl[row][i] & 0x000F);
+          acc1[1] += yl[2 * i + 1] * (wl[row][i] & 0x0F00);
+          acc1[2] += yl[2 * i + 8] * (wl[row][i] & 0x00F0);
+          acc1[3] += yl[2 * i + 9] * (wl[row][i] & 0xF000);
+          acc2[0] += yh[2 * i + 0] * (wh[row][i] & 0x000F);
+          acc2[1] += yh[2 * i + 1] * (wh[row][i] & 0x0F00);
+          acc2[2] += yh[2 * i + 8] * (wh[row][i] & 0x00F0);
+          acc2[3] += yh[2 * i + 9] * (wh[row][i] & 0xF000);
+        }
+
+        sumf[m][row] +=
+            dv[row][0] *
+                ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[row][0] +
+                 (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[row][1] * 1.f / 16.f +
+                 (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[row][4] +
+                 (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[row][5] * 1.f / 16.f) -
+            dv[row][1] *
+                (sumy[0] * sc8[row][2] + sumy[1] * sc8[row][3] +
+                 sumy[2] * sc8[row][6] + sumy[3] * sc8[row][7]);
+      }
+
+      y4[m] += 4 * QK_K;
+    }
+  }
+
+  for (short m = 0; m < MW; ++m) {
+    if (r1 + m >= M) {
+      break;
+    }
+    for (short row = 0; row < nr0 && first_row + row < O; ++row) {
+      const float sum_all = simd_sum(sumf[m][row]);
+      if (tiisg == 0) {
+        out[(int64_t)(r1 + m) * O + first_row + row] = T(sum_all);
+      }
+    }
+  }
+}
+
+// The multi-row mat-vec again, with the **unpack** hoisted as well as the
+// read -- which is the half the measurement says is binding.
+//
+// `q4k_qmv_m` above shares one read of a weight block between MW rows and
+// measures ~10% against the one-row kernel, because at MW rows the kernel is
+// not reading-bound any more: on `lm_head` a single row sustains 520 GB/s,
+// the machine's ceiling, and four rows through `q4k_qmv_m` sustain 192 -- the
+// weights arrive long before the arithmetic that consumes them is done.
+// What repeats per row is the dequantize: a mask and an integer-to-float
+// conversion for every code, against the one fused multiply-add that uses it.
+//
+// So this one unpacks a block's codes into registers once and spends them MW
+// times. The loop order is the other way round from `q4k_qmv_m` -- output row
+// outside, row of `x` inside -- because 32 unpacked weights and 32
+// activations do not both fit for two output rows at once; the activations
+// are re-read per output row instead, which is the cheap side (they are a few
+// kilobytes and they stay in cache).
+//
+// Every product is the product the one-row kernel forms, in the same order
+// into the same accumulator: `float(q & mask)` is the same float the implicit
+// conversion made. Bit-exactness is `tests/q4k.rs`, not this comment.
+template <typename T, short nr0, short NSG, short MW>
+[[kernel]] void q4k_qmv_mh(
+    const device uint16_t* qs [[buffer(0)]],
+    const device uint16_t* scales [[buffer(1)]],
+    const device half* dm [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& O [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint16_t kmask1 = 0x3f3f;
+  constexpr uint16_t kmask2 = 0x0f0f;
+  constexpr uint16_t kmask3 = 0xc0c0;
+
+  const short ix = tiisg / 8;
+  const short it = tiisg % 8;
+  const short iq = it / 4;
+  const short ir = it % 4;
+
+  const int nb = K / QK_K;
+  const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
+  const int r1 = int(tgpig.y) * MW;
+
+  const int qs_row = nb * Q4K_QS_U16;
+  const int sc_row = nb * Q4K_SC_U16;
+  const int dm_row = nb * Q4K_DM_F16;
+
+  // A tail group clamps its spare rows onto the last real one and does not
+  // store them.
+  int64_t ybase[MW];
+  for (short m = 0; m < MW; ++m) {
+    ybase[m] = (int64_t)min(r1 + m, M - 1) * K + 64 * iq + 8 * ir;
+  }
+
+  float sumf[MW][nr0];
+  for (short m = 0; m < MW; ++m) {
+    for (short row = 0; row < nr0; ++row) {
+      sumf[m][row] = 0.f;
+    }
+  }
+
+  for (int ib = ix; ib < nb; ib += 4) {
+    const device uint16_t* sc = scales + first_row * sc_row + ib * Q4K_SC_U16 + iq;
+    const device uint16_t* q1 = qs + first_row * qs_row + ib * Q4K_QS_U16 + 16 * iq + 4 * ir;
+    const device half* dh = dm + first_row * dm_row + ib * Q4K_DM_F16;
+
+    for (short row = 0; row < nr0; ++row) {
+      const uint16_t s0 = sc[0] & kmask1;
+      const uint16_t s1 = sc[2] & kmask1;
+      const uint16_t s2 = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+      const uint16_t s3 = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+      const float sc0 = float(s0 & 0xff);
+      const float sc1 = float(s0 >> 8);
+      const float sc2 = float(s1 & 0xff);
+      const float sc3 = float(s1 >> 8);
+      const float sc4 = float(s2 & 0xff);
+      const float sc5 = float(s2 >> 8);
+      const float sc6 = float(s3 & 0xff);
+      const float sc7 = float(s3 >> 8);
+      const float d0 = float(dh[0]);
+      const float d1 = float(dh[1]);
+
+      // The block's codes, once.
+      float wq1[16];
+      float wq2[16];
+      for (short i = 0; i < 4; ++i) {
+        const uint16_t a = q1[i];
+        const uint16_t b = q1[32 + i];
+        wq1[4 * i + 0] = float(a & 0x000F);
+        wq1[4 * i + 1] = float(a & 0x0F00);
+        wq1[4 * i + 2] = float(a & 0x00F0);
+        wq1[4 * i + 3] = float(a & 0xF000);
+        wq2[4 * i + 0] = float(b & 0x000F);
+        wq2[4 * i + 1] = float(b & 0x0F00);
+        wq2[4 * i + 2] = float(b & 0x00F0);
+        wq2[4 * i + 3] = float(b & 0xF000);
+      }
+
+      for (short m = 0; m < MW; ++m) {
+        const device T* y4m = x + ybase[m] + ib * QK_K;
+
+        float yl[16];
+        float yh[16];
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+          yl[i + 0] = float(y4m[i + 0]);
+          sumy[0] += yl[i + 0];
+          yl[i + 8] = float(y4m[i + 32]);
+          sumy[1] += yl[i + 8];
+          yh[i + 0] = float(y4m[i + 128]);
+          sumy[2] += yh[i + 0];
+          yh[i + 8] = float(y4m[i + 160]);
+          sumy[3] += yh[i + 8];
+        }
+
+        float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 4; ++i) {
+          acc1[0] += yl[2 * i + 0] * wq1[4 * i + 0];
+          acc1[1] += yl[2 * i + 1] * wq1[4 * i + 1];
+          acc1[2] += yl[2 * i + 8] * wq1[4 * i + 2];
+          acc1[3] += yl[2 * i + 9] * wq1[4 * i + 3];
+          acc2[0] += yh[2 * i + 0] * wq2[4 * i + 0];
+          acc2[1] += yh[2 * i + 1] * wq2[4 * i + 1];
+          acc2[2] += yh[2 * i + 8] * wq2[4 * i + 2];
+          acc2[3] += yh[2 * i + 9] * wq2[4 * i + 3];
+        }
+
+        sumf[m][row] +=
+            d0 *
+                ((acc1[0] + 1.f / 256.f * acc1[1]) * sc0 +
+                 (acc1[2] + 1.f / 256.f * acc1[3]) * sc1 * 1.f / 16.f +
+                 (acc2[0] + 1.f / 256.f * acc2[1]) * sc4 +
+                 (acc2[2] + 1.f / 256.f * acc2[3]) * sc5 * 1.f / 16.f) -
+            d1 * (sumy[0] * sc2 + sumy[1] * sc3 + sumy[2] * sc6 + sumy[3] * sc7);
+      }
+
+      q1 += qs_row;
+      sc += sc_row;
+      dh += dm_row;
+    }
+  }
+
+  for (short m = 0; m < MW; ++m) {
+    if (r1 + m >= M) {
+      break;
+    }
+    for (short row = 0; row < nr0 && first_row + row < O; ++row) {
+      const float sum_all = simd_sum(sumf[m][row]);
+      if (tiisg == 0) {
+        out[(int64_t)(r1 + m) * O + first_row + row] = T(sum_all);
+      }
+    }
+  }
+}
+
 // `kernel_mul_mv_id`: the MoE gather. One output row per (token, expert) pair
 // -- `lhs[r]` says which row of `x` it reads and `rhs[r]` which expert's
 // weights it reads, which is `mx.gather_qmm`'s contract and `SwitchGLU`'s
@@ -334,6 +660,12 @@ struct Q4KFmt {
 #define instantiate_q4k(tname, type)                                           \
   instantiate_kernel("q4k_dequantize_" #tname, q4k_dequantize, type)           \
   instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)                   \
+  instantiate_kernel("q4k_qmv_m2_" #tname, q4k_qmv_m, type, 2, 2, 2)           \
+  instantiate_kernel("q4k_qmv_m3_" #tname, q4k_qmv_m, type, 2, 2, 3)           \
+  instantiate_kernel("q4k_qmv_m4_" #tname, q4k_qmv_m, type, 2, 2, 4)           \
+  instantiate_kernel("q4k_qmv_mh2_" #tname, q4k_qmv_mh, type, 2, 2, 2)         \
+  instantiate_kernel("q4k_qmv_mh3_" #tname, q4k_qmv_mh, type, 2, 2, 3)         \
+  instantiate_kernel("q4k_qmv_mh4_" #tname, q4k_qmv_mh, type, 2, 2, 4)         \
   instantiate_kernel("q4k_gather_qmv_" #tname, q4k_gather_qmv, type, 2, 2)     \
   instantiate_kernel(                                                          \
       "q4k_qmm_t_r32_" #tname, kquant_qmm_t, type, Q4KFmt, float, 32)         \

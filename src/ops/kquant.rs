@@ -135,6 +135,109 @@ pub fn mm_rows_id(rows: usize, experts: usize) -> usize {
     }
 }
 
+/// Rows of `x` one dispatch of the mat-vec carries, `ORNITH_QMV_ROWS`.
+///
+/// 1 turns the multi-row kernel off and sends every width back through
+/// `q*_qmv` one row at a time, which is what the port did before Phase 28 and
+/// what the A/B is against; 2..4 pin a width. The default is 4, which is a
+/// verify window at the deepest depth `sdpa` will fuse.
+///
+/// Worth, end to end on `q6k-full`, 200 tokens, greedy, two draws each and
+/// the acceptance byte-identical between them (GPU ms a token):
+///
+///   config                  a row each   this kernel
+///   --mtp-depth 1 --frspec   6.78/6.80   **6.60/6.60**
+///   --mtp-depth 3 --frspec   8.72/8.72   **8.28/8.30**
+///
+/// -2.8% and -5.0%, against the -12% to -21% Phase 27 priced it at.
+///
+/// Instantiated widths only -- a kernel per width is how the row loop unrolls,
+/// and `MW` past four runs out of registers for the activations it holds.
+static QMV_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn qmv_rows() -> usize {
+    use std::sync::atomic::Ordering;
+    match QMV_ROWS.load(Ordering::Relaxed) {
+        0 => {
+            let n = match std::env::var("ORNITH_QMV_ROWS").as_deref() {
+                Ok("1") => 1,
+                Ok("2") => 2,
+                Ok("3") => 3,
+                Err(_) | Ok("4") => 4,
+                Ok(other) => panic!("ORNITH_QMV_ROWS={other}: 1 (off) to 4"),
+            };
+            QMV_ROWS.store(n, Ordering::Relaxed);
+            n
+        }
+        n => n,
+    }
+}
+
+/// `ORNITH_QMV_HOIST=0`: go back to unpacking the codes once a row.
+///
+/// The second half of the multi-row kernel, and the one the measurement asked
+/// for: at MW rows the kernel is arithmetic-bound, and what repeats per row
+/// is the dequantize rather than the read.
+///
+/// **Q6_K only, and that is measured rather than assumed.** Both kernels
+/// exist and both are bit-exact; inside a width-4 verify, per kernel, with
+/// `ORNITH_COMMIT_EVERY=1`:
+///
+///   ms a verify        a row each   one read   + unpacked
+///   q6k dense mat-vec      2.118      2.505      **1.677**
+///   q4k dense mat-vec      5.297    **5.220**      5.789
+///
+/// Q6_K unpacks five operations a weight (two masks, a shift, an or and the
+/// bias) against the one multiply-add that spends it, so hoisting it out of
+/// the row loop is most of the inner loop. Q4_K unpacks one mask and one
+/// conversion, and the hoist costs it what it saves: holding 32 unpacked
+/// weights forces the output row outside the row-of-`x` loop, which doubles
+/// the activation reads to one a multiply-add. So `ORNITH_QMV_HOIST` applies
+/// to Q6_K and Q4_K stays on the shared read alone.
+static QMV_HOIST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Which formats unpack once a block: none, Q6_K, or both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hoist {
+    Off,
+    /// The default, and the only one that measures a win.
+    Q6K,
+    /// Q4_K too, which is 9% slower and is kept so the next session can
+    /// re-measure it instead of re-deriving it.
+    All,
+}
+
+pub fn qmv_hoist() -> Hoist {
+    use std::sync::atomic::Ordering;
+    match QMV_HOIST.load(Ordering::Relaxed) {
+        0 => {
+            let h = match std::env::var("ORNITH_QMV_HOIST").as_deref() {
+                Ok("0") => Hoist::Off,
+                Ok("all") => Hoist::All,
+                Err(_) | Ok("1") => Hoist::Q6K,
+                Ok(other) => panic!("ORNITH_QMV_HOIST={other}: 0, 1 or all"),
+            };
+            QMV_HOIST.store(h as u8 + 1, Ordering::Relaxed);
+            h
+        }
+        1 => Hoist::Off,
+        2 => Hoist::Q6K,
+        _ => Hoist::All,
+    }
+}
+
+pub fn set_qmv_hoist(h: Hoist) {
+    QMV_HOIST.store(h as u8 + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The same for everything dispatched after this call, so one process can
+/// measure both kernels -- the only honest A/B on a machine whose wall clock
+/// swings between sittings.
+pub fn set_qmv_rows(rows: usize) {
+    assert!((1..=4).contains(&rows), "only 1 (off) to 4 are instantiated");
+    QMV_ROWS.store(rows, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `ORNITH_KQUANT_TILE_HALF=1`: ggml's own tile scalar instead of this port's.
 ///
 /// ggml dequantizes into `half` and multiplies half by half; this port
@@ -338,19 +441,27 @@ pub fn dequantize(ctx: &Context, w: &KMatrix, dtype: Dtype) -> Array {
 /// prefill it is the price of not having written `qmm_t` yet, and it is paid
 /// in time rather than in correctness.
 ///
-/// **At a speculative verify window it is neither free nor prefill, and that
-/// is now the largest lever this port has left.** `REBUILD.md` Phase 27: a
-/// verify forward over `depth + 1` rows costs 3.4 ms a row on `q6k-full`,
-/// 41% of which is this kernel reading the same matrix once per row -- 91
-/// dispatches at both widths, 2.8x the time at four rows. Neither existing
-/// kernel is the answer at that width ([`qmm_t`] reads the matrix once but
-/// its floor is 7.5x a mat-vec, so it only crosses over at
-/// [`MM_ROW_LIMIT`]), and the grid axis order is not it either -- swapping
-/// the rows onto x, which is where mlx's affine `qmv` puts them, measured
-/// 1.00 and was reverted. What would pay is an M axis *inside* this kernel:
-/// the `ib` loop reads a block once and accumulates it into M row
-/// accumulators, leaving each row's order exactly as it is here, so the
-/// window mode's contract holds by construction.
+/// **At a speculative verify window it is neither free nor prefill, and
+/// Phase 28 is what that turned out to be worth.** Phase 27 measured a
+/// verify row at 3.4 ms on `q6k-full`, 41% of it this kernel, with the
+/// dispatch count fixed and the time 2.8x at four rows -- and read that as
+/// the weights being read once per row. The kernel that reads them once for
+/// all M rows (`q*_qmv_m{2,3,4}`, [`qmv_rows`]) is bit-exact against this one
+/// and measures **~0 on the verify**: 3.14 ms a row against 3.14.
+///
+/// The re-read was never the binding cost. On `lm_head`, dispatched one at a
+/// time, a single row reads 286 MB in 0.550 ms -- 520 GB/s, this machine's
+/// ceiling -- and four rows through the shared-read kernel read the same
+/// 286 MB in 1.488, which is 192 GB/s. Past the first row the kernel is
+/// **arithmetic**-bound, and the three reads it saves were already hidden
+/// under the arithmetic that consumes them. What repeats per row and is not
+/// hidden is the *dequantize*, which is why the kernel that pays is the one
+/// that hoists that ([`qmv_hoist`]) and why it pays only on Q6_K.
+///
+/// The other three candidates are still refuted: [`qmm_t`] reads the matrix
+/// once but its floor is 7.5x a mat-vec ([`MM_ROW_LIMIT`]), mlx's `qmv_wide`
+/// shares a read between five rows at 0.57x and a different association, and
+/// the grid axis order measured 1.00.
 pub fn qmv(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
     let (o, k) = (w.out_dims(), w.in_dims());
     assert_eq!(x.shape[x.ndim() - 1], k, "{} qmv: x is {k}-wide?", w.kind.name());
@@ -371,15 +482,37 @@ pub fn qmv(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
     let n = shape.len();
     shape[n - 1] = o;
     let out = Array::empty(ctx, &shape, x.dtype);
-    ctx.kernel(&w.kernel("qmv", x.dtype))
+
+    // The M axis on the grid re-reads the matrix per row; the M axis inside
+    // the kernel reads it once. Same arithmetic per row either way, so the
+    // choice is free of the invariance question -- see `qmv_rows`.
+    let mw = qmv_rows().min(m);
+    let hoisted = match qmv_hoist() {
+        Hoist::Off => false,
+        Hoist::Q6K => w.kind == KQuant::Q6K,
+        Hoist::All => true,
+    };
+    let name = match (mw > 1, hoisted) {
+        (false, _) => "qmv".to_string(),
+        (true, false) => format!("qmv_m{mw}"),
+        (true, true) => format!("qmv_mh{mw}"),
+    };
+    let call = ctx
+        .kernel(&w.kernel(&name, x.dtype))
         .arr(&w.qs)
         .arr(&w.scales)
         .arr(&w.dm)
         .arr(x)
         .out(&out)
         .bytes(&(k as i32))
-        .bytes(&(o as i32))
-        .groups((o / (NSG * NR0), m, 1), (32, NSG, 1));
+        .bytes(&(o as i32));
+    if mw > 1 {
+        // The last group covers a short tail by repeating the last row, which
+        // the kernel computes and does not store.
+        call.bytes(&(m as i32)).groups((o / (NSG * NR0), m.div_ceil(mw), 1), (32, NSG, 1));
+    } else {
+        call.groups((o / (NSG * NR0), m, 1), (32, NSG, 1));
+    }
     out
 }
 
@@ -546,10 +679,11 @@ pub fn gather_qmm_t(
 /// same conservative rule the old 8 was picked by, and it still leaves the
 /// speculative verify window (`depth + 1` = 4 rows) on the mat-vec.
 ///
-/// That last clause reads like a happy accident and is the right call for the
-/// wrong reason: Phase 27 measured the tile at 2x the mat-vec at four rows,
-/// so the window belongs here -- but the mat-vec is itself paying 4 reads of
-/// the matrix, and what the window wants is a kernel neither of these is.
+/// That last clause reads like a happy accident and is the right call for a
+/// reason Phase 28 had to measure: the tile is 2x the mat-vec at four rows,
+/// and the mat-vec's four reads of the matrix -- which looked like the thing
+/// to fix -- cost almost nothing, because the kernel is arithmetic-bound
+/// there. See [`qmv`].
 const MM_ROW_LIMIT: usize = 16;
 
 /// `ORNITH_KQUANT_GEMM=0` sends every shape back through the mat-vec.

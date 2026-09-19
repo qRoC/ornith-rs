@@ -67,10 +67,28 @@ fn gpu_ms(ctx: &Context, mut f: impl FnMut()) -> f64 {
     ctx.prof_reset();
     for _ in 0..REPS {
         f();
+        if serial() {
+            ctx.sync();
+        }
     }
     ctx.sync();
     let (_, _, gpu_s, _) = ctx.prof_totals();
     gpu_s * 1e3 / REPS as f64
+}
+
+/// `ORNITH_SERIAL=1`: drain the queue between repetitions.
+///
+/// The bin's own caveat, made measurable. Sixteen repetitions back to back
+/// are sixteen *independent* dispatches, and the encoder runs them
+/// concurrently -- so several copies of the weight read are in flight at once
+/// and serve each other out of cache. A verify runs its mat-vecs in a
+/// dependency chain, one at a time, each evicting the last. This mode is that
+/// one, and the difference between the two columns is how much of a module's
+/// re-read the cache was absorbing.
+fn serial() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ORNITH_SERIAL").as_deref() == Ok("1"))
 }
 
 fn best(ctx: &Context, mut f: impl FnMut()) -> f64 {
@@ -141,20 +159,32 @@ fn main() {
         for (i, m) in WIDTHS.iter().enumerate() {
             let x = Array::empty(&ctx, &[*m, w.in_dims()], Dtype::BF16);
             zero(&ctx, &x);
+            // The A/B this bin was reopened for, both halves in one process:
+            // the token axis on the grid (a matrix read a row) against the
+            // token axis inside the kernel (a matrix read once).
+            kquant::set_qmv_rows(1);
             let t = best(&ctx, || {
                 let _ = w.matmul(&ctx, &x);
             });
+            kquant::set_qmv_rows(4);
+            let inside = match &w {
+                Linear::K(_) => best(&ctx, || {
+                    let _ = w.matmul(&ctx, &x);
+                }),
+                _ => f64::NAN,
+            };
             let (alt, alt_name) = alternative(&ctx, &w, &x);
             if i == 0 {
                 base = (t, alt);
                 println!(
-                    "  {:>6} {:>13} {:>8} {:>13} {:>8}",
-                    "M", "as dispatched", "vs M=1", alt_name, "vs M=1"
+                    "  {:>6} {:>13} {:>8} {:>13} {:>8} {:>13} {:>8}",
+                    "M", "a row each", "vs M=1", "M inside", "vs M=1", alt_name, "vs M=1"
                 );
             }
             println!(
-                "  {m:>6} {t:>13.3} {:>8.2} {alt:>13.3} {:>8.2}",
+                "  {m:>6} {t:>13.3} {:>8.2} {inside:>13.3} {:>8.2} {alt:>13.3} {:>8.2}",
                 t / base.0,
+                inside / base.0,
                 alt / base.1
             );
         }

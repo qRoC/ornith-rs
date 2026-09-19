@@ -929,8 +929,10 @@ The two structural costs, which are why deeper is worse:
    **Phase 27 sizes it against everything else the window costs**, which is
    what this item never had: the expert gather is **30%** of what a verify
    pays per extra row on `q6k-full`. The larger share, 41%, is the dense
-   k-quant mat-vecs reading the same weights once per row -- a re-read, not
-   new traffic, and the one part of a window that can be taken back exactly.
+   k-quant mat-vecs -- which Phase 27 read as a re-read that could be taken
+   back exactly, and Phase 28 measured as arithmetic that cannot. Taking the
+   re-read back is worth 2.8% a token; **this 30% is now the larger of the two
+   remaining pieces of a window row.**
 
 A dense model would win here; a 3B-active MoE with an unpruned draft head does
 not. FR-Spec is the fix for the first of those, and it is in -- see below.
@@ -984,20 +986,24 @@ Three consequences, all of which replace something this file used to say:
 - **The draft's 256-expert MoE is 0.167 ms**, 1.4% of a cycle. It is the worst
   shape this model has and it is not a lever; making it free would not be
   measurable in a run.
-- **What scales with the window is the trunk re-reading its weights.** 41% of
-  the width cost is dense k-quant mat-vecs -- same dispatch count, same
-  weights, read once per row, because ggml's mat-vec carries the token axis on
-  the grid; 30% is the expert gather paying for 32 rows where ~23 are distinct
-  experts; 29% is `forward_capture` stepping the gated-delta recurrence one
-  token at a time. `REBUILD.md` Phase 27 has the per-kernel table, the three
-  fixes that are *not* it (the grid axis order, the tile, `qmv_wide` -- all
-  three built or measured and all three refuted), and the one that is: a
-  multi-row k-quant mat-vec that reads each weight block once and keeps every
-  row's accumulation order, which is worth **-21% a token at depth 1 against
-  -12% today** and stops depth 3 losing. (Those two are on Phase 27's own
-  44-token prompt, where autoregression measures 8.56 GPU ms a token and
-  `--mtp-depth 1 --frspec` 7.53 -- the same -12 to -14% this table's -13.7%
-  records on its own prompt.)
+- **What scales with the window is the trunk doing the work again per row.**
+  41% of the width cost is dense k-quant mat-vecs; 30% is the expert gather
+  paying for 32 rows where ~23 are distinct experts; 29% is `forward_capture`
+  stepping the gated-delta recurrence one token at a time. `REBUILD.md`
+  Phase 27 has the per-kernel table and the three fixes that are *not* it (the
+  grid axis order, the tile, `qmv_wide` -- all three built or measured and all
+  three refuted).
+
+  **Phase 27 read the 41% as the weights being re-read once per row, priced
+  taking it back at -21% a token, and Phase 28 built it and measured -2.8%.**
+  The re-read is not what a window row costs: on `lm_head` one row already
+  sustains 520 GB/s, the machine's ceiling, and four rows through a kernel
+  that reads the matrix once run at 192 -- past the first row the mat-vec is
+  arithmetic-bound and the saved reads were hidden under the arithmetic. What
+  did pay is hoisting the **dequantize** out of the row loop, and only where
+  it is expensive: Q6_K -21% on that kernel, Q4_K +9% and left alone. Whole
+  run: **-2.8% a token at depth 1 and -5.0% at depth 3**, with the acceptance
+  byte-identical.
 
 ### How exact it is: exactly, and it is the default
 
@@ -1920,7 +1926,12 @@ In order:
    the wall, and the eighth explanation still needs a machine that is not
    swapping. Fixing it is worth another ~13 tok/s on top, not the whole win.
 
-5. **A multi-row k-quant mat-vec, which is the largest measured lever left.**
+5. **A multi-row k-quant mat-vec -- built in Phase 28, worth an eighth of
+   what this item predicted.** Everything below is what was predicted; the
+   measurement is `REBUILD.md` Phase 28 and it is `-2.8%` a token at depth 1,
+   not `-21%`, because the re-read this item is about was never the binding
+   cost. Kept as written because the *reasoning* is the thing to learn from:
+   every clause of it is sound except the one that was never checked.
    `REBUILD.md` Phase 27: a verify forward costs **3.4 ms per row of the
    window** on `q6k-full`, against a draft level's 0.587, and 41% of that is
    the dense k-quant mat-vecs reading the same weight matrix once per row --

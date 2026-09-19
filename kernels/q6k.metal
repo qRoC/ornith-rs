@@ -194,6 +194,172 @@ template <typename T, short nr0, short NSG>
       sgitg);
 }
 
+// The same mat-vec with the token axis moved **inside**, as in `q4k.metal`.
+//
+// One threadgroup takes `MW` rows of `x`; the block loop reads a block's
+// weights once into registers and feeds all of them. Each row's accumulator
+// sees the same blocks in the same order as a one-row call, so the two agree
+// bit for bit and `ops::invariant`'s window mode can keep this kernel on.
+template <typename T, short nr0, short NSG, short MW, bool HOIST>
+[[kernel]] void q6k_qmv_m(
+    const device uint8_t* w [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device half* dm [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& O [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint8_t kmask1 = 0x03;
+  constexpr uint8_t kmask2 = 0x0C;
+  constexpr uint8_t kmask3 = 0x30;
+  constexpr uint8_t kmask4 = 0xC0;
+
+  const int nb = K / QK_K;
+  const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
+  const int r1 = int(tgpig.y) * MW;
+
+  const int w_row = nb * Q6K_W_BYTES;
+  const int sc_row = nb * Q6K_SC;
+  const int d_row = nb * Q6K_D;
+
+  const short tid = tiisg / 2;
+  const short ix = tiisg % 2;
+  const short ip = tid / 8; // 0 or 1, which half of the block
+  const short il = tid % 8;
+  const short l0 = 4 * il;
+  const short is = 8 * ip + l0 / 16;
+
+  const short y_offset = 128 * ip + l0;
+  const short q_offset_l = 64 * ip + l0;
+  const short q_offset_h = 32 * ip + l0;
+
+  // A tail threadgroup clamps its spare rows onto the last real one: they
+  // compute an answer nobody stores, which keeps the inner loops free of a
+  // bound test.
+  int64_t ybase[MW];
+  for (short m = 0; m < MW; ++m) {
+    ybase[m] = (int64_t)min(r1 + m, M - 1) * K + y_offset;
+  }
+
+  float sumf[MW][nr0];
+  for (short m = 0; m < MW; ++m) {
+    for (short row = 0; row < nr0; ++row) {
+      sumf[m][row] = 0.f;
+    }
+  }
+
+  for (int i = ix; i < nb; i += 2) {
+    // This block's weights, once, for every row of `x` below.
+    const device uint8_t* q1 = w + first_row * w_row + i * Q6K_W_BYTES + q_offset_l;
+    const device uint8_t* qh =
+        w + first_row * w_row + i * Q6K_W_BYTES + Q6K_QL_BYTES + q_offset_h;
+    const device int8_t* sc =
+        (const device int8_t*)(scales + first_row * sc_row + i * Q6K_SC) + is;
+    const device half* dh = dm + first_row * d_row + i * Q6K_D;
+
+    uint8_t wl[nr0][4];
+    uint8_t wu[nr0][4];
+    uint8_t wh[nr0][4];
+    int8_t sv[nr0][4];
+    float dv[nr0];
+
+    for (short row = 0; row < nr0; ++row) {
+      for (short l = 0; l < 4; ++l) {
+        wl[row][l] = q1[l];
+        wu[row][l] = q1[32 + l];
+        wh[row][l] = qh[l];
+      }
+      sv[row][0] = sc[0];
+      sv[row][1] = sc[2];
+      sv[row][2] = sc[4];
+      sv[row][3] = sc[6];
+      dv[row] = float(dh[0]);
+
+      q1 += w_row;
+      qh += w_row;
+      sc += sc_row;
+      dh += d_row;
+    }
+
+    // The codes unpacked once per block instead of once per block and row of
+    // `x`. Q6_K's unpack is five operations a weight -- two masks, a shift,
+    // an or and the bias -- against the one fused multiply-add that consumes
+    // it, so at MW rows this is the larger half of the inner loop, and it is
+    // the half the one-row kernel cannot amortise. The values are the same
+    // integers either way, so the products below are the same products.
+    float wq[HOIST ? nr0 : 1][16];
+    if (HOIST) {
+      for (short row = 0; row < nr0; ++row) {
+        for (short l = 0; l < 4; ++l) {
+          wq[row][4 * l + 0] =
+              float((int8_t)((wl[row][l] & 0xF) | ((wh[row][l] & kmask1) << 4)) - 32);
+          wq[row][4 * l + 1] =
+              float((int8_t)((wu[row][l] & 0xF) | ((wh[row][l] & kmask2) << 2)) - 32);
+          wq[row][4 * l + 2] =
+              float((int8_t)((wl[row][l] >> 4) | ((wh[row][l] & kmask3) << 0)) - 32);
+          wq[row][4 * l + 3] =
+              float((int8_t)((wu[row][l] >> 4) | ((wh[row][l] & kmask4) >> 2)) - 32);
+        }
+      }
+    }
+
+    for (short m = 0; m < MW; ++m) {
+      const device T* y = x + ybase[m] + i * QK_K;
+
+      float yl[16];
+      for (short l = 0; l < 4; ++l) {
+        yl[4 * l + 0] = float(y[l + 0]);
+        yl[4 * l + 1] = float(y[l + 32]);
+        yl[4 * l + 2] = float(y[l + 64]);
+        yl[4 * l + 3] = float(y[l + 96]);
+      }
+
+      for (short row = 0; row < nr0; ++row) {
+        float4 sums = {0.f, 0.f, 0.f, 0.f};
+
+        for (short l = 0; l < 4; ++l) {
+          if (HOIST) {
+            sums[0] += yl[4 * l + 0] * wq[row][4 * l + 0];
+            sums[1] += yl[4 * l + 1] * wq[row][4 * l + 1];
+            sums[2] += yl[4 * l + 2] * wq[row][4 * l + 2];
+            sums[3] += yl[4 * l + 3] * wq[row][4 * l + 3];
+          } else {
+            sums[0] +=
+                yl[4 * l + 0] * ((int8_t)((wl[row][l] & 0xF) | ((wh[row][l] & kmask1) << 4)) - 32);
+            sums[1] +=
+                yl[4 * l + 1] * ((int8_t)((wu[row][l] & 0xF) | ((wh[row][l] & kmask2) << 2)) - 32);
+            sums[2] +=
+                yl[4 * l + 2] * ((int8_t)((wl[row][l] >> 4) | ((wh[row][l] & kmask3) << 0)) - 32);
+            sums[3] +=
+                yl[4 * l + 3] * ((int8_t)((wu[row][l] >> 4) | ((wh[row][l] & kmask4) >> 2)) - 32);
+          }
+        }
+
+        sumf[m][row] +=
+            dv[row] *
+            (sums[0] * sv[row][0] + sums[1] * sv[row][1] + sums[2] * sv[row][2] +
+             sums[3] * sv[row][3]);
+      }
+    }
+  }
+
+  for (short m = 0; m < MW; ++m) {
+    if (r1 + m >= M) {
+      break;
+    }
+    for (short row = 0; row < nr0 && first_row + row < O; ++row) {
+      const float sum_all = simd_sum(sumf[m][row]);
+      if (tiisg == 0) {
+        out[(int64_t)(r1 + m) * O + first_row + row] = T(sum_all);
+      }
+    }
+  }
+}
+
 // The MoE gather, as in `q4k.metal`: `lhs[r]` picks the token, `rhs[r]` the
 // expert.
 template <typename T, short nr0, short NSG>
@@ -288,6 +454,12 @@ struct Q6KFmt {
 #define instantiate_q6k(tname, type)                                           \
   instantiate_kernel("q6k_dequantize_" #tname, q6k_dequantize, type)           \
   instantiate_kernel("q6k_qmv_" #tname, q6k_qmv, type, 2, 2)                   \
+  instantiate_kernel("q6k_qmv_m2_" #tname, q6k_qmv_m, type, 2, 2, 2, false)     \
+  instantiate_kernel("q6k_qmv_m3_" #tname, q6k_qmv_m, type, 2, 2, 3, false)     \
+  instantiate_kernel("q6k_qmv_m4_" #tname, q6k_qmv_m, type, 2, 2, 4, false)     \
+  instantiate_kernel("q6k_qmv_mh2_" #tname, q6k_qmv_m, type, 2, 2, 2, true)     \
+  instantiate_kernel("q6k_qmv_mh3_" #tname, q6k_qmv_m, type, 2, 2, 3, true)     \
+  instantiate_kernel("q6k_qmv_mh4_" #tname, q6k_qmv_m, type, 2, 2, 4, true)     \
   instantiate_kernel("q6k_gather_qmv_" #tname, q6k_gather_qmv, type, 2, 2)     \
   instantiate_kernel(                                                          \
       "q6k_qmm_t_r32_" #tname, kquant_qmm_t, type, Q6KFmt, float, 32)         \

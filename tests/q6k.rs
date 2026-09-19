@@ -17,7 +17,8 @@
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
 use ornith_rs::ops::kquant::{
-    KMatrix, KQuant, dequantize, gather_qmm_t, gather_qmv, qmm_t, qmv,
+    Hoist, KMatrix, KQuant, dequantize, gather_qmm_t, gather_qmv, qmm_t, qmv,
+    set_qmv_hoist,
 };
 use ornith_rs::refs::{RefCase, compare};
 
@@ -50,6 +51,62 @@ fn dequantize_matches_ggml() {
         let got = dequantize(&ctx, &w, Dtype::F32);
         let d = compare(&got.to_vec_f32(&ctx), &case.f32(&format!("{name}_deq")));
         assert_eq!(d.max_abs, 0.0, "{name} dequantize: {d}");
+    }
+}
+
+/// A window of rows is the one-row answer M times over, bit for bit.
+///
+/// `q6k_qmv_m*` reads a weight block once and accumulates it into M row
+/// accumulators, where `q6k_qmv` reads the whole matrix once per row. What
+/// makes that a kernel the window mode can keep rather than a tile it has to
+/// refuse is that nothing else moves: the same blocks reach each row's
+/// accumulator in the same order, so the two agree exactly and not to a
+/// tolerance. `max_abs == 0.0` is the whole contract.
+///
+/// The widths past 4 are the tail: a group covering rows nobody asked for
+/// repeats the last one and must not store it.
+#[test]
+fn the_multi_row_matvec_is_the_one_row_matvec() {
+    let Some(case) = RefCase::open_or_skip("q6k") else { return };
+    let ctx = Context::new().unwrap();
+    for name in CASES {
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        let base = case.get(&format!("{name}_x")).to_f32();
+
+        // Rows that differ from one another, so a wrong stride or a row
+        // reading its neighbour's accumulator shows up as a wrong answer
+        // instead of a lucky match.
+        let row_of = |m: usize| -> Vec<f32> {
+            base.iter()
+                .enumerate()
+                .map(|(i, v)| v * (1.0 + m as f32 * 0.25) + ((m * 13 + i) % 7) as f32 * 1e-3)
+                .collect()
+        };
+
+        for width in [2usize, 3, 4, 5, 8] {
+            let mut all = Vec::with_capacity(width * cols);
+            let mut want = Vec::new();
+            for m in 0..width {
+                let r = row_of(m);
+                // `qmv` at one row is the one-row kernel whatever the knobs
+                // say, so this baseline is the thing being replaced.
+                let one = Array::from_f32_as_bf16(&ctx, &r, &[1, cols]);
+                want.extend(qmv(&ctx, &one, &w).to_vec_f32(&ctx));
+                all.extend(r);
+            }
+            let x = Array::from_f32_as_bf16(&ctx, &all, &[width, cols]);
+            // Both multi-row kernels: the one that shares the weight read and
+            // the one that also unpacks the codes once. Only one of them is
+            // dispatched for this format by default, and both owe the same
+            // answer.
+            for hoist in [Hoist::Off, Hoist::All] {
+                set_qmv_hoist(hoist);
+                let d = compare(&qmv(&ctx, &x, &w).to_vec_f32(&ctx), &want);
+                assert_eq!(d.max_abs, 0.0, "{name} at M = {width}, {hoist:?}: {d}");
+            }
+            set_qmv_hoist(Hoist::Q6K);
+        }
     }
 }
 
