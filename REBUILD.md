@@ -5812,20 +5812,30 @@ from that same run:
       the chunk, real            1410.4 ms   1505 dispatches   clamp 5.7%
       the same, inflated         1563.8 ms   (8%, as Phase 35 found)
 
-      kernel             count      us     floor   per dispatch      bytes
-      unsort_rows           40  78929.6    110.9      1943.5 us   134.2 MB
-      gather_rows_div       40  71718.3    129.6      1776.8 us    67.1 MB
-      gather_u32            40    128.3     95.0         3.2 us     0.3 MB
-      moe_combine           40  11383.8    238.0       284.6 us     72.0 MB
+      kernel             count      us     floor   per dispatch  bytes a dispatch
+      unsort_rows           40  78929.6    110.9      1973.2 us   134.2 MB moved
+      gather_rows_div       40  71718.3    129.6      1793.0 us    67.1 MB written
+      moe_combine           40  11383.8    238.0       284.6 us    75.5 MB read
+      sort_block_scatter    40   2760.6   2600.6        69.0 us
+      sort_block_offsets    40   1110.5   1017.9        27.8 us
+      sort_block_hist       40    158.9   1615.3         4.0 us
+      gather_u32            40    137.4     98.0         3.4 us
 
 **The two are 150.6 ms, 10.7% of that run's own 1410.4.** So the object
 Phase 35 named survived re-measurement, and the gather's per-dispatch cost
-had *fallen* by half (3.44 ms to 1.78) now that the serial sort no longer
+had *fallen* by half (3.44 ms to 1.79) now that the serial sort no longer
 runs beside it -- which is the whole reason the re-take was the first
 instruction and not a formality.
 
+**And it closes one of Phase 35's open items on the way.** The sort was
+left "not re-measured after parallelising -- the scatter is still one
+thread per 256-element block". It is: the three kernels together are
+**4.0 ms a chunk**, where `counting_sort_experts` was 167.6, and the
+one-thread scatter is 2.76 ms of that -- **0.2% of the chunk**. There is
+nothing left in it.
+
 The row to stare at is the last column against the clock. **67.1 MB written
-in 1.777 ms is 37.8 GB/s. 134.2 MB moved in 1.943 ms is 69 GB/s. This
+in 1.793 ms is 37.4 GB/s. 134.2 MB moved in 1.973 ms is 68 GB/s. This
 machine does 465.** Nothing in either kernel is scattered enough to explain
 that: a row is 4 KB of contiguous bfloat16 and consecutive threadgroups walk
 one row. That reading is what the phase eventually turned on, and it is
@@ -5887,7 +5897,7 @@ would have shipped, and **the control is what is wrong with it.**
 
 ### The width, which nothing had asked about
 
-38 GB/s on a 465 GB/s machine is not a gather being a gather. `dim` is 2048
+37 GB/s on a 465 GB/s machine is not a gather being a gather. `dim` is 2048
 bfloat16, so a row is 4 KB and a threadgroup of 256 threads copies 512
 contiguous bytes -- **two bytes a thread**. Sixteen bytes a thread is the
 same copy at a width the machine is built for, and it is fifteen lines:

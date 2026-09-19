@@ -76,7 +76,7 @@ template <typename T>
 // The same gather, sixteen bytes a thread instead of two.
 //
 // The scalar form above is one `bfloat16_t` per thread: 33.5M threads to
-// move 67 MB, and the inventory reads it at **38 GB/s against this
+// move 67 MB, and the inventory reads it at **37 GB/s against this
 // machine's 465** (`REBUILD.md` Phase 36). Nothing about it is scattered
 // enough to explain that -- consecutive threadgroups walk one row -- so the
 // suspect is the access width, and this is that hypothesis as a kernel.

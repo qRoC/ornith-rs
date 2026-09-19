@@ -238,7 +238,7 @@ pub fn switch_glu_sorted(
 /// they were -- one element a thread -- removing them read -8.3% of a
 /// chunk; against the same copies at sixteen bytes a thread it reads
 /// **-0.6%, 7 of 8 pairs down** (`REBUILD.md` Phase 36). The kernels were
-/// moving 67 and 134 MB at 38 and 69 GB/s on a machine that does 465, and
+/// moving 67 and 134 MB at 37 and 68 GB/s on a machine that does 465, and
 /// most of what the inventory was pointing at was their access width and
 /// not their existence. See [`gather_rows`]. This is kept because it is
 /// strictly less work and consistently signed, not because it is the large
@@ -341,11 +341,11 @@ fn glu(
 ///
 /// Two kernels for one copy, and the difference between them is only how
 /// many bytes a thread moves. One element a thread is 33.5M threads and 67
-/// MB at a prefill chunk, and it measured **38 GB/s** against this
+/// MB at a prefill chunk, and it measured **37 GB/s** against this
 /// machine's 465; sixteen bytes a thread is the same copy at an access
 /// width the machine is built for, and it was worth **-4.6% of a 6621-token
 /// prompt, 3 of 3 down** -- four times what removing the copy outright is
-/// worth. Nothing about this kernel is scattered enough to explain 38 GB/s:
+/// worth. Nothing about this kernel is scattered enough to explain 37 GB/s:
 /// consecutive threadgroups walk one row. The width was the whole of it.
 /// A row has to be a whole number of vectors for the wide form, which every
 /// hidden size in this model is, and `ORNITH_MOE_GATHER_WIDE=0` is the

@@ -1367,7 +1367,7 @@ most of it is about reading an instrument on a second object.
   number a gemm will multiply.
 - **Read the bandwidth column, not only the milliseconds.** Phase 35 left
   two kernels named at 78.9 and 78.2 ms and the plan that followed was to
-  remove them. The same rows said 38 and 69 GB/s on a 465 GB/s machine, and
+  remove them. The same rows said 37 and 68 GB/s on a 465 GB/s machine, and
   that was the larger finding: the copies were **two bytes a thread**, and
   a 16-byte access was worth four times what removing them was
   (`REBUILD.md` Phase 36). A kernel an order of magnitude under the
@@ -2069,7 +2069,7 @@ In order:
    is not its plan.** Both copies are gone where the kernels allow it, and
    that is worth **-0.6% of a chunk**. What was worth -4.6% of the prompt
    was noticing that both kernels moved 67 and 134 MB **two bytes a
-   thread** -- 38 and 69 GB/s against this machine's 465 -- and giving them
+   thread** -- 37 and 68 GB/s against this machine's 465 -- and giving them
    a 16-byte access. The first A/B of the removals read -8.3% and was
    measuring the control's access width; it had to be run again once the
    control was widened. **A control has to be the best version of what it
