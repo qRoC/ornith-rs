@@ -4334,6 +4334,81 @@ Two lessons came out of it, both cheap and both kept in the bin:
 
 ---
 
+## Phase 30 -- the capture's stepping, taken apart instead of fused -- **DONE**
+
+Phase 29 measured the loose part of a window row's recurrence third at **11%
+of a row** and said about half of it looked like things the capture does
+*around* the recurrence rather than the recurrence itself. That half is now
+gone, and it took three changes, none of which touches the recurrence
+contract and all of which are exact.
+
+**The conv snapshots.** `forward_capture` sliced the conv window out of
+`conv_input` once per token -- `T` dispatches a layer -- and `rewind` reads
+**one** of them, because a cycle commits one prefix. It keeps `conv_input`
+instead (114 KB a layer, against `T` snapshots of 49 KB) and takes that one
+slice once `keep` is known. `TrunkCapture::rewind` therefore takes a
+`&Context`.
+
+**The output concatenation.** Each step allocated its own `[1, 1, Hv, Dv]`
+and the `T` of them were concatenated afterwards. `gated_delta_kernel_into`
+hands the kernel row `t` of a `[B, T, Hv, Dv]` buffer -- an `Array` carries
+its own offset, so this is the same kernel writing to a different address --
+and the window comes out assembled. `concat_all_time` and `concat_time_4d`
+had no other caller and are gone.
+
+**The gate, and the two slices that fed it.** `gated_delta_update` computes
+`beta` and `compute_g` from its own arguments, so a per-token call recomputed
+both on one-token slices. Both are elementwise over `[B, T, Hv]`, so one call
+over the window gives the same element from the same inputs. And the slices
+that pick a token out of them are *views*: `slice_time` is a kernel because a
+general `[B, T, D]` time slice is strided, but at `B = 1` -- every
+speculative window -- a row is contiguous. The copying form stays for what a
+cache keeps, so that nothing a cache holds points into a pooled buffer.
+
+### What it came to
+
+`src/bin/draft_cost.rs`, `forward_capture` against `forward_hidden` on the
+same window from the same cache state -- the two code paths in one process,
+which is why this number is readable on a machine that was never quiet:
+
+    width-4 verify               dispatches   stepping costs
+    before                          2695         1.109 ms
+    conv snapshots lazy             2575         0.808
+    no output concatenation         2485         0.914  (a loud hour)
+    gate hoisted, slices as views   2065       **0.417**
+
+**A captured token now costs exactly one more dispatch a layer than an
+uncaptured one** -- the recurrence itself -- where it used to cost five. At
+width 1 the capture and the plain forward issue the **same** number of
+dispatches (1665 and 1665) and measure 0.056 ms apart, which is the control
+that says the rest of the column is the thing named.
+
+0.417 ms over three extra rows is **0.139 ms a row, 4.4% of a 3.14 ms row**,
+down from 11%. `--mtp-depth 1` and `--mtp-depth 3` both still print
+byte-identical text to `--greedy`, and the suite is green.
+
+### The lever Phase 27 named is closed, and it was closed by not building it
+
+What remains between the two paths is 90 dispatches at width 4: three extra
+`gated_delta_packed` calls a layer. A fused recurrence -- "one dispatch
+writing all `T` snapshots", which is what Phase 27 asked for and Phase 29
+priced -- would remove those, but it still has to **write** `W` states where
+the stepped form writes `W`; all it can take back is the `W - 1` state
+*reads*, about half of the 0.417. That is ~0.2 ms of a 14.7 ms verify, 2% of
+a row, for a new recurrence kernel and a rewiring of the rewind path. **Not
+worth building.**
+
+Which is the part worth carrying: the thing named as the fix was one of four
+per-token costs, and the other three were not the recurrence at all -- they
+were a snapshot nobody read, a concatenation of outputs that could have been
+written in place, and a gate recomputed on a slice of its own input. None of
+them needed a kernel. **A cost attributed to a mechanism is worth taking
+apart before it is worth optimising**, which is the same lesson as Phases 28
+and 29 in its third form: there, a named term turned out not to be what grew;
+here, a named term turned out to be four terms.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

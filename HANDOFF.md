@@ -1022,6 +1022,19 @@ Three consequences, all of which replace something this file used to say:
   plain form writes one. So the accounting is: 41% arithmetic (5% recovered),
   30% arithmetic (nothing), 29% of which at most 11% of a row is loose.
 
+- **Phase 30 took 60% of that 11% without writing a kernel, and closed the
+  rest as not worth one.** A captured token cost five dispatches a layer more
+  than an uncaptured one; three of the five had nothing to do with the
+  recurrence -- a conv snapshot taken per token of which `rewind` reads one,
+  a concatenation of outputs that the kernel can write in place, and a gate
+  recomputed per token on a slice of its own input. Removing them takes a
+  width-4 verify from 2695 dispatches to 2065 and the cost of stepping from
+  1.109 ms to **0.417**, i.e. 11% of a row to 4.4%, with both depths still
+  printing byte-identical text. What is left is three recurrence calls a
+  layer, and a fused kernel could only take back their state *reads* -- 2% of
+  a row. **The lever this file listed as item 5's sibling is closed by having
+  become unnecessary.**
+
 ### How exact it is: exactly, and it is the default
 
 The acceptance rule and the rewind were always exact. The output was not, and
