@@ -4387,6 +4387,39 @@ that says the rest of the column is the thing named.
 down from 11%. `--mtp-depth 1` and `--mtp-depth 3` both still print
 byte-identical text to `--greedy`, and the suite is green.
 
+### Both builds on a machine that finally went quiet
+
+The table above was taken under a neighbour's load, so the two builds were
+also run against each other on an idle machine (`busy 0%` at both ends),
+`576e42a` in a detached worktree with its own target directory:
+
+    stepping costs, GPU ms      before      after
+      width 1                    0.137     -0.209   (both zero: equal counts)
+      width 2                    0.365      0.012
+      width 3                    0.543      0.290
+      width 4                  **0.832**  **0.378**
+      dispatches at width 4    2695/1975  2065/1975
+
+And the whole loop, four draws a cell, interleaved `before, after, before,
+after` so a drift cancels pairwise, acceptance byte-identical throughout:
+
+    GPU ms a token          before                  after            diff
+    --mtp-depth 1 --frspec  7.29 7.22 7.01 7.39   7.09 7.06 7.31 6.98  -1.6%
+    --mtp-depth 3 --frspec  8.98 8.78 8.99 9.01   8.79 8.55 8.79 9.09  -1.5%
+
+**-1.6% and -1.5% a token, six of eight pairs in the right direction, and
+that is at the edge of what this machine resolves** -- one pair at each depth
+goes the other way by more than the mean difference. It is also smaller than
+the per-verify measurement predicts (0.35 ms a cycle over 1.70 tokens is
+-0.21 ms a token at depth 1; measured -0.12).
+
+So the number of record for this phase is the in-process one -- two code
+paths, one forward, one process, with an equal-dispatch control at width 1 --
+and the loop is quoted as agreeing in sign and order of magnitude rather than
+as the measurement. A change worth ~0.15 ms a token is below what a
+200-token run separates cleanly here, which is worth knowing before the next
+one is priced that way.
+
 ### The lever Phase 27 named is closed, and it was closed by not building it
 
 What remains between the two paths is 90 dispatches at width 4: three extra
