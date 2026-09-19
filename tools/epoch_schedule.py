@@ -187,4 +187,5 @@ def main():
         print(f"  x{c:<4} {k}")
 
 
-main()
+if __name__ == "__main__":
+    main()

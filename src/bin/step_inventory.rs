@@ -213,6 +213,14 @@ fn main() {
     }
     ctx.sync();
     let base = snapshot(&caches);
+    // The trace and the times describe whichever code paths are in force, so
+    // put back what the environment asked for: with both controls set this
+    // bin dumps the *old* stream, which is what a change is ranked against.
+    let want_fuse = std::env::var("ORNITH_FUSE_ADD_RMS").as_deref() != Ok("0");
+    let want_late = std::env::var("ORNITH_MOE_EARLY_GATE").as_deref() != Ok("1");
+    ornith_rs::ops::norm::set_fuse_add_rms(want_fuse);
+    ornith_rs::ops::moe::set_late_shared_gate(want_late);
+
 
     // --- the step, and the same step with the work taken out ---------------
     //
@@ -310,6 +318,7 @@ fn main() {
         on.push(ms);
         don = d;
     }
+    ornith_rs::ops::norm::set_fuse_add_rms(want_fuse);
     let (a, b) = (median(&mut off.clone()), median(&mut on.clone()));
     println!("  {:<24} {a:>9.3} {doff:>11.0}  {off:.3?}", "separate");
     println!("  {:<24} {b:>9.3} {don:>11.0}  {on:.3?}", "fused");
@@ -331,6 +340,7 @@ fn main() {
         ornith_rs::ops::moe::set_late_shared_gate(true);
         late.push(step(&ctx, &mut caches, false).0);
     }
+    ornith_rs::ops::moe::set_late_shared_gate(want_late);
     let pairs: Vec<f64> = late.iter().zip(&early).map(|(l, e)| l - e).collect();
     let (a, b) = (median(&mut early.clone()), median(&mut late.clone()));
     println!("  {:<24} {a:>9.3} {:>11}  {early:.3?}", "beside the router", "");
@@ -340,6 +350,72 @@ fn main() {
         "so",
         b - a,
         "",
+        pairs.iter().sum::<f64>() / pairs.len() as f64,
+        pairs.iter().filter(|d| **d < 0.0).count(),
+        pairs.len(),
+    );
+
+    // --- and what the router's sort costs, which removal cannot say --------
+    //
+    // `carg_block_sort` cannot be priced by dropping it: its output is an
+    // address, and without it the expert gather reads eight experts at
+    // random, which is slower. `ORNITH_FAKE_SORT` swaps it for a kernel that
+    // writes a valid order cheaply -- wrong experts, right shape, right
+    // count of distinct weights -- so the difference is the sort's own cost
+    // less the stand-in's.
+    println!("\nthe router's 256-wide argsort, against a stand-in that is not one\n");
+    println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
+    let (mut sorted, mut faked) = (Vec::new(), Vec::new());
+    let (mut ds, mut df2) = (0.0, 0.0);
+    for _ in 0..ab_draws {
+        ornith_rs::ops::moe::set_fake_sort(false);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        sorted.push(ms);
+        ds = d;
+        ornith_rs::ops::moe::set_fake_sort(true);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        faked.push(ms);
+        df2 = d;
+    }
+    ornith_rs::ops::moe::set_fake_sort(false);
+    let pairs: Vec<f64> = faked.iter().zip(&sorted).map(|(f, s)| f - s).collect();
+    let (a, b) = (median(&mut sorted.clone()), median(&mut faked.clone()));
+    println!("  {:<24} {a:>9.3} {ds:>11.0}  {sorted:.3?}", "the sort");
+    println!("  {:<24} {b:>9.3} {df2:>11.0}  {faked:.3?}", "a stand-in");
+    println!(
+        "  {:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down",
+        "so",
+        b - a,
+        df2 - ds,
+        pairs.iter().sum::<f64>() / pairs.len() as f64,
+        pairs.iter().filter(|d| **d < 0.0).count(),
+        pairs.len(),
+    );
+
+    // --- and what the selection kernel took of it ---------------------------
+    println!("\nmlx's sort of 256 experts, against k rounds of selection\n");
+    println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
+    let (mut srt, mut sel) = (Vec::new(), Vec::new());
+    let (mut d1, mut d2) = (0.0, 0.0);
+    for _ in 0..ab_draws {
+        ornith_rs::ops::moe::set_router_select(false);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        srt.push(ms);
+        d1 = d;
+        ornith_rs::ops::moe::set_router_select(true);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        sel.push(ms);
+        d2 = d;
+    }
+    let pairs: Vec<f64> = sel.iter().zip(&srt).map(|(a, b)| a - b).collect();
+    let (a, b) = (median(&mut srt.clone()), median(&mut sel.clone()));
+    println!("  {:<24} {a:>9.3} {d1:>11.0}  {srt:.3?}", "sort, slice, gather");
+    println!("  {:<24} {b:>9.3} {d2:>11.0}  {sel:.3?}", "one selection");
+    println!(
+        "  {:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down",
+        "so",
+        b - a,
+        d2 - d1,
         pairs.iter().sum::<f64>() / pairs.len() as f64,
         pairs.iter().filter(|d| **d < 0.0).count(),
         pairs.len(),
@@ -487,6 +563,37 @@ fn main() {
         rows.len(),
     );
 
+    // --- the joined table, for `tools/epoch_slack.py` -----------------------
+    //
+    // The trace carries the bindings, which is what says which dispatches
+    // could share an epoch; the times say what an epoch would then cost. The
+    // ranking wants both, and the join is by position.
+    if let Ok(dir) = std::env::var("ORNITH_INV_DUMP") {
+        use std::io::Write;
+        let mut t = std::fs::File::create(format!("{dir}.trace")).expect("trace file");
+        for line in &trace {
+            writeln!(t, "{line}").unwrap();
+        }
+        let mut f = std::fs::File::create(format!("{dir}.tsv")).expect("times file");
+        writeln!(f, "#i\tsection\tkernel\tgrid\ttg\tread\twrite\tus\tfloor_us").unwrap();
+        for (i, r) in rows.iter().enumerate() {
+            writeln!(
+                f,
+                "{i}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
+                r.section,
+                r.kernel,
+                r.grid.0.max(1) * r.grid.1.max(1) * r.grid.2.max(1),
+                r.tg.0.max(1) * r.tg.1.max(1) * r.tg.2.max(1),
+                r.read_live,
+                r.write,
+                r.t_real,
+                r.t_floor
+            )
+            .unwrap();
+        }
+        println!("\ndumped {} dispatches to {dir}.trace and {dir}.tsv", rows.len());
+    }
+
     // --- a layer, dispatch by dispatch --------------------------------------
     for want in ["layer.linear 5", "layer.full 7"] {
         let layer: Vec<&Row> = rows.iter().filter(|r| r.section == want).collect();
@@ -598,6 +705,12 @@ fn main() {
             *b as f64 / 1048576.0,
             *b as f64 / (t - f).max(1e-9) / 1e3,
         );
+    }
+
+    // A dump run is for `epoch_slack.py`, which wants the trace and the times
+    // and not the hour the class sweep takes.
+    if std::env::var_os("ORNITH_INV_DUMP").is_some() {
+        return;
     }
 
     // --- and what one class costs where it actually runs --------------------
