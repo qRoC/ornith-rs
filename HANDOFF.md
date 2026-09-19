@@ -2151,9 +2151,28 @@ In order:
    `ORNITH_KQUANT_TILE_HALF` on this port's tile is **3.0-3.6%**. So
    75.5% -> ~81% rather than -> 84%, which is **~6% of a chunk**:
    `q6k-full` would prefill ~4.2 GPU s against the parent's 3.99, still
-   slower. **Priced and not built, and recorded as an estimate rather
-   than a debt** -- the k-quants are taken for 4 GB and -13.1% of a
-   decode step, and this is the prefill they knowingly pay for it.
+   slower. **Priced and not built in Phase 38, and recorded as an
+   estimate rather than a debt** -- the k-quants are taken for 4 GB and
+   -13.1% of a decode step, and this is the prefill they knowingly pay
+   for it.
+   **And then it became the thing to build, by elimination rather than by
+   growing.** The prize is still ~6% on the secondary artifact; what
+   changed is everything around it. A re-ranking of `IDEAS.md`
+   (2026-09-20, and see the bullet under item 3) retired its last two
+   unbuilt entries, the MTP stall below is blocked on a machine that does
+   not swap, and Qwen4-exp does not fit in 68 GB. So this is the only open
+   measurable object in the port, and the argument for taking it is no
+   longer the 6%: `mlx::steel::BlockMMA` is **the one thing this port
+   consumes as a black box** rather than having written, and Phase 38
+   showed it is fast partly for a reason nobody had read.
+   **Start with a spike, not a loader.** The plan's premise -- that steel
+   with `float` threadgroup tiles is bit-identical to the tile it replaces
+   (both walk K in ascending 8-element fragments into a float accumulator)
+   -- is plausible and **unverified**. One Q4_K loader, one shape, dense
+   only, `max_abs` against `kquant::qmm_t` with TFLOP/s beside it, from
+   `bin/arithmetic`. If it is not zero the task is a different task; if it
+   is zero and the rate does not move, the eight points are not where they
+   were counted. That is Phase 38's own lesson pointed at its successor.
 1. **A machine that is not swapping.** This is first because it is what the
    next two are waiting on, and it is not something the code can fix. Every
    GPU-side number in this document is now current and trustworthy -- they
@@ -2355,6 +2374,24 @@ In order:
      the highest-signal group there is. The oracle half of the pitch held
      exactly as claimed -- no Metal written, `full_forward_matches_mlx` passes
      on the forged artifact at `max_abs == 0.0`.
+
+     **And the two entries below it on that ranking are now closed too
+     (2026-09-20), which closes `IDEAS.md` entirely.** Both the fp8 group
+     scale and the Lloyd-Max codebook want **group size 16**, and mlx's
+     affine mode accepts 32, 64 and 128 only -- so neither has an oracle,
+     and Phase 13's decomposition already said the gain lives in the group
+     size rather than the scale format. At g32, which mlx does run,
+     Lloyd-Max is 8.2-9.0% weight error at 4.50 bits against the body's
+     7.8-8.3% at 5.00: worse error for fewer bits.
+     **And the prize one of them was holding open has been collected by
+     something else in the meantime.** Its pitch was "0.50 fewer bits, ~10%
+     of bytes, with quality attached"; `Q4_K` is **4.50 bits a weight**
+     against affine int4 g32's **5.00** and shipped at -13.1% of a decode
+     step with no quality difference the 64 probes can see. A format ggml
+     has and mlx does not took the bytes that entry wanted a new kernel and
+     a lost oracle for. **A ranked list decays from the bottom**: its top
+     entries get built and marked while the ones below keep the baseline
+     they were written against, and the baseline is what moves.
 
      Two findings outlast it. **The fold point decides, not the spread**:
      `out_proj` has 1319x max/median saliency and is unreachable because its
