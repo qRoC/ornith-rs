@@ -6415,9 +6415,12 @@ case is 6660 values and a 16-byte access wants a multiple of eight -- which
 is the guard working and the assertion earning its place on its first run.
 
 **What is left in the bucket after this**: the two transposes, 12.4 ms at
-54-68 GB/s. They are not a width change -- one side of a transpose is
-strided, so it wants a tiled kernel through threadgroup memory -- and at
-~0.8% of a chunk that is priced and not built.
+54-68 GB/s -- `transpose_lh` 207.1 us over 30 dispatches and
+`transpose_hl` **619.0 us over 10**, so the second is three times the
+first per dispatch and is where a tiled kernel would start. They are not
+a width change -- one side of a transpose is strided, so it wants a
+32x32 tile staged through threadgroup memory with a padded stride -- and
+at ~0.8% of a chunk that is priced and not built.
 
 ### What it says about where to go, which is mostly "not far"
 
@@ -6427,8 +6430,14 @@ own quantized gemm 84%, ggml's k-quant tile 75-76%. So of the ~19 points
 the k-quant gemm is down, **10 are what unpacking costs anyone**, **8 are
 ggml's tiling against mlx's**, and **1-3 are the k-quant unpack itself**.
 
-That makes the reachable headroom **~9% of a chunk, and only on a k-quant
-artifact** -- the 8 points, times 89.4%. On the affine parent it is **~0**:
+That makes the reachable headroom **~8% of a chunk, and only on a k-quant
+artifact**. The derivation, because "8 points" is a share of a *ceiling*
+and not of a time: the four k-quant gemms are 1301 ms of the 1575 ms
+stream, **82.6%**; going from 75.5% of the ceiling to 84% takes
+`1 - 75.5/84 = 10.1%` off their time; `0.826 x 0.101` is **8.4%**. (An
+earlier line here said ~9% from "8 points times 89.4%", which multiplies
+a ceiling share by the wrong denominator and lands near the right answer
+for the wrong reason.) On the affine parent it is **~0**:
 its gemms already run on mlx's kernel at 84%, and nothing in this port
 gets below the 10 points that unpacking costs everyone.
 
@@ -6449,7 +6458,12 @@ The candidates, in order:
   tile width, predicted by an op count and confirmed by a stand-in.
   Halving it would buy ~1% of a chunk.
 - **What is left is ggml's tiling against mlx's, and only on a k-quant
-  artifact**: 8 points, ~6% of a chunk, and reaching it means carrying
+  artifact**: 8 points, **~8% of a chunk** (derived above). Start with
+  the routed pair: `q4k_gather_qmm_t` and `q6k_gather_qmm_t` are **706 ms
+  of the 1575 ms stream, 45%** -- more than the two dense ones together
+  (595 ms, 38%) -- and they are the half that also has to keep mlx's
+  answer to raggedness, walking `rhs_indices` for each maximal run of one
+  expert. Reaching it means carrying
   Q4_K and Q6_K into a steel `BlockMMA` gemm rather than ggml's
   `kernel_mul_mm`. That is a real kernel project with a measured prize
   and a ready oracle (`max_abs == 0.0` against the tile it replaces).

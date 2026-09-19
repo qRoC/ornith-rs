@@ -2113,7 +2113,7 @@ In order:
    ggml's k-quant tile 75-76%. Of the ~19 points the k-quant gemm is down,
    **10 are what unpacking costs anyone, 8 are ggml's tiling against
    mlx's, and 1-3 are the k-quant unpack itself**. So the reachable
-   headroom is **~9% of a chunk on a k-quant artifact and ~0 on the affine
+   headroom is **~8% of a chunk on a k-quant artifact and ~0 on the affine
    parent**, none of it reachable by scheduling, fusing or removing
    anything, and **both candidates the phase first named are now
    closed.** The routed gemm's 8 points are neither `N` nor routing nor
@@ -2127,8 +2127,10 @@ In order:
    **What is left is one thing, and only on a k-quant artifact.** At one
    shape the stack reads dense bf16 94%, mlx's affine 4-bit gemm 84%,
    ggml's tile 75-76%. **mlx's quantized gemm is 13% faster than ggml's
-   tile while doing more work**, so ~8 points -- ~6% of a chunk -- are
-   ggml's `kernel_mul_mm` tiling against steel's `BlockMMA`. Reaching it
+   tile while doing more work**, so ~8 points -- **~8% of a chunk**, from
+   the four k-quant gemms being 82.6% of the stream and 75.5% -> 84% of
+   the ceiling taking 10.1% off their time -- are ggml's `kernel_mul_mm`
+   tiling against steel's `BlockMMA`. Reaching it
    means carrying Q4_K and Q6_K into a steel-tiled gemm: a real kernel
    project, with a measured prize and a ready oracle (`max_abs == 0.0`
    against the tile it replaces). **On the affine parent there is nothing
