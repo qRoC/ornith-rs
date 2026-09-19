@@ -5257,9 +5257,12 @@ The phase did find where the case may be, and it was not on the list.
                       -0.31 s, -5.7%, 3 of 3 down
 
 **One block-shaped kernel took 5.7% off prefill**, and not by launching less:
-at the 2048-token chunk the ten kernels move ~250 MB a layer between them
-where the one moves ~67, because eight of the ten exist only to write an
-intermediate the next one reads. Every remaining elementwise op in the trunk
+300 launches a chunk cannot be 5.7% of 1.8 seconds. The mechanism is bytes,
+and eight of the ten kernels exist only to write an intermediate the next one
+reads -- at the 2048-token chunk that is ~250 MB a layer against the one
+kernel's ~67, which is arithmetic from the bindings' shapes rather than a
+measured byte count. The 5.7% is measured; the number behind it is not, and
+a prefill inventory would be the way to have both. Every remaining elementwise op in the trunk
 has that same shape at prefill. The deferred layer's decode prize is 3.8% and
 its prefill prize has never been measured; it is a different number and the
 mechanism says it is a larger one.
