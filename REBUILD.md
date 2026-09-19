@@ -6102,10 +6102,14 @@ two copies: `tests/q4k.rs` and `tests/q6k.rs`,
 
 ## Phase 37 -- an arithmetic ceiling, and this machine has no matrix unit -- **DONE**
 
-Phase 36 left prefill **81% quantized gemm** -- 1264 ms of a 1564 ms
-isolated chunk, against 13% of data movement and 6% of everything else. So
-the next question about prefill is not "which kernel is slow" but "is the
-gemm near its ceiling", and there was no ceiling to ask against.
+Phase 36 left prefill almost entirely gemm. The figure this phase started
+from was **81%** and it was the wrong one -- it came from the inventory
+taken *before* Phase 36's change, the only one that existed when this
+phase began. Re-taken after (Phase 36, "what is left in it"), a chunk is
+**89.4% quantized gemm**, 3.8% data movement, 6.7% everything else. The
+correction strengthens the motivation rather than weakening it: the next
+question about prefill is not "which kernel is slow" but "is the gemm near
+its ceiling", and there was no ceiling to ask against.
 `bin/bandwidth` has answered the memory side since Phase 19; the arithmetic
 side had a number off a box.
 
@@ -6323,11 +6327,26 @@ format. That belongs beside every other entry in the quantization ledger.
 
 ### What it says about where to go, which is mostly "not far"
 
-Prefill is 81% gemm; the gemm is at 72-80% of a ceiling a real kernel
-reaches at 96%; the whole gap is the dequantize. So **the entire remaining
-arithmetic headroom in a prefill chunk is ~16%**, all of it inside kernels
-whose job is to unpack 4-bit weights, and none of it reachable by
-scheduling, fusing or removing anything. The two candidates, in order:
+Prefill is **89.4% gemm**, and the gemm's distance from the ceiling is now
+decomposed rather than lumped: at one shape, dense bf16 reaches 94%, mlx's
+own quantized gemm 84%, ggml's k-quant tile 75-76%. So of the ~19 points
+the k-quant gemm is down, **10 are what unpacking costs anyone**, **8 are
+ggml's tiling against mlx's**, and **1-3 are the k-quant unpack itself**.
+
+That makes the reachable headroom **~9% of a chunk, and only on a k-quant
+artifact** -- the 8 points, times 89.4%. On the affine parent it is **~0**:
+its gemms already run on mlx's kernel at 84%, and nothing in this port
+gets below the 10 points that unpacking costs everyone.
+
+(An earlier draft of this paragraph said "81% gemm, the whole gap is the
+dequantize, ~16% headroom". Every clause of that was superseded by
+measurements taken later in this same phase, and it sat here beside them
+until a sweep of the document caught it. The rule from Phase 35 is
+literally "when a number goes into a record, grep the record for the same
+number's earlier self", and this is the second phase running where the
+number needing that was mine.)
+
+The candidates, in order:
 
 - ~~the routed gemm's 8 points~~ -- **closed above.** They are the tile
   width, it is already at its optimum for this model's run lengths, and

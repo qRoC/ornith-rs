@@ -2106,12 +2106,16 @@ In order:
    not built**. The memory-pressure idle sits on top of all of it and is
    item 1.
    **And Phase 37 then measured how much room is left at all, which is not
-   much.** A chunk is 81% quantized gemm; those gemms run at 72-80% of an
-   arithmetic ceiling that mlx's own dense bf16 gemm reaches at 96%; the
-   whole gap is the cost of unpacking 4-bit weights, on the same ALUs the
-   multiply needs. So **the total remaining arithmetic headroom in a
-   prefill chunk is ~16%**, none of it reachable by scheduling, fusing or
-   removing anything, and **both candidates it first named are now
+   much.** After Phase 36 a chunk is **89.4% quantized gemm**, 3.8% data
+   movement, 6.7% everything else -- so what is left is an arithmetic
+   question and nothing else. At one shape the gemm's distance from the
+   ceiling decomposes: dense bf16 94%, mlx's own quantized gemm 84%,
+   ggml's k-quant tile 75-76%. Of the ~19 points the k-quant gemm is down,
+   **10 are what unpacking costs anyone, 8 are ggml's tiling against
+   mlx's, and 1-3 are the k-quant unpack itself**. So the reachable
+   headroom is **~9% of a chunk on a k-quant artifact and ~0 on the affine
+   parent**, none of it reachable by scheduling, fusing or removing
+   anything, and **both candidates the phase first named are now
    closed.** The routed gemm's 8 points are neither `N` nor routing nor
    the weight footprint -- each was moved on its own and none matters --
    they are the tile width, and the wider tile is **14% worse on the real
@@ -2736,10 +2740,21 @@ reads much more invitingly than it should.
   both of those copies back to one element a thread** -- which is the
   control that has to be *off* for the other two to be ranked against
   anything but a kernel's access width (`REBUILD.md` Phase 36).
-  `step_inventory` A/Bs all of them in one process, and
-  `step_inventory prefill only` runs the Phase 36 cell alone with eight
-  interleaved pairs and stops, which is the protocol prefill's thermal
-  drift asks for.
+  `step_inventory` A/Bs all of them in one process, and it has two
+  single-cell modes for the reason prefill's thermal drift gives -- a cell
+  placed eleventh is measured in a state the first one was not:
+  `step_inventory prefill only` runs the Phase 36 gather/unsort cell alone
+  with eight interleaved pairs and stops, and `step_inventory prefill
+  addrms` does the same for the residual-add fusion, which needed exactly
+  that protocol after three readings of it straddled zero (it is **zero**;
+  `REBUILD.md` Phase 35).
+- **Two stand-ins produce wrong answers on purpose**, and both exist
+  because a removal cannot price what they price. `ORNITH_FAKE_SORT=1` is
+  the older one. `Q4KBareFmt` / `kquant::qmm_t_bare` is the newer: the
+  k-quant tile with only `Q4KFmt`'s arithmetic removed, same loads, same
+  registers, which is what separates "the unpack costs 2-3%" from "this
+  tile costs 8 points". Nothing in the model dispatches it; it is reached
+  from `bin/arithmetic` alone.
 - **A short generation puts the prompt on the denominator.** `ORNITH_PROF`'s
   per-token figures divide by the tokens actually generated, not by `-m`, and
   the prefill call's dispatches and GPU time are in the numerator. A run that
