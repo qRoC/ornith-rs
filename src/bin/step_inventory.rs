@@ -380,7 +380,15 @@ fn main() {
     // The draws are printed in order, so the drift is visible rather than
     // assumed away.
     let only = std::env::args().any(|a| a == "only");
+    // `addrms` is the other single-cell mode, and it exists because that
+    // cell has been read three times -- -0.31%, -2.34%, +0.26% -- and three
+    // readings straddling zero is a cell that has not been measured. Phase
+    // 35 said what would settle it: eight interleaved pairs *near the top
+    // of a run*, before the machine has drifted. So this mode skips the
+    // cell below, puts `add_rms` first, and stops after it.
+    let addrms = std::env::args().any(|a| a == "addrms");
     let moe_draws = if ab_only || only { 8 } else { DRAWS + 1 };
+    if !addrms {
     println!("\nthe expert gather and its inverse, indexed and copied\n");
     println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
     for (name, gather, unsort) in [
@@ -453,7 +461,9 @@ fn main() {
     if only {
         return;
     }
+    } // !addrms
 
+    let ab_draws = if addrms { 8 } else { ab_draws };
     println!("\nthe add and the norm that reads it, fused and not\n");
     println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
     let (mut on, mut off) = (Vec::new(), Vec::new());
@@ -472,13 +482,22 @@ fn main() {
     let (a, b) = (median(&mut off.clone()), median(&mut on.clone()));
     println!("  {:<24} {a:>9.3} {doff:>11.0}  {off:.3?}", "separate");
     println!("  {:<24} {b:>9.3} {don:>11.0}  {on:.3?}", "fused");
+    // The pair statistics, which this cell printed for every other fusion
+    // and not for this one -- which is part of why it stayed unsettled.
+    let pairs: Vec<f64> = on.iter().zip(&off).map(|(f, s)| f - s).collect();
     println!(
-        "  {:<24} {:>9.3} {:>11.0}  {:+.2}%",
+        "  {:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down, {:+.2}%",
         "so",
         b - a,
         don - doff,
+        pairs.iter().sum::<f64>() / pairs.len() as f64,
+        pairs.iter().filter(|d| **d < 0.0).count(),
+        pairs.len(),
         100.0 * (b - a) / a
     );
+    if addrms {
+        return;
+    }
 
     // --- the MoE block's tail, one dispatch against six --------------------
     println!("\nthe MoE block's tail, fused and not\n");

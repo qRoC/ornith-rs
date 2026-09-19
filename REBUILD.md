@@ -5711,9 +5711,32 @@ this phase did not spend them.
 **Phase 36's first run produced a third reading, and it changes sign:**
 `1438.4 -> 1442.2`, **+0.26%, 1 of 4 pairs down**, same cell, same four
 draws, same artifact. So the three are -0.31%, -2.34% and +0.26%, and the
-honest summary is now not "somewhere between" but **"this cell has not
-been measured"**. It is still a cell of four draws in the second position
-of a run that throttles; the eight interleaved pairs are still unspent.
+honest summary was not "somewhere between" but "this cell has not been
+measured".
+
+**Spent in Phase 37, and the answer is zero.** `step_inventory prefill
+addrms` runs this cell *first* with eight interleaved pairs and stops,
+which is what this paragraph asked for:
+
+    q6k-full, 8 interleaved pairs, first cell of the run, chunk level 1247 ms
+
+      separate  [1281.1, 1252.4, 1325.4, 1312.3, 1309.8, 1326.4, 1328.6, 1334.2]
+      fused     [1287.8, 1318.3, 1298.9, 1311.9, 1307.4, 1320.2, 1325.0, 1376.9]
+      median -7.08 ms (-0.53%), mean of pairs +9.52 ms, 5 of 8 down
+
+**Median and mean disagree in sign and the sign test is 5 of 8**, which is
+this instrument saying nothing. (The mean is one draw's doing -- the last
+fused pair is +42.7 ms -- and the thermal drift is visible in both arms,
+1281 to 1334 and 1288 to 1377, which is exactly what the interleaving is
+for.) So: **the residual add fused into its norm is worth nothing
+measurable at a prefill chunk**, and it is kept for the decode step, where
+Phase 31 measured it at 0.068 of 0.145 ms and where it is exact and
+strictly smaller either way. Four readings, and the fourth one is the only
+one taken by the protocol; the cell is closed.
+
+The cell also gained the pair statistics every other fusion's cell already
+printed and this one did not -- which is part of why three readings went
+by without anyone noticing they disagreed.
 
 What *is* established, and does not rest on this cell: launches are 0.22%
 of a chunk, so nothing here is bought by removing one -- and the two
@@ -6027,7 +6050,8 @@ the side where *the control itself* is the thing that moved.
 
 ### What is left in it
 
-**Two things this phase measured and two it did not.** The per-dispatch
+**Two things this phase measured and two it did not** (one of which Phase
+37 then spent -- `add_rms` above is settled). The per-dispatch
 inventory was re-taken *before* the change and not after, so what a chunk
 is made of now -- and what the next-largest row in it is -- is unmeasured;
 and the direct old-against-new prompt pair was attempted and thrown away,
