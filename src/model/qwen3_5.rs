@@ -18,7 +18,10 @@ use crate::array::{Array, Dtype};
 use crate::metal::Context;
 use crate::ops::elementwise::{add, precise_swiglu, scalar_mul, sigmoid_gate, silu};
 use crate::ops::embedding::embedding;
-use crate::ops::gdn::{concat_time, depthwise_conv1d, gated_delta_update, gated_delta_update_into};
+use crate::ops::gdn::{
+    beta, compute_g, concat_time, depthwise_conv1d, gated_delta_kernel_into,
+    gated_delta_update,
+};
 use crate::ops::layout::{slice_inner, transpose_hl, transpose_lh};
 use crate::ops::moe::sparse_moe_block;
 use crate::ops::norm::rms_norm;
@@ -523,6 +526,15 @@ impl GatedDeltaNet {
         let q = scalar_mul(ctx, &rms_norm(ctx, &q, None, 1e-6), inv_scale * inv_scale);
         let k = scalar_mul(ctx, &rms_norm(ctx, &k, None, 1e-6), inv_scale);
 
+        // The gate and the decay, once for the window rather than once per
+        // token. Both are elementwise over `[B, T, Hv]` -- `sigmoid` and
+        // `compute_g`'s exp -- so a thread computes the same element from the
+        // same inputs whichever shape it is handed, and slicing the results
+        // per token is free where recomputing them was two dispatches a
+        // token a layer.
+        let beta_all = beta(ctx, &bb);
+        let g_all = compute_g(ctx, &self.a_log, &aa, &self.dt_bias);
+
         let mut state = cache.state_or_zeros(ctx, cfg, b);
         let mut states: Vec<Array> = Vec::with_capacity(s);
         // The `T` one-token outputs, written where a concatenation would have
@@ -531,16 +543,15 @@ impl GatedDeltaNet {
         // destination address.
         let out = Array::empty(ctx, &[b, s, hv, dv], x.dtype);
         for t in 0..s {
-            let (_, next) = gated_delta_update_into(
+            let (_, next) = gated_delta_kernel_into(
                 ctx,
                 &slice_head(ctx, &q, t),
                 &slice_head(ctx, &k, t),
                 &slice_head(ctx, &v, t),
-                &slice_time(ctx, &aa, t, 1),
-                &slice_time(ctx, &bb, t, 1),
-                &self.a_log,
-                &self.dt_bias,
+                &row_view(&g_all, t),
+                &row_view(&beta_all, t),
                 &state,
+                None,
                 &out_row(&out, t),
             );
             // The conv window after token `t` is a slice of `conv_input`,
@@ -558,6 +569,20 @@ impl GatedDeltaNet {
         let y = self.out_proj.matmul(ctx, &gated.reshape(&[b, s, hv * dv]));
         (y, GdnSnaps { conv_input, states })
     }
+}
+
+/// Row `t` of a `[B, T, H]` array, as a `[1, 1, H]` view.
+///
+/// `slice_time` is a kernel because a general `[B, T, D]` slice is strided;
+/// at `B = 1` -- which is every speculative window -- one row is contiguous
+/// and this is a view, so it costs nothing. Only for values consumed inside
+/// the same forward: a cache keeps the copying form, so that nothing it holds
+/// points into a pooled buffer.
+fn row_view(x: &Array, t: usize) -> Array {
+    let (b, tt, h) = (x.shape[0], x.shape[1], x.shape[2]);
+    assert_eq!(b, 1, "the speculative window is single-batch");
+    assert!(t < tt);
+    x.reshape(&[tt, h]).slice_leading(t, 1).reshape(&[1, 1, h])
 }
 
 /// Row `t` of a `[B, T, Hv, Dv]` output buffer, as a `[1, 1, Hv, Dv]` view.
