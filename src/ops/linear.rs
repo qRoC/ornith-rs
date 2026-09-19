@@ -58,6 +58,26 @@ impl Linear {
         }
     }
 
+    /// `RMSNormGated` and this projection in one dispatch, where the shapes
+    /// allow it. `None` means they do not and the caller issues both; see
+    /// [`kquant::rmsgate_qmv`].
+    pub fn rmsgate_matmul(
+        &self,
+        ctx: &Context,
+        x: &Array,
+        norm_w: &Array,
+        gate: &Array,
+        head_dim: usize,
+        eps: f32,
+    ) -> Option<Array> {
+        match self {
+            // mlx's affine family has no fused form; the k-quant one is
+            // where `out_proj` lives on the artifact this was measured on.
+            Linear::Mlx(_) => None,
+            Linear::K(q) => kquant::rmsgate_qmv(ctx, x, q, norm_w, gate, head_dim, eps),
+        }
+    }
+
     /// Experts for a routed weight, else 1.
     pub fn num_experts(&self) -> usize {
         match self {

@@ -550,9 +550,18 @@ impl GatedDeltaNet {
         cache.state = Some(new_state);
         cache.offset += s;
 
-        // RMSNormGated: normalise, then gate with z in float32.
+        // RMSNormGated: normalise, then gate with z in float32 -- inside
+        // `out_proj` where the shapes allow it, since this is the one norm in
+        // the model with exactly one consumer.
+        let flat = [b, s, hv * dv];
+        let (fout, fz) = (out.reshape(&flat), z.reshape(&flat));
+        if let Some(y) =
+            self.out_proj.rmsgate_matmul(ctx, &fout, &self.norm, &fz, dv, cfg.rms_norm_eps)
+        {
+            return y;
+        }
         let gated = rms_norm_gated(ctx, &out, Some(&self.norm), &z, cfg.rms_norm_eps);
-        self.out_proj.matmul(ctx, &gated.reshape(&[b, s, hv * dv]))
+        self.out_proj.matmul(ctx, &gated.reshape(&flat))
     }
 }
 
@@ -667,8 +676,21 @@ impl GatedDeltaNet {
         cache.state = Some(state);
         cache.offset += s;
 
-        let gated = rms_norm_gated(ctx, &out, Some(&self.norm), &z, cfg.rms_norm_eps);
-        let y = self.out_proj.matmul(ctx, &gated.reshape(&[b, s, hv * dv]));
+        let flat = [b, s, hv * dv];
+        let y = match self.out_proj.rmsgate_matmul(
+            ctx,
+            &out.reshape(&flat),
+            &self.norm,
+            &z.reshape(&flat),
+            dv,
+            cfg.rms_norm_eps,
+        ) {
+            Some(y) => y,
+            None => {
+                let gated = rms_norm_gated(ctx, &out, Some(&self.norm), &z, cfg.rms_norm_eps);
+                self.out_proj.matmul(ctx, &gated.reshape(&flat))
+            }
+        };
         (y, GdnSnaps { conv_input, states })
     }
 }

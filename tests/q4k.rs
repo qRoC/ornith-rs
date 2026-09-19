@@ -713,3 +713,58 @@ fn a_pruned_k_quant_row_is_the_row_it_came_from() {
         );
     }
 }
+
+/// `RMSNormGated` folded into the projection that reads it, against the two
+/// dispatches it replaces.
+///
+/// Port against port, and that is the whole chain: `rms_norm_gated` is pinned
+/// to mlx in `tests/gdn` and `qmv` to a float64 reference above, so an exact
+/// match here pins the fused kernel to both. The prologue's reduction has to
+/// be mlx's `rms_single_row` layout -- 32 lanes, four contiguous elements,
+/// one `simd_sum` -- and a head of any other width would show up here as a
+/// last-bit difference rather than as a wrong answer.
+#[test]
+fn the_fused_norm_projection_is_the_two_dispatches() {
+    let Some(case) = RefCase::open_or_skip("q4k") else { return };
+    let ctx = Context::new().unwrap();
+    const HD: usize = 128;
+    for name in ["head", "qkv"] {
+        let w = matrix(&ctx, &case, name);
+        let cols = case.meta_usize(&format!("{name}_cols"));
+        assert_eq!(cols % HD, 0);
+        let heads = cols / HD;
+
+        // Arbitrary but deterministic: the reference's own activations, and a
+        // norm weight sliced out of them so it is neither ones nor tiny.
+        let x = case.array(&ctx, &format!("{name}_x")).reshape(&[1, heads, HD]);
+        let gate = case.array(&ctx, &format!("{name}_x")).reshape(&[1, heads, HD]);
+        let nw = case.array(&ctx, &format!("{name}_x")).reshape(&[heads, HD]).index(0);
+
+        let flat = [1usize, cols];
+        let want = qmv(
+            &ctx,
+            &ornith_rs::ops::norm::rms_norm_gated(&ctx, &x, Some(&nw), &gate, 1e-6)
+                .reshape(&flat),
+            &w,
+        );
+        // Every width of the kernel, since the only thing `nr0` changes is
+        // how many threadgroups repeat the prologue -- if it changed a value
+        // the sweep that chooses it would be choosing between two models.
+        for nr0 in [2usize, 4, 8, 16] {
+            let was = ornith_rs::ops::kquant::set_rmsgate_nr0(nr0);
+            let got = ornith_rs::ops::kquant::rmsgate_qmv(
+                &ctx,
+                &x.reshape(&flat),
+                &w,
+                &nw,
+                &gate.reshape(&flat),
+                HD,
+                1e-6,
+            );
+            ornith_rs::ops::kquant::set_rmsgate_nr0(was);
+            let Some(got) = got else { continue };
+            let d = compare(&got.to_vec_f32(&ctx), &want.to_vec_f32(&ctx));
+            assert_eq!(d.max_abs, 0.0, "{name} fused norm+projection, nr0={nr0}: {d}");
+        }
+    }
+}

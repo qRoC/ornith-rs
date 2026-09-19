@@ -28,6 +28,7 @@
 #include "mlx/backend/metal/kernels/utils.h"
 
 #include "kquant_mm.h"
+#include "ornith_rmsgate.h"
 
 #define QK_K 256
 #define Q4K_QS_U16 64 // 128 bytes of 4-bit codes, as uint16
@@ -112,12 +113,15 @@ template <typename T>
 // expert's weights and which token's activations these are. ggml splits it the
 // same way -- `kernel_mul_mv_id` is a wrapper that offsets `src0` by the
 // expert and `src1` by the token and then calls this.
-template <typename T, short nr0, short NSG>
+// `YP` is the activation pointer's address space: `const device T*` for every
+// caller here but the fused `rmsgate` one, which has already normalised the
+// row into threadgroup memory. Nothing in the body depends on which it is.
+template <typename T, short nr0, short NSG, typename YP>
 static inline void q4k_qmv_impl(
     const device uint16_t* qs,
     const device uint16_t* scales,
     const device half* dm,
-    const device T* y,
+    YP y,
     device T* dst,
     int K,
     int O,
@@ -145,7 +149,7 @@ static inline void q4k_qmv_impl(
   float yh[16];
   float sumf[nr0] = {0.f};
 
-  const device T* y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+  YP y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
   uint16_t sc16[4];
   thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
@@ -236,6 +240,52 @@ template <typename T, short nr0, short NSG>
       dm,
       x + (int64_t)r1 * K,
       out + (int64_t)r1 * O,
+      K,
+      O,
+      int(tgpig.x),
+      tiisg,
+      sgitg);
+}
+
+// `Qwen3NextRMSNormGated` and the projection that reads it, in one dispatch.
+//
+// The one place in this model where a norm has exactly one consumer, which is
+// what makes it a fusion rather than an op layer: every other norm here feeds
+// four or six matvecs. See `ornith_rmsgate.h` for the exactness argument and
+// `REBUILD.md` Phase 33 for why this time is worth reaching for.
+//
+// M = 1 only. Each threadgroup normalises the whole activation row into
+// threadgroup memory and then runs the mat-vec above over it unchanged --
+// so the activation reads the body makes get cheaper, and the price is that
+// all `O / (NSG * nr0)` threadgroups do the same normalisation. That count is
+// what `nr0` and `NSG` are swept for: at ggml's 2 and 2 an `O = 2048`
+// projection runs 512 threadgroups and normalises its input 512 times.
+//
+// `ORNITH_FUSE_NORM_PROJ=0` issues the norm and the matvec separately.
+template <typename T, short nr0, short NSG>
+[[kernel]] void q4k_rmsgate_qmv(
+    const device uint16_t* qs [[buffer(0)]],
+    const device uint16_t* scales [[buffer(1)]],
+    const device half* dm [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& O [[buffer(6)]],
+    const device T* nw [[buffer(7)]],
+    const device T* gate [[buffer(8)]],
+    const constant int& head_dim [[buffer(9)]],
+    const constant float& eps [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup T row[ORNITH_RMSGATE_MAX];
+  ornith_rmsgate_row<T>(x, nw, gate, row, K, head_dim, eps, tiisg, sgitg, NSG);
+  q4k_qmv_impl<T, nr0, NSG>(
+      qs,
+      scales,
+      dm,
+      (threadgroup const T*)row,
+      out,
       K,
       O,
       int(tgpig.x),
@@ -660,6 +710,10 @@ struct Q4KFmt {
 #define instantiate_q4k(tname, type)                                           \
   instantiate_kernel("q4k_dequantize_" #tname, q4k_dequantize, type)           \
   instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)                   \
+  instantiate_kernel("q4k_rmsgate_qmv_" #tname, q4k_rmsgate_qmv, type, 2, 2)   \
+  instantiate_kernel("q4k_rmsgate_qmv_r4_" #tname, q4k_rmsgate_qmv, type, 4, 4) \
+  instantiate_kernel("q4k_rmsgate_qmv_r8_" #tname, q4k_rmsgate_qmv, type, 8, 4) \
+  instantiate_kernel("q4k_rmsgate_qmv_r16_" #tname, q4k_rmsgate_qmv, type, 16, 4)\
   instantiate_kernel("q4k_qmv_m2_" #tname, q4k_qmv_m, type, 2, 2, 2)           \
   instantiate_kernel("q4k_qmv_m3_" #tname, q4k_qmv_m, type, 2, 2, 3)           \
   instantiate_kernel("q4k_qmv_m4_" #tname, q4k_qmv_m, type, 2, 2, 4)           \

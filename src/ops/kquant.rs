@@ -516,6 +516,130 @@ pub fn qmv(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
     out
 }
 
+/// `Qwen3NextRMSNormGated` and the projection that reads it, in one dispatch.
+///
+/// Returns `None` when this is not the shape the fused kernel is written for,
+/// and the caller then issues the norm and the matvec separately. The
+/// conditions are Q4_K, one row (a decode step or nothing), a head of exactly
+/// `32 * RMS_N_READS` so the norm's reduction is one simdgroup, and an
+/// activation row that fits the prologue's threadgroup buffer.
+///
+/// `REBUILD.md` Phase 33: the pair it replaces is 4.8 us a dispatch, three
+/// times the elementwise chain's average, and gluing the two elementwise ops
+/// together instead measures zero -- this is the only other way to that time,
+/// and it is the deferred op layer's mechanism tried on the one norm in the
+/// model that has a single consumer.
+pub fn rmsgate_qmv(
+    ctx: &Context,
+    x: &Array,
+    w: &KMatrix,
+    norm_w: &Array,
+    gate: &Array,
+    head_dim: usize,
+    eps: f32,
+) -> Option<Array> {
+    const MAX_ROW: usize = 4096; // ORNITH_RMSGATE_MAX in kernels/ornith_rmsgate.h
+    if !fuse_norm_proj() {
+        return None;
+    }
+    let (o, k) = (w.out_dims(), w.in_dims());
+    let m = x.numel() / k;
+    if w.kind != KQuant::Q4K
+        || m != 1
+        || k > MAX_ROW
+        || head_dim != 32 * 4
+        || k % head_dim != 0
+        || k % QK_K != 0
+        || o % (rmsgate_nsg() * rmsgate_nr0()) != 0
+        || x.dtype != Dtype::BF16
+        || norm_w.numel() != head_dim
+        || gate.numel() != x.numel()
+    {
+        return None;
+    }
+    let mut shape = x.shape.clone();
+    let n = shape.len();
+    shape[n - 1] = o;
+    let out = Array::empty(ctx, &shape, x.dtype);
+    let (nr0, nsg) = (rmsgate_nr0(), rmsgate_nsg());
+    let name = match nr0 {
+        2 => "rmsgate_qmv".to_string(),
+        n => format!("rmsgate_qmv_r{n}"),
+    };
+    ctx.kernel(&w.kernel(&name, x.dtype))
+        .arr(&w.qs)
+        .arr(&w.scales)
+        .arr(&w.dm)
+        .arr(x)
+        .out(&out)
+        .bytes(&(k as i32))
+        .bytes(&(o as i32))
+        .arr(norm_w)
+        .arr(gate)
+        .bytes(&(head_dim as i32))
+        .bytes(&eps)
+        .groups((o / (nsg * nr0), 1, 1), (32, nsg, 1));
+    Some(out)
+}
+
+/// Output rows a threadgroup of the fused norm+projection takes, which is
+/// the only knob on how many times its prologue normalises the same row:
+/// `O / (NSG * nr0)` threadgroups each do it once. 2 is ggml's shape for the
+/// plain matvec and 512 normalisations for `out_proj`; 16 is 32 of them.
+/// 4 is the measured minimum of the four: 512 threadgroups at ggml's 2 cost
+/// +0.304 ms, 128 cost +0.079, 64 cost +0.188 and 32 cost +0.468 -- the
+/// prologue gets cheaper as the count falls and the mat-vec gets worse.
+static RMSGATE_NR0: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
+
+pub fn rmsgate_nr0() -> usize {
+    if let Ok(v) = std::env::var("ORNITH_RMSGATE_NR0") {
+        if let Ok(n) = v.parse() {
+            RMSGATE_NR0.store(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    RMSGATE_NR0.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn rmsgate_nsg() -> usize {
+    if rmsgate_nr0() == 2 { 2 } else { 4 }
+}
+
+/// Set the fused kernel's rows per simdgroup; returns what it was.
+pub fn set_rmsgate_nr0(n: usize) -> usize {
+    let was = rmsgate_nr0();
+    RMSGATE_NR0.store(n, std::sync::atomic::Ordering::Relaxed);
+    was
+}
+
+/// Whether `RMSNormGated` rides into the projection that reads it, or is its
+/// own dispatch.
+///
+/// **Off, and it is the control that says why** -- the other way round from
+/// every other switch here, because this one lost. `REBUILD.md` Phase 34:
+/// at its best of four widths it costs **+0.079 ms** against the two
+/// dispatches it replaces, whose entire removal is worth 0.145. A mat-vec
+/// parallelises over *output rows* and every threadgroup reads the whole
+/// input, so folding a producer into it is not fusing it once, it is
+/// repeating it once per threadgroup. `ORNITH_FUSE_NORM_PROJ=1` turns it on.
+static FUSE_NORM_PROJ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FUSE_NORM_PROJ_ENV: std::sync::Once = std::sync::Once::new();
+
+pub fn fuse_norm_proj() -> bool {
+    FUSE_NORM_PROJ_ENV.call_once(|| {
+        if std::env::var("ORNITH_FUSE_NORM_PROJ").as_deref() == Ok("1") {
+            FUSE_NORM_PROJ.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    FUSE_NORM_PROJ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the fusion on or off at runtime; returns what it was.
+pub fn set_fuse_norm_proj(on: bool) -> bool {
+    let was = fuse_norm_proj();
+    FUSE_NORM_PROJ.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
+}
+
 /// `mx.gather_qmm(x, w, rhs_indices=..., transpose=True)` at M = 1, which is
 /// the only shape `SwitchGLU` produces -- ggml's `kernel_mul_mv_id`.
 ///
