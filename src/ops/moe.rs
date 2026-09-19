@@ -301,20 +301,79 @@ pub fn counting_sort_for_test(ctx: &Context, inds: &Array, n_experts: usize) -> 
 
 /// `(order, inv_order)` for mlx-lm's `_gather_sort`. See the kernel comment in
 /// kernels/moe.metal for why a counting sort reproduces mlx's argsort here.
+///
+/// Three dispatches above a block, one below it. The one-thread kernel was
+/// written for a decode step, where `n` is `k` -- eight entries -- and the
+/// sorted path is not even taken; a prefill chunk of 2048 sends it 16384 and
+/// it cost **11% of the chunk** (`REBUILD.md` Phase 35). The parallel form
+/// is the same sort with its serial depth cut from `n` to one block, and it
+/// is bit-identical by construction. `ORNITH_PARALLEL_SORT=0` is the
+/// control.
 fn counting_sort(ctx: &Context, inds: &Array, n_experts: usize) -> (Array, Array) {
+    /// `ORNITH_SORT_BLOCK` in kernels/moe.metal.
+    const BLOCK: usize = 256;
     let n = inds.numel();
     let order = Array::empty(ctx, &[n], Dtype::U32);
     let inv_order = Array::empty(ctx, &[n], Dtype::U32);
-    let counts = Array::empty(ctx, &[n_experts], Dtype::U32);
-    ctx.kernel("counting_sort_experts")
+    let n_blocks = n.div_ceil(BLOCK);
+
+    // One block is one thread's worth of work either way, and the histogram
+    // lives in a 1024-entry threadgroup array.
+    if !parallel_sort() || n_blocks <= 1 || n_experts > 1024 {
+        let counts = Array::empty(ctx, &[n_experts], Dtype::U32);
+        ctx.kernel("counting_sort_experts")
+            .arr(inds)
+            .out(&order)
+            .out(&inv_order)
+            .out(&counts)
+            .bytes(&(n as u32))
+            .bytes(&(n_experts as u32))
+            .threads((1, 1, 1), (1, 1, 1));
+        return (order, inv_order);
+    }
+
+    let blk = Array::empty(ctx, &[n_experts * n_blocks], Dtype::U32);
+    ctx.kernel("sort_block_hist")
         .arr(inds)
-        .out(&order)
-        .out(&inv_order)
-        .out(&counts)
+        .out(&blk)
         .bytes(&(n as u32))
         .bytes(&(n_experts as u32))
-        .threads((1, 1, 1), (1, 1, 1));
+        .bytes(&(n_blocks as u32))
+        .groups((n_blocks, 1, 1), (BLOCK, 1, 1));
+    ctx.kernel("sort_block_offsets")
+        .out(&blk)
+        .bytes(&(n_experts as u32))
+        .bytes(&(n_blocks as u32))
+        .groups((1, 1, 1), (BLOCK, 1, 1));
+    ctx.kernel("sort_block_scatter")
+        .arr(inds)
+        .out(&blk)
+        .out(&order)
+        .out(&inv_order)
+        .bytes(&(n as u32))
+        .bytes(&(n_blocks as u32))
+        .threads((n_blocks, 1, 1), (BLOCK.min(n_blocks), 1, 1));
     (order, inv_order)
+}
+
+/// Whether the gather sort is parallel over its input. See [`counting_sort`].
+static PARALLEL_SORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static PARALLEL_SORT_ENV: std::sync::Once = std::sync::Once::new();
+
+fn parallel_sort() -> bool {
+    PARALLEL_SORT_ENV.call_once(|| {
+        if std::env::var("ORNITH_PARALLEL_SORT").as_deref() == Ok("0") {
+            PARALLEL_SORT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    PARALLEL_SORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the parallel sort on or off at runtime; returns what it was.
+pub fn set_parallel_sort(on: bool) -> bool {
+    let was = parallel_sort();
+    PARALLEL_SORT.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
 }
 
 /// The whole tail of the block in one dispatch: the top-k scores normalised,

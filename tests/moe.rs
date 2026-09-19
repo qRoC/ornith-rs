@@ -333,3 +333,37 @@ fn debug_unsort() {
     eprintln!("unsort mismatches: {bad} of {rows}");
     assert_eq!(bad, 0);
 }
+
+/// The parallel gather sort is the one-thread gather sort, permutation for
+/// permutation.
+///
+/// `sort_permutation_matches_mlx` above already pins whichever path runs to
+/// mlx's `mx.argsort`, and at T = 512 that is the parallel one. This pins the
+/// other direction: the two paths against each other, so the control the
+/// timing runs alternate against is the same sort and not merely a sort.
+/// Stability is the whole content of the claim -- 16384 equal keys have to
+/// keep their input order across 64 blocks.
+#[test]
+fn the_parallel_sort_is_the_serial_one() {
+    let Some(case) = RefCase::open_or_skip("moe") else { return };
+    let ctx = Context::new().unwrap();
+    let k = case.meta_usize("top_k");
+    let n_experts = case.meta_usize("n_experts");
+    for t in TS {
+        let inds = Array::from_slice(
+            &ctx,
+            &case.get(&format!("inds_t{t}")).to_u32(),
+            &[t, k],
+            ornith_rs::array::Dtype::U32,
+        );
+        let was = ornith_rs::ops::moe::set_parallel_sort(false);
+        let (so, si) = ornith_rs::ops::moe::counting_sort_for_test(&ctx, &inds, n_experts);
+        let (so, si) = (so.to_vec_u32(&ctx), si.to_vec_u32(&ctx));
+        ornith_rs::ops::moe::set_parallel_sort(true);
+        let (po, pi) = ornith_rs::ops::moe::counting_sort_for_test(&ctx, &inds, n_experts);
+        let (po, pi) = (po.to_vec_u32(&ctx), pi.to_vec_u32(&ctx));
+        ornith_rs::ops::moe::set_parallel_sort(was);
+        assert_eq!(po, so, "order, T={t} ({} rows)", t * k);
+        assert_eq!(pi, si, "inv_order, T={t} ({} rows)", t * k);
+    }
+}

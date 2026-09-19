@@ -167,6 +167,126 @@ template <typename T>
 // expert) pair alone, so it would be invariant to tie-breaking anyway. A
 // single thread per row keeps the counting exact and the code obvious; the
 // arrays here are at most tokens x 8 entries.
+// The same stable counting sort, parallel over the *input* rather than over
+// nothing.
+//
+// The kernel below is one thread, and its comment says why that was fine:
+// "the arrays here are at most tokens x 8 entries". At a decode step tokens
+// is 1 and it is eight entries. At a prefill chunk of 2048 it is **16384**,
+// and `REBUILD.md` Phase 35 measured the one thread at 3.5 ms a dispatch,
+// 40 dispatches a chunk, **11% of a prefill chunk** -- two thirds of the
+// whole gap to mlx on a prompt. The sorted path starts at 64 rows, so a
+// decode step never reaches it and no instrument here had ever looked.
+//
+// Parallelising over experts does not help: each expert's thread would still
+// walk all n keys, so the serial depth is unchanged. Parallelising over the
+// input does, and stability survives because the slot an element gets is
+// decided by (its expert, its block, its position in the block) in that
+// order, which is the order the single thread visits them in.
+//
+//   1. `sort_block_hist`   one threadgroup a block, a histogram in
+//                          threadgroup memory -> counts[expert][block]
+//   2. `sort_block_offsets` one threadgroup: each expert sums its blocks,
+//                          one thread scans the expert totals, each expert
+//                          turns its blocks into starting slots
+//   3. `sort_block_scatter` one thread a block, walking its own S elements
+//                          in order -- serial depth S, not n
+//
+// Bit-identical to the one-thread kernel by construction, and
+// `tests/moe::the_parallel_sort_is_the_serial_one` holds it there.
+
+#define ORNITH_SORT_BLOCK 256
+
+[[kernel]] void sort_block_hist(
+    const device uint32_t* keys [[buffer(0)]],
+    device uint32_t* blk_counts [[buffer(1)]],  // [n_experts, n_blocks]
+    const constant uint& n [[buffer(2)]],
+    const constant uint& n_experts [[buffer(3)]],
+    const constant uint& n_blocks [[buffer(4)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]) {
+  threadgroup atomic_uint hist[1024];
+  for (uint e = lid; e < n_experts; e += tgsize) {
+    atomic_store_explicit(&hist[e], 0, metal::memory_order_relaxed);
+  }
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+  const uint b = tgpig;
+  const uint start = b * ORNITH_SORT_BLOCK;
+  for (uint j = lid; j < ORNITH_SORT_BLOCK; j += tgsize) {
+    const uint i = start + j;
+    if (i < n) {
+      atomic_fetch_add_explicit(&hist[keys[i]], 1, metal::memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+  for (uint e = lid; e < n_experts; e += tgsize) {
+    blk_counts[e * n_blocks + b] =
+        atomic_load_explicit(&hist[e], metal::memory_order_relaxed);
+  }
+}
+
+[[kernel]] void sort_block_offsets(
+    device uint32_t* blk_counts [[buffer(0)]],  // in: counts, out: start slots
+    const constant uint& n_experts [[buffer(1)]],
+    const constant uint& n_blocks [[buffer(2)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]) {
+  threadgroup uint total[1024];
+  for (uint e = lid; e < n_experts; e += tgsize) {
+    uint t = 0;
+    for (uint b = 0; b < n_blocks; ++b) {
+      t += blk_counts[e * n_blocks + b];
+    }
+    total[e] = t;
+  }
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+  // The expert bases, in ascending expert order -- the outer key of the sort.
+  if (lid == 0) {
+    uint running = 0;
+    for (uint e = 0; e < n_experts; ++e) {
+      uint c = total[e];
+      total[e] = running;
+      running += c;
+    }
+  }
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+  // And within an expert, ascending block order -- the middle key.
+  for (uint e = lid; e < n_experts; e += tgsize) {
+    uint off = total[e];
+    for (uint b = 0; b < n_blocks; ++b) {
+      uint c = blk_counts[e * n_blocks + b];
+      blk_counts[e * n_blocks + b] = off;
+      off += c;
+    }
+  }
+}
+
+[[kernel]] void sort_block_scatter(
+    const device uint32_t* keys [[buffer(0)]],
+    device uint32_t* blk_off [[buffer(1)]],  // start slots, bumped in place
+    device uint32_t* order [[buffer(2)]],
+    device uint32_t* inv_order [[buffer(3)]],
+    const constant uint& n [[buffer(4)]],
+    const constant uint& n_blocks [[buffer(5)]],
+    uint b [[thread_position_in_grid]]) {
+  // One thread a block: within a block the elements must be taken in input
+  // order, which is the inner key of the sort. Serial depth is the block,
+  // not the array, and no two blocks touch the same (expert, block) slot.
+  const uint start = b * ORNITH_SORT_BLOCK;
+  const uint end = metal::min(start + ORNITH_SORT_BLOCK, n);
+  for (uint i = start; i < end; ++i) {
+    const uint e = keys[i];
+    const uint slot = blk_off[e * n_blocks + b]++;
+    order[slot] = i;
+    inv_order[i] = slot;
+  }
+}
+
 [[kernel]] void counting_sort_experts(
     const device uint32_t* keys [[buffer(0)]],
     device uint32_t* order [[buffer(1)]],
