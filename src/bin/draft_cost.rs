@@ -35,6 +35,7 @@ use ornith_rs::frspec::{self, FrSpec};
 use ornith_rs::generate::{model_call, prefill, prefill_step_size};
 use ornith_rs::metal::Context;
 use ornith_rs::model::config::TextConfig;
+use ornith_rs::model::cache::LayerCache;
 use ornith_rs::model::mtp::{MtpHead, make_mtp_cache, sidecar_path};
 use ornith_rs::model::qwen3_5::TextModel;
 use ornith_rs::ops::elementwise::swiglu;
@@ -490,6 +491,88 @@ fn main() {
             v.map(|(c, s)| format!("{s:>9.3} x{c:<5}")).unwrap_or_else(|| "        --      ".into())
         };
         println!("  {} {} {}  {n}", cell(a), cell(b), cell(c));
+    }
+
+    // --- what stepping the recurrence costs ---------------------------------
+    //
+    // Phase 27 charged 29% of an extra window row to `forward_capture`
+    // stepping the gated-delta recurrence one token at a time, and Phase 28's
+    // lesson is that a share like that names a quantity, not a term. Two
+    // things grow with the window there: the recurrence's *work* (W tokens)
+    // and its *dispatches* (W of them, because the capture wants a state
+    // snapshot per token). The fix Phase 27 named -- one dispatch writing all
+    // W snapshots -- is only worth something if the second is the larger.
+    //
+    // The comparison needs no new kernel, because both forms already exist:
+    // `forward_hidden` runs the same trunk with `DecoderLayer::forward`, which
+    // calls the recurrence **once over the whole window** and needs no
+    // snapshot slices and no output concat, and `forward_capture` steps. Run
+    // on the same window from the same cache state, their difference is the
+    // whole price of stepping -- in the real model, at the real cache
+    // pressure, which is where the synthetic version of this measurement
+    // could not be made to hold still.
+    //
+    // It is an **upper bound** on what a fused capture would save: a fused
+    // capture still has to write W states where a plain forward writes one.
+    let snapshot = |cs: &[LayerCache]| -> Vec<(Option<Array>, Option<Array>, usize)> {
+        cs.iter()
+            .map(|c| match c {
+                LayerCache::Kv(k) => (k.keys.clone(), k.values.clone(), k.offset),
+                LayerCache::Gdn(g) => (g.conv.clone(), g.state.clone(), g.offset),
+            })
+            .collect()
+    };
+    let restore = |cs: &mut [LayerCache], s: &[(Option<Array>, Option<Array>, usize)]| {
+        for (c, (a, b, o)) in cs.iter_mut().zip(s) {
+            match c {
+                LayerCache::Kv(k) => {
+                    k.keys = a.clone();
+                    k.values = b.clone();
+                    k.offset = *o;
+                }
+                LayerCache::Gdn(g) => {
+                    g.conv = a.clone();
+                    g.state = b.clone();
+                    g.offset = *o;
+                }
+            }
+        }
+    };
+
+    println!("\nstepping the recurrence: the capture against a plain forward\n");
+    println!(
+        "  {:>5} {:>12} {:>12} {:>10} {:>10} {:>12}",
+        "width", "capture ms", "plain ms", "stepping", "of a row", "dispatches"
+    );
+    let mut step_ms = [0.0f64; 5];
+    for w in 1..=4usize {
+        let win: Vec<u32> = (0..w).map(|_| primary).collect();
+        let window = Array::from_slice(&ctx, &win, &[w], Dtype::U32);
+        let base = snapshot(&caches);
+
+        let (cap, dc) = gpu_ms_n(&ctx, VERIFY_REPS, || {
+            let (vh, _, _) = model.forward_capture(&ctx, &window, &mut caches);
+            std::hint::black_box(&vh);
+            restore(&mut caches, &base);
+        });
+        let (plain, dp) = gpu_ms_n(&ctx, VERIFY_REPS, || {
+            let (vh, _) = model.forward_hidden(&ctx, &window, &mut caches);
+            std::hint::black_box(&vh);
+            restore(&mut caches, &base);
+        });
+        restore(&mut caches, &base);
+        step_ms[w] = cap - plain;
+        println!(
+            "  {w:>5} {cap:>12.3} {plain:>12.3} {:>10.3} {:>10} {:>5.0} / {:<5.0}",
+            cap - plain,
+            if w > 1 {
+                format!("{:.1}%", 100.0 * (step_ms[w] - step_ms[1]) / (w - 1) as f64 / 3.14)
+            } else {
+                "--".to_string()
+            },
+            dc,
+            dp,
+        );
     }
 
     // --- what the cycle is made of ------------------------------------------

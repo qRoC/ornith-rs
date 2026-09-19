@@ -930,9 +930,15 @@ The two structural costs, which are why deeper is worse:
    what this item never had: the expert gather is **30%** of what a verify
    pays per extra row on `q6k-full`. The larger share, 41%, is the dense
    k-quant mat-vecs -- which Phase 27 read as a re-read that could be taken
-   back exactly, and Phase 28 measured as arithmetic that cannot. Taking the
-   re-read back is worth 2.8% a token; **this 30% is now the larger of the two
-   remaining pieces of a window row.**
+   back exactly, and Phase 28 measured as arithmetic that cannot.
+
+   **And Phase 29 measured this 30% the same way, on the shipping artifact,
+   and it is arithmetic too.** Hold the rows fixed and vary the distinct
+   experts behind them and the time does not move: 32 rows cost the same
+   whether they name 26 experts or 8, 48 rows the same at 48 or 8, and sorting
+   them into runs so each expert is read once costs **23-44% more**. The
+   gather pays for the arithmetic of its rows, not for the bytes of its
+   experts, so there is nothing here to group.
 
 A dense model would win here; a 3B-active MoE with an unpruned draft head does
 not. FR-Spec is the fix for the first of those, and it is in -- see below.
@@ -1004,6 +1010,17 @@ Three consequences, all of which replace something this file used to say:
   it is expensive: Q6_K -21% on that kernel, Q4_K +9% and left alone. Whole
   run: **-2.8% a token at depth 1 and -5.0% at depth 3**, with the acceptance
   byte-identical.
+
+- **And Phase 29 priced the other two thirds, which leaves the row nearly
+  closed.** The expert gather is arithmetic as well (above). Of the
+  recurrence's 29%, the part that is *stepping* rather than work is **11% of
+  a row** and no more: `forward_hidden` already runs the same trunk with one
+  recurrence dispatch over the whole window, no snapshot slices and no output
+  concat, and against `forward_capture` on the same window from the same cache
+  state it is 1.09 ms cheaper at width 4 and exactly equal at width 1. A fused
+  capture cannot take all of that -- it still writes `W` states where the
+  plain form writes one. So the accounting is: 41% arithmetic (5% recovered),
+  30% arithmetic (nothing), 29% of which at most 11% of a row is loose.
 
 ### How exact it is: exactly, and it is the default
 

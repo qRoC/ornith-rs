@@ -35,7 +35,25 @@ use ornith_rs::weights::WeightStore;
 const P: &str = "language_model.model.layers.0.mlp";
 const K: usize = 8;
 
+/// GPU seconds when `ORNITH_PROF=1`, else the drained wall clock.
+///
+/// The wall was what this bin measured when it was written, and on this
+/// machine the wall moves 3x between sittings while GPU seconds hold to 1%
+/// inside one.
 fn best_of<F: FnMut()>(ctx: &Context, reps: usize, mut run: F) -> f64 {
+    if ctx.prof_on() {
+        let mut best = f64::MAX;
+        for _ in 0..reps {
+            run();
+            ctx.sync();
+            ctx.prof_reset();
+            run();
+            ctx.sync();
+            let (_, _, gpu_s, _) = ctx.prof_totals();
+            best = best.min(gpu_s);
+        }
+        return best;
+    }
     let mut best = f64::MAX;
     for _ in 0..reps {
         ctx.sync();
@@ -76,9 +94,15 @@ fn main() {
     let dir = model_dir();
     let ctx = Context::new().unwrap();
     let mut ws = WeightStore::open(&dir, &[]).unwrap();
-    let g = Linear::Mlx(ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.gate_proj")));
-    let u = Linear::Mlx(ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.up_proj")));
-    let dn = Linear::Mlx(ws.quant_matrix(&ctx, &format!("{P}.switch_mlp.down_proj")));
+    // `ws.linear` and not `ws.quant_matrix`: this bin was written against the
+    // affine artifact and panicked on the one the project ships, whose expert
+    // modules are Q4_K. The question it asks -- does the gather pay for rows
+    // or for distinct experts -- is one that has to be asked on the shipping
+    // artifact, since Phase 28 showed the two families answer the
+    // traffic-against-arithmetic question differently.
+    let g = ws.linear(&ctx, &format!("{P}.switch_mlp.gate_proj"));
+    let u = ws.linear(&ctx, &format!("{P}.switch_mlp.up_proj"));
+    let dn = ws.linear(&ctx, &format!("{P}.switch_mlp.down_proj"));
     let dim = g.in_dims();
     println!("{}\n{} experts, dim {dim}\n", dir.display(), g.num_experts());
 

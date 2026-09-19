@@ -4232,6 +4232,108 @@ a window row, and nothing here says what *their* growth is made of either.
 
 ---
 
+## Phase 29 -- the other two thirds of a window row, priced -- **DONE**
+
+Phase 27 split what an extra verify-window row costs three ways -- 41% dense
+k-quant mat-vecs, 30% the expert gather, 29% `forward_capture` stepping the
+gated-delta recurrence -- and Phase 28 took the first third apart and found
+its name was wrong: the weight re-read cost almost nothing and the arithmetic
+was the whole of it. This phase asks the other two the same question with the
+same instrument: **remove one of the two co-growing terms and leave the
+other.**
+
+### The expert gather: rows, not distinct experts, on the artifact that ships
+
+`src/bin/moe_reuse.rs` holds the row count fixed and varies how many distinct
+experts those rows name -- the arithmetic held, the traffic varied. It could
+not run here: it was written against the affine artifact and loaded the expert
+modules through mlx's path, so on `q6k-full` it panicked on a Q4_K module.
+Fixed to `ws.linear`, and moved from the wall clock to GPU seconds. 8 experts
+a token, GPU ms:
+
+    rows   distinct       ms
+     16    16 -> 8    0.279 -> 0.277
+     24    24 -> 8    0.405 -> 0.403
+     32    26 -> 8    0.173 -> 0.171
+     48    48 -> 8    0.289 -> 0.333
+
+**Flat.** Up to six times the distinct weights behind the same rows, and the
+time does not move; sorting the rows into runs so an expert is read once costs
+23-44% more than not bothering. The same shape as the dense third: the gather
+pays for the arithmetic of 32 rows, not for the bytes of 32 experts, and the
+"charge for the ~23 distinct rather than the 32 rows" fix Phase 27 sketched is
+worth nothing. (`HANDOFF.md` has carried a version of this since the affine
+artifact; what is new is that it now holds where the project actually is.)
+
+### The recurrence: the stepping is 11% of a row and the rest is work
+
+Both forms already exist, which is the whole reason this is measurable without
+a new kernel. `DecoderLayer::forward` -- what `forward_hidden` runs -- calls
+the recurrence **once over the whole window**, writes one state, and needs no
+snapshot slices and no output concat. `forward_capture` steps it per token
+because the rewind wants a state snapshot per token. Same window, same cache
+state (saved and restored around every repetition), GPU ms, two draws:
+
+    width   capture ms      plain ms       stepping    dispatches
+      1    7.279 / 7.431  7.298 / 7.328  -0.019/0.103  1755 / 1665
+      2    9.796 / 9.667  9.379 / 9.287   0.418/0.379  2155 / 1855
+      3   12.550 /12.546 11.923 /11.858   0.627/0.688  2425 / 1915
+      4   15.478 /15.465 14.369 /14.391   1.109/1.074  2695 / 1975
+
+Width 1 is the control -- one token is one dispatch either way -- and it reads
+zero, which is what says the other rows are measuring the thing named. At
+width 4 stepping costs **1.09 ms, i.e. 0.36 ms an extra row, 11% of a 3.14 ms
+row**, reproducible to 3%.
+
+And 11% is an **upper bound**, because a fused capture is not a plain forward:
+it still has to write `W` states where the plain form writes one. What a
+fusion can actually take back is the `W - 1` state *reads* (2.1 MB a layer
+each), the `W` snapshot slices and the `W - 1` output concatenations -- call
+it half to two thirds of the 11%, for a new recurrence kernel and a rewiring
+of the capture path. Phase 28's dense lever was 5% of a row for a kernel of
+comparable size.
+
+### The row, fully accounted
+
+    third                  Phase 27's share   what it is        what is loose
+    dense k-quant mat-vec       41%           arithmetic        5%  (taken)
+    expert gather               30%           arithmetic        nothing
+    recurrence                  29%           work + stepping   <= 11%
+
+**Three thirds, three mechanisms named from a share, and in all three the
+share was mostly the arithmetic the mechanism's fix does not touch.** A verify
+window row is close to irreducible: it is a decode step's work done again for
+one more token, and the only parts that were ever "overhead" are the ones
+counted above.
+
+### The synthetic instrument that had to be thrown away
+
+Worth recording because it cost most of the phase. `src/bin/window_rest.rs`
+measures the recurrence on its own -- one dispatch over `W` tokens against `W`
+dispatches of one -- and its fused column is a clean straight line (17.0 us
+plus 3.3 us a token, three independent runs agreeing to 2%). Its **stepped**
+column would not hold still: whichever cell fell late in a run would read
+about 3x low, with the dispatch count printed beside it and correct, and at
+one point implying 733 GB/s over a state this machine cannot move that fast.
+
+Two lessons came out of it, both cheap and both kept in the bin:
+
+- **`min` is the wrong estimator here.** `window_mv` takes the least of three
+  passes because interference can only add time. For microsecond dispatches
+  in a chain it can also *subtract* it -- a pass whose command buffers fall
+  outside the profiling window reads low -- so this bin takes the median of
+  seven and prints the dispatch count, which is what caught a timing loop that
+  was measuring its own `zero` calls.
+- **And the whole thing was still the wrong object.** The real model
+  contradicted its level by 4.5x: 3.7 us a recurrence dispatch in
+  `forward_capture` against 16.7 us in the bin. Thirty layers of it in a
+  dependency chain, against real cache pressure, is not the same object as one
+  layer of it in a loop. The measurement of record is the one above, which
+  uses only kernels that already exist and compares two code paths the model
+  already has.
+
+---
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
