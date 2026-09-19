@@ -261,6 +261,13 @@ pub struct Prof {
     /// single dispatch (`ORNITH_COMMIT_EVERY=1`), since a buffer's timestamps
     /// cover everything in it.
     pub gpu_by_kernel: HashMap<String, f64>,
+    /// The same times kept one per command buffer instead of summed by name,
+    /// in commit order. Under `ORNITH_COMMIT_EVERY=1` a buffer is a dispatch,
+    /// so this is one entry per dispatch in encode order -- which is what
+    /// lets a time be joined to the trace line that names its bindings, and
+    /// so to the bytes the dispatch actually moved. Only kept while a trace
+    /// is recording, and capped with it.
+    per_dispatch: Vec<(Rc<str>, f64)>,
     /// GPU seconds in buffers that held more than one dispatch.
     pub gpu_mixed: f64,
     /// Kernel names dispatched into the buffer now being built.
@@ -446,11 +453,37 @@ pub struct Context {
     /// has something to wait on when `flush` already submitted everything.
     last_committed: RefCell<Option<CommandBuffer>>,
     /// Commit after this many dispatches, trading two costs against each
-    /// other: a command buffer costs ~60 us of GPU time, and a large one
+    /// other: a command buffer costs GPU time of its own, and a large one
     /// leaves the GPU idle while the CPU fills it. Measured on this machine at
     /// 256 greedy tokens -- 32: 68 tok/s, 128: 82, 512: 79, where 512 is the
     /// end where the GPU starts waiting. `ORNITH_COMMIT_EVERY` overrides it.
-    pub max_dispatches_per_commit: usize,
+    ///
+    /// **A buffer costs ~6.6 us, not the ~60 this comment used to claim.**
+    /// `REBUILD.md` Phase 31 swept the size with every dispatch's work
+    /// clamped away, which is where a fixed per-buffer cost shows up alone:
+    /// 52 buffers a token to none is 0.34 ms. Between 128 and 1024 there is
+    /// ~0.1 ms of GPU time and the wall gives it straight back, so 128
+    /// stays.
+    max_dispatches_per_commit: Cell<usize>,
+    /// Every dispatch issued with a single threadgroup, so it pays its launch
+    /// and does none of its work. The output is wrong by construction; what
+    /// it measures is the other term, and the control that says it measures
+    /// it is a kernel whose grid was one threadgroup already -- that one must
+    /// come out unchanged. `ORNITH_GRID1=1`, or [`Context::set_grid1`].
+    grid1: Cell<bool>,
+    /// The same, for one class of dispatch instead of all of them: kernels
+    /// whose name contains this, and whether to drop the whole dispatch
+    /// rather than only its work. What it is for is the question the clamp
+    /// above cannot answer -- not what the floor is over the whole step, but
+    /// what *this* kernel costs where it actually runs, with its neighbours
+    /// around it and whatever overlap they give it.
+    ///
+    /// A dropped dispatch is still counted and still hands its bindings to
+    /// the tracker, so the barriers, the epochs, the commit boundaries and
+    /// the dispatch count are all what they were; the only difference is the
+    /// dispatch itself. Both need the selective encoder, since that is what
+    /// maintains the name.
+    neuter: RefCell<Option<(String, bool)>>,
     prof: RefCell<Prof>,
     barriers: BarrierMode,
     hazards: RefCell<Hazards>,
@@ -518,10 +551,14 @@ impl Context {
             next_fence: RefCell::new(0),
             last_fence: RefCell::new(None),
             last_committed: RefCell::new(None),
-            max_dispatches_per_commit: std::env::var("ORNITH_COMMIT_EVERY")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(128),
+            max_dispatches_per_commit: Cell::new(
+                std::env::var("ORNITH_COMMIT_EVERY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(128),
+            ),
+            grid1: Cell::new(std::env::var_os("ORNITH_GRID1").is_some()),
+            neuter: RefCell::new(None),
             prof: RefCell::new(Prof {
                 on: std::env::var_os("ORNITH_PROF").is_some(),
                 ..Prof::default()
@@ -1012,7 +1049,12 @@ impl Context {
             let dt = end - start;
             p.gpu_s += dt;
             match name {
-                Some(n) => *p.gpu_by_kernel.entry(n).or_default() += dt,
+                Some(n) => {
+                    if p.trace.is_some() && p.per_dispatch.len() < TRACE_BUDGET {
+                        p.per_dispatch.push((Rc::from(n.as_str()), dt));
+                    }
+                    *p.gpu_by_kernel.entry(n).or_default() += dt;
+                }
                 None => p.gpu_mixed += dt,
             }
         }
@@ -1076,9 +1118,88 @@ impl Context {
         t.push(line);
     }
 
+    /// The grid the dispatch went out with, appended to the line
+    /// [`Dispatch::order`] just pushed. `dispatchThreads` and
+    /// `dispatchThreadgroups` are both reported as threadgroups, which is
+    /// what says whether a kernel had the machine or a corner of it.
+    fn trace_grid(&self, grid: (usize, usize, usize), tg: (usize, usize, usize)) {
+        let mut p = self.prof.borrow_mut();
+        let Some(t) = p.trace.as_mut() else { return };
+        let Some(line) = t.last_mut() else { return };
+        if line.starts_with("--") || line.starts_with("==") {
+            return;
+        }
+        line.push_str(&format!(
+            " grid:{}x{}x{} tg:{}x{}x{}",
+            grid.0, grid.1, grid.2, tg.0, tg.1, tg.2
+        ));
+    }
+
     /// The recorded step, if `ORNITH_TRACE` asked for one.
     pub fn prof_trace(&self) -> Vec<String> {
         self.prof.borrow().trace.clone().unwrap_or_default()
+    }
+
+    /// Start recording a trace here rather than from the first dispatch of
+    /// the process, and throw away anything recorded before. A bin that wants
+    /// one step's dispatches wants the step it chose, not the first
+    /// [`TRACE_BUDGET`] of a load.
+    pub fn prof_trace_start(&self) {
+        let mut p = self.prof.borrow_mut();
+        p.trace = Some(Vec::new());
+        p.per_dispatch.clear();
+    }
+
+    /// `(kernel, GPU seconds)` per command buffer that held one dispatch, in
+    /// commit order. With `ORNITH_COMMIT_EVERY=1` that is the trace's
+    /// dispatch lines, in the same order, with a time against each.
+    pub fn prof_per_dispatch(&self) -> Vec<(String, f64)> {
+        self.prof.borrow().per_dispatch.iter().map(|(k, s)| (k.to_string(), *s)).collect()
+    }
+
+    /// Mark where one part of the model ends and the next begins, so a trace
+    /// can be cut into layers without inferring the boundaries from the
+    /// pattern of kernel names. A no-op unless a trace is recording.
+    pub fn prof_section(&self, kind: &str, i: usize) {
+        let mut p = self.prof.borrow_mut();
+        if let Some(t) = p.trace.as_mut()
+            && t.len() < TRACE_BUDGET
+        {
+            t.push(format!("== {kind} {i}"));
+        }
+    }
+
+    /// Commit every `n` dispatches from here on. The env var sets it once;
+    /// this is for a bin that wants the per-kernel attribution of
+    /// `ORNITH_COMMIT_EVERY=1` for one measurement and the real commit size
+    /// for another, in one process.
+    pub fn set_commit_every(&self, n: usize) {
+        self.max_dispatches_per_commit.set(n.max(1));
+    }
+
+    /// See [`Context::grid1`]. Returns what it was.
+    pub fn set_grid1(&self, on: bool) -> bool {
+        self.grid1.replace(on)
+    }
+
+    /// See [`Context::neuter`]. `None` puts every dispatch back.
+    pub fn set_neuter(&self, what: Option<(&str, bool)>) {
+        *self.neuter.borrow_mut() = what.map(|(k, all)| (k.to_string(), all));
+    }
+
+    /// `(clamp this dispatch's grid, drop it entirely)` for the kernel being
+    /// encoded.
+    /// The two compose: with every grid clamped, a filter that drops one
+    /// class takes that class's *launch* out of the floor, which is how the
+    /// floor gets decomposed into the same classes as the work.
+    fn neutered(&self) -> (bool, bool) {
+        let n = self.neuter.borrow();
+        if let Some((pat, all)) = n.as_ref()
+            && self.cur_kernel.borrow().contains(pat.as_str())
+        {
+            return if *all { (false, true) } else { (true, false) };
+        }
+        (self.grid1.get(), false)
     }
 
     /// `(dispatches in the epoch, how many epochs held that many)`, smallest
@@ -1181,7 +1302,7 @@ impl Context {
         }
         let mut n = self.dispatches.borrow_mut();
         *n += 1;
-        let over = *n >= self.max_dispatches_per_commit;
+        let over = *n >= self.max_dispatches_per_commit.get();
         drop(n);
         if over {
             self.flush();
@@ -1376,10 +1497,15 @@ impl<'a> Dispatch<'a> {
     /// mlx's `dispatch_threadgroups`.
     pub fn groups(self, grid: (usize, usize, usize), tg: (usize, usize, usize)) {
         self.order();
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: grid.0, height: grid.1, depth: grid.2 },
-            MTLSize { width: tg.0, height: tg.1, depth: tg.2 },
-        );
+        let (clamp, dropped) = self.ctx.neutered();
+        let g = if clamp { (1, 1, 1) } else { grid };
+        self.ctx.trace_grid(g, tg);
+        if !dropped {
+            self.enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: g.0, height: g.1, depth: g.2 },
+                MTLSize { width: tg.0, height: tg.1, depth: tg.2 },
+            );
+        }
         self.ctx.count_dispatch();
     }
 
@@ -1387,10 +1513,22 @@ impl<'a> Dispatch<'a> {
     /// `dispatch_threads`, which the JIT `mx.fast.metal_kernel` path uses.
     pub fn threads(self, grid: (usize, usize, usize), tg: (usize, usize, usize)) {
         self.order();
-        self.enc.dispatchThreads_threadsPerThreadgroup(
-            MTLSize { width: grid.0, height: grid.1, depth: grid.2 },
-            MTLSize { width: tg.0, height: tg.1, depth: tg.2 },
-        );
+        // One threadgroup's worth of threads, never more than the grid asked
+        // for: a kernel dispatched over one threadgroup already is left alone,
+        // which is the control.
+        let (clamp, dropped) = self.ctx.neutered();
+        let g = if clamp {
+            (grid.0.min(tg.0), grid.1.min(tg.1), grid.2.min(tg.2))
+        } else {
+            grid
+        };
+        self.ctx.trace_grid(g, tg);
+        if !dropped {
+            self.enc.dispatchThreads_threadsPerThreadgroup(
+                MTLSize { width: g.0, height: g.1, depth: g.2 },
+                MTLSize { width: tg.0, height: tg.1, depth: tg.2 },
+            );
+        }
         self.ctx.count_dispatch();
     }
 }
