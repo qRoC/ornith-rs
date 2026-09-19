@@ -259,6 +259,41 @@ Why it suits this project better than anything else here:
 
 ## If it were ranked
 
+> **ALL FIVE ARE SETTLED, 2026-09-20, and four of them were settled by
+> phases later than this list.** The list below is kept for its reasoning;
+> read the verdicts first, because the ranking is stale against its own
+> document's header block.
+>
+> 1. **Activation-aware scaling -- built, does not pay** (Phase 6), as the
+>    entry itself now records.
+> 2. **fp8 scale at g16 -- priced out** (Phase 13, and the header block
+>    above). mlx's affine mode accepts group sizes 32, 64 and 128 only, so
+>    there is **no oracle at g16**, and the decomposition says the gain
+>    lives in the group size rather than the scale format: -1.31 points of
+>    granularity, +0.51 back for the fp8 scales.
+> 3. **Two-stage exact `lm_head` -- dead.** A 2-bit first stage prunes
+>    nothing; see `HANDOFF.md`.
+> 4. **Lloyd-Max codebook at g16 -- dead twice over.** It needs the same
+>    g16 mlx will not run, so it has no oracle either; and on the model's
+>    own weights its row does not reproduce -- 7.50% predicted against
+>    **7.5-18.7% measured, a 2.5x swing across tensors**. At g32, the
+>    granularity mlx *does* run, it is 8.2-9.0% weight error at 4.50 bits
+>    against the body's 7.8-8.3% at 5.00: worse error for fewer bits.
+> 5. **Vector quantization** -- rejected in "Checked and rejected" above.
+>
+> **And the prize item 4 was chasing has already been collected by
+> something else.** Its pitch was "0.50 fewer bits, ~10% of bytes, with
+> quality attached". `Q4_K` is **4.50 bits a weight** (144 bytes per 256)
+> against affine int4 g32's 5.00, and it shipped at **-13.1% of a decode
+> step with no quality difference the 64-probe set can see** (Phases
+> 15-18). A format mlx does not have and ggml does took the bytes this
+> list was still holding open for a new kernel and a lost oracle.
+>
+> So there is nothing on this page that outranks the one open performance
+> object in the port, which is `REBUILD.md` Phase 38's: carrying Q4_K and
+> Q6_K onto mlx's steel tiling, ~6% of a prefill chunk, k-quant artifacts
+> only.
+
 1. **Activation-aware scaling** -- no kernels, keeps the oracle, attacks the
    binding question from the only side with room left. **BUILT AND MEASURED,
    and it does not pay** -- `REBUILD.md` Phase 6. Both halves of the pitch
