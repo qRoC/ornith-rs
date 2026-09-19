@@ -313,7 +313,8 @@ pub fn sparse_moe_block(
     let gates = gate.matmul(ctx, &x2);
     let sg = shared_gate.matmul(ctx, &x2);
     let su = shared_up.matmul(ctx, &x2);
-    let gate_scalar = shared_expert_gate.matmul(ctx, &x2);
+    let early_gate = !late_shared_gate();
+    let mut gate_scalar = early_gate.then(|| shared_expert_gate.matmul(ctx, &x2));
 
     let gates = super::softmax::softmax(ctx, &gates, true);
     let sact = super::elementwise::swiglu(ctx, &sg, &su);
@@ -322,13 +323,52 @@ pub fn sparse_moe_block(
     let shared_y = shared_down.matmul(ctx, &sact);
 
     let scores = if norm_topk_prob { normalize_scores(ctx, &scores) } else { scores };
-    let shared_y = super::elementwise::sigmoid_gate(ctx, &gate_scalar, &shared_y);
+
+    // `shared_expert_gate` is one row of 2048 -- 6 KB, one output number --
+    // and it is the most expensive small dispatch in the step: 13 us, because
+    // a one-row `qmv` is 32 threads walking K in a chain of dependent loads
+    // and there is nothing else in it to hide them behind. Its own epoch is
+    // where that shows. It depends on `x2` alone and is not read until
+    // `sigmoid_gate`, so it is issued here instead, next to the routed
+    // experts' gathers -- which are 14-16 us of memory each and have the
+    // latency slack to absorb it. Same dispatch, same inputs, same output;
+    // only where it sits in the queue moves. `ORNITH_MOE_EARLY_GATE=1` puts
+    // it back beside the router, as the control. Moving the shared expert's
+    // *down* projection along with it measured the same to within a
+    // thousandth of a millisecond, so it stays where it is.
+    if !early_gate {
+        gate_scalar = Some(shared_expert_gate.matmul(ctx, &x2));
+    }
 
     let y = switch_glu(ctx, &x2, &inds, switch_gate, switch_up, switch_down);
+
+    let shared_y =
+        super::elementwise::sigmoid_gate(ctx, gate_scalar.as_ref().unwrap(), &shared_y);
     let mixed = mix_experts(ctx, &y, &scores);
 
     let out = super::elementwise::add(ctx, &mixed, &shared_y);
     out.reshape(&x.shape)
+}
+
+/// Where the shared expert's gate goes. See [`sparse_moe_block`].
+static LATE_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static LATE_GATE_ENV: std::sync::Once = std::sync::Once::new();
+
+fn late_shared_gate() -> bool {
+    LATE_GATE_ENV.call_once(|| {
+        if std::env::var("ORNITH_MOE_EARLY_GATE").as_deref() == Ok("1") {
+            LATE_GATE.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    LATE_GATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Move it at runtime, so one process can measure both orders. Returns what
+/// it was.
+pub fn set_late_shared_gate(on: bool) -> bool {
+    let was = late_shared_gate();
+    LATE_GATE.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
 }
 
 /// `(y * scores[..., None]).sum(axis=-2)`: weight each expert's output by its
