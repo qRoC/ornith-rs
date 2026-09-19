@@ -260,6 +260,8 @@ fn main() {
     let want_moe_tail = std::env::var("ORNITH_FUSE_MOE_TAIL").as_deref() != Ok("0");
     let want_gdn_front = std::env::var("ORNITH_FUSE_GDN_FRONT").as_deref() != Ok("0");
     let want_gdn_norm = std::env::var("ORNITH_FUSE_GDN_NORM").as_deref() != Ok("0");
+    let want_moe_gather = std::env::var("ORNITH_FUSE_MOE_GATHER").as_deref() != Ok("0");
+    let want_moe_unsort = std::env::var("ORNITH_FUSE_MOE_UNSORT").as_deref() != Ok("0");
     // The one switch here that is off by default, because it lost.
     let want_norm_proj = std::env::var("ORNITH_FUSE_NORM_PROJ").as_deref() == Ok("1");
     ornith_rs::ops::norm::set_fuse_add_rms(want_fuse);
@@ -268,6 +270,8 @@ fn main() {
     ornith_rs::ops::gdn::set_fuse_gdn_front(want_gdn_front);
     ornith_rs::ops::norm::set_fuse_gdn_norm(want_gdn_norm);
     ornith_rs::ops::kquant::set_fuse_norm_proj(want_norm_proj);
+    ornith_rs::ops::moe::set_fuse_moe_gather(want_moe_gather);
+    ornith_rs::ops::moe::set_fuse_moe_unsort(want_moe_unsort);
 
 
     // --- the step, and the same step with the work taken out ---------------
@@ -364,6 +368,92 @@ fn main() {
 
     let ab_only = std::env::args().any(|a| a == "ab");
     let ab_draws = if ab_only { 8 } else { DRAWS + 1 };
+
+    // --- the two copies the sorted expert path used to make ----------------
+    //
+    // First, and with the draws a prefill cell needs, because that width is
+    // what this pair is about and because `REBUILD.md` Phase 35 found the
+    // level climbing monotonically across a run: a cell placed eleventh is
+    // measured in a thermal state the first one was not. `only` runs this
+    // and stops, which is the protocol that finding asks for -- few cells a
+    // sitting, and the arms interleaved so the drift is inside both of them.
+    // The draws are printed in order, so the drift is visible rather than
+    // assumed away.
+    let only = std::env::args().any(|a| a == "only");
+    let moe_draws = if ab_only || only { 8 } else { DRAWS + 1 };
+    println!("\nthe expert gather and its inverse, indexed and copied\n");
+    println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
+    for (name, gather, unsort) in [
+        // The first row is the control against itself -- same flags in both
+        // arms, so its difference is this cell's own noise and the rows
+        // below are read against that and not against zero.
+        ("the control, twice", false, false),
+        ("the gather indexed", true, false),
+        ("the unsort indexed", false, true),
+    ] {
+        let (mut copied, mut idx) = (Vec::new(), Vec::new());
+        let (mut dc, mut di) = (0.0, 0.0);
+        for _ in 0..moe_draws {
+            ornith_rs::ops::moe::set_fuse_moe_gather(false);
+            ornith_rs::ops::moe::set_fuse_moe_unsort(false);
+            let (ms, d) = step(&ctx, &mut caches, false);
+            copied.push(ms);
+            dc = d;
+            ornith_rs::ops::moe::set_fuse_moe_gather(gather);
+            ornith_rs::ops::moe::set_fuse_moe_unsort(unsort);
+            let (ms, d) = step(&ctx, &mut caches, false);
+            idx.push(ms);
+            di = d;
+        }
+        let pairs: Vec<f64> = idx.iter().zip(&copied).map(|(a, b)| a - b).collect();
+        let (a, b) = (median(&mut copied.clone()), median(&mut idx.clone()));
+        println!(
+            "  {name:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down, {:+.2}%",
+            b - a,
+            di - dc,
+            pairs.iter().sum::<f64>() / pairs.len() as f64,
+            pairs.iter().filter(|d| **d < 0.0).count(),
+            pairs.len(),
+            100.0 * (b - a) / a,
+        );
+        println!("  {:<24} copied {copied:.3?}\n  {:<24} indexed {idx:.3?}", "", "");
+    }
+    // And both at once, which is the change as it ships.
+    {
+        let (mut copied, mut idx) = (Vec::new(), Vec::new());
+        let (mut dc, mut di) = (0.0, 0.0);
+        for _ in 0..moe_draws {
+            ornith_rs::ops::moe::set_fuse_moe_gather(false);
+            ornith_rs::ops::moe::set_fuse_moe_unsort(false);
+            let (ms, d) = step(&ctx, &mut caches, false);
+            copied.push(ms);
+            dc = d;
+            ornith_rs::ops::moe::set_fuse_moe_gather(true);
+            ornith_rs::ops::moe::set_fuse_moe_unsort(true);
+            let (ms, d) = step(&ctx, &mut caches, false);
+            idx.push(ms);
+            di = d;
+        }
+        let pairs: Vec<f64> = idx.iter().zip(&copied).map(|(a, b)| a - b).collect();
+        let (a, b) = (median(&mut copied.clone()), median(&mut idx.clone()));
+        println!(
+            "  {:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down, {:+.2}%",
+            "both indexed",
+            b - a,
+            di - dc,
+            pairs.iter().sum::<f64>() / pairs.len() as f64,
+            pairs.iter().filter(|d| **d < 0.0).count(),
+            pairs.len(),
+            100.0 * (b - a) / a,
+        );
+        println!("  {:<24} copied {copied:.3?}\n  {:<24} indexed {idx:.3?}", "", "");
+    }
+    ornith_rs::ops::moe::set_fuse_moe_gather(want_moe_gather);
+    ornith_rs::ops::moe::set_fuse_moe_unsort(want_moe_unsort);
+    if only {
+        return;
+    }
+
     println!("\nthe add and the norm that reads it, fused and not\n");
     println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
     let (mut on, mut off) = (Vec::new(), Vec::new());
@@ -395,6 +485,12 @@ fn main() {
     println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
     let (mut fused, mut apart) = (Vec::new(), Vec::new());
     let (mut dfu, mut dap) = (0.0, 0.0);
+    // The six kernels read `y` in token order, so under that arm the tail
+    // pulls `unsort_rows` back in with it. Pin the indexed tail off in both
+    // arms and this stays the six-against-one cell it was, rather than a
+    // cell measuring two fusions at once. (Same move as `set_fuse_norm_proj`
+    // in the RMSNormGated cell below, and for the same reason.)
+    let was_unsort = ornith_rs::ops::moe::set_fuse_moe_unsort(false);
     for _ in 0..ab_draws {
         ornith_rs::ops::moe::set_fuse_moe_tail(false);
         let (ms, d) = step(&ctx, &mut caches, false);
@@ -406,6 +502,7 @@ fn main() {
         dfu = d;
     }
     ornith_rs::ops::moe::set_fuse_moe_tail(want_moe_tail);
+    ornith_rs::ops::moe::set_fuse_moe_unsort(was_unsort);
     let pairs: Vec<f64> = fused.iter().zip(&apart).map(|(f, a)| f - a).collect();
     let (a, b) = (median(&mut apart.clone()), median(&mut fused.clone()));
     println!("  {:<24} {a:>9.3} {dap:>11.0}  {apart:.3?}", "six dispatches");
