@@ -217,9 +217,15 @@ fn main() {
     // put back what the environment asked for: with both controls set this
     // bin dumps the *old* stream, which is what a change is ranked against.
     let want_fuse = std::env::var("ORNITH_FUSE_ADD_RMS").as_deref() != Ok("0");
-    let want_late = std::env::var("ORNITH_MOE_EARLY_GATE").as_deref() != Ok("1");
+    let want_gate_pos = match std::env::var("ORNITH_MOE_GATE_POS").as_deref() {
+        Ok(v) => v.parse().expect("ORNITH_MOE_GATE_POS is 0, 1 or 2"),
+        Err(_) if std::env::var("ORNITH_MOE_EARLY_GATE").as_deref() == Ok("1") => 0u8,
+        Err(_) => 1u8,
+    };
+    let want_moe_tail = std::env::var("ORNITH_FUSE_MOE_TAIL").as_deref() != Ok("0");
     ornith_rs::ops::norm::set_fuse_add_rms(want_fuse);
-    ornith_rs::ops::moe::set_late_shared_gate(want_late);
+    ornith_rs::ops::moe::set_shared_gate_pos(want_gate_pos);
+    ornith_rs::ops::moe::set_fuse_moe_tail(want_moe_tail);
 
 
     // --- the step, and the same step with the work taken out ---------------
@@ -330,30 +336,180 @@ fn main() {
         100.0 * (b - a) / a
     );
 
-    // --- and the reorder: where the shared expert's gate is issued ----------
-    println!("\nthe shared expert's gate, beside the router and beside the gathers\n");
+    // --- the MoE block's tail, one dispatch against six --------------------
+    println!("\nthe MoE block's tail, fused and not\n");
     println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
-    let (mut late, mut early) = (Vec::new(), Vec::new());
+    let (mut fused, mut apart) = (Vec::new(), Vec::new());
+    let (mut dfu, mut dap) = (0.0, 0.0);
     for _ in 0..ab_draws {
-        ornith_rs::ops::moe::set_late_shared_gate(false);
-        early.push(step(&ctx, &mut caches, false).0);
-        ornith_rs::ops::moe::set_late_shared_gate(true);
-        late.push(step(&ctx, &mut caches, false).0);
+        ornith_rs::ops::moe::set_fuse_moe_tail(false);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        apart.push(ms);
+        dap = d;
+        ornith_rs::ops::moe::set_fuse_moe_tail(true);
+        let (ms, d) = step(&ctx, &mut caches, false);
+        fused.push(ms);
+        dfu = d;
     }
-    ornith_rs::ops::moe::set_late_shared_gate(want_late);
-    let pairs: Vec<f64> = late.iter().zip(&early).map(|(l, e)| l - e).collect();
-    let (a, b) = (median(&mut early.clone()), median(&mut late.clone()));
-    println!("  {:<24} {a:>9.3} {:>11}  {early:.3?}", "beside the router", "");
-    println!("  {:<24} {b:>9.3} {:>11}  {late:.3?}", "beside the gathers", "");
+    ornith_rs::ops::moe::set_fuse_moe_tail(want_moe_tail);
+    let pairs: Vec<f64> = fused.iter().zip(&apart).map(|(f, a)| f - a).collect();
+    let (a, b) = (median(&mut apart.clone()), median(&mut fused.clone()));
+    println!("  {:<24} {a:>9.3} {dap:>11.0}  {apart:.3?}", "six dispatches");
+    println!("  {:<24} {b:>9.3} {dfu:>11.0}  {fused:.3?}", "one");
     println!(
-        "  {:<24} {:>9.3} {:>11}  mean of pairs {:+.3} ms, {} of {} down",
+        "  {:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down, {:+.2}%",
         "so",
         b - a,
-        "",
+        dfu - dap,
         pairs.iter().sum::<f64>() / pairs.len() as f64,
         pairs.iter().filter(|d| **d < 0.0).count(),
         pairs.len(),
+        100.0 * (b - a) / a,
     );
+
+    // --- the boundary, measured before anything is built --------------------
+    //
+    // Everything else here prices one class at a time, and a fusion returns
+    // about half of its class's `drop ms`, because taking one dispatch out
+    // lets its neighbours overlap into the hole and taking all of them out
+    // cannot. What a whole *layer* of fusions could return therefore has no
+    // reading in that table. This measures it directly: the real step, at the
+    // real commit size, with the entire elementwise chain never issued.
+    //
+    // The output is garbage, which is what a ceiling costs -- nothing here is
+    // a kernel anyone would keep. What the garbage must not do is change what
+    // the step *reads*: the router's selection is `block_softmax_precise`
+    // into `router_top_k`, and neither is on the list, so the gather still
+    // reads eight distinct experts of 256 and the same bytes with them. The
+    // partition is the check on that -- three disjoint buckets whose union is
+    // the whole, and a sum far from the whole would be the interaction this
+    // reasoning missed.
+    if std::env::args().any(|a| a == "border") {
+        // Patterns match the instantiated kernel name as a substring, so
+        // `swiglu` takes `precise_swiglu` with it, which is what the chain
+        // means. A pattern serves a call site, not a block: `sigmoid_gate`
+        // is the shared expert's gate and the capture's output gate both,
+        // and it is counted in one bucket.
+        const GDN: &[&str] = &[
+            "concat_time", "slice_inner", "depthwise_conv_1d", "silu_", "gdn_beta", "compute_g",
+        ];
+        // `moe_combine` is the six of them since Phase 32; the six patterns
+        // stay so the census prints their zero, and so the list still means
+        // "the tail" under `ORNITH_FUSE_MOE_TAIL=0`.
+        const MOE: &[&str] = &[
+            "moe_combine", "mul_by_row", "div_by_row", "col_reduce", "row_reduce",
+            "sigmoid_gate",
+        ];
+        const REST: &[&str] = &["rmsbfloat16", "add_rms", "swiglu", "scalar_mul", "add_elem"];
+        let all: Vec<&str> = GDN.iter().chain(MOE).chain(REST).copied().collect();
+
+        // First, what each pattern actually matches. A list that matches
+        // nothing is a measurement of nothing, and it would read as a
+        // boundary of zero.
+        println!("\nwhat each pattern takes out, dispatches a step\n");
+        for pat in &all {
+            ctx.set_neuter_many(&[pat], true);
+            step(&ctx, &mut caches, false);
+            let n = ctx.prof_dropped() as f64 / REPS as f64;
+            ctx.set_neuter(None);
+            println!("  {pat:<24} {n:>6.0}");
+        }
+
+        const PAIRS: usize = 8;
+        println!("\nthe elementwise chain, taken out of the step together\n");
+        println!(
+            "  {:<26} {:>6} {:>9} {:>9} {:>11} {:>7}",
+            "dropped", "disp", "GPU ms", "vs base", "mean pair", "down"
+        );
+        let cells: Vec<(&str, Vec<&str>)> = vec![
+            ("nothing matches this", vec!["nothing-matches-this"]),
+            ("the whole chain", all.clone()),
+            ("the gated-delta chain", GDN.to_vec()),
+            ("the MoE tail", MOE.to_vec()),
+            ("norms, activations, adds", REST.to_vec()),
+            // And the sets a kernel could actually absorb, which is a
+            // different object from a bucket: what one whole-block kernel
+            // would stop issuing, before the one dispatch it issues instead.
+            (
+                "one MoE combine kernel",
+                vec!["moe_combine", "row_reduce", "div_by_row", "mul_by_row", "col_reduce",
+                     "sigmoid_gate", "add_elem"],
+            ),
+            ("swiglu, into its consumer", vec!["swiglu"]),
+            ("one gated-delta kernel", GDN.to_vec()),
+            // And the complement of those two: what a general deferred layer
+            // would still be chasing once both are written. Measured, not
+            // subtracted -- the parts do not sum to the whole.
+            ("left for a deferred layer", vec!["rmsbfloat16", "add_rms", "swiglu", "scalar_mul"]),
+            ("the norms alone", vec!["rmsbfloat16", "add_rms"]),
+        ];
+        let mut parts = 0.0;
+        let mut whole = 0.0;
+        for (name, pats) in &cells {
+            let (mut base, mut gone) = (Vec::new(), Vec::new());
+            let mut dropped = 0.0;
+            for _ in 0..PAIRS {
+                ctx.set_neuter(None);
+                base.push(step(&ctx, &mut caches, false).0);
+                ctx.set_neuter_many(pats, true);
+                gone.push(step(&ctx, &mut caches, false).0);
+                dropped = ctx.prof_dropped() as f64 / REPS as f64;
+            }
+            ctx.set_neuter(None);
+            let pairs: Vec<f64> = gone.iter().zip(&base).map(|(g, b)| g - b).collect();
+            let mean = pairs.iter().sum::<f64>() / pairs.len() as f64;
+            let (b, g) = (median(&mut base.clone()), median(&mut gone.clone()));
+            println!(
+                "  {name:<26} {dropped:>6.0} {g:>9.3} {:>9.3} {mean:>11.3} {:>4}/{}",
+                g - b,
+                pairs.iter().filter(|d| **d < 0.0).count(),
+                pairs.len(),
+            );
+            println!("  {:<26} base {base:.3?}\n  {:<26} gone {gone:.3?}", "", "");
+            match *name {
+                "the whole chain" => whole = mean,
+                "the gated-delta chain" | "the MoE tail" | "norms, activations, adds" => {
+                    parts += mean
+                }
+                _ => {}
+            }
+        }
+        println!(
+            "\n  the three buckets sum to {parts:+.3} ms against {whole:+.3} for the whole \
+             chain,\n  i.e. {:.0}% of it -- the overlap the parts get and the whole does not.",
+            100.0 * parts / whole,
+        );
+        return;
+    }
+
+    // --- and the reorder: which epoch the shared expert's gate is issued in --
+    //
+    // Three positions, not two, since Phase 32's fusion moved the epoch
+    // structure out from under the one Phase 31 chose. Paired against
+    // position 1 each draw, because the level moves inside a run and the
+    // difference is the measurement.
+    println!("\nthe shared expert's gate, in each of the three epochs it can sit in\n");
+    println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "vs beside", "draws");
+    let mut gate: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for _ in 0..ab_draws {
+        for (p, v) in gate.iter_mut().enumerate() {
+            ornith_rs::ops::moe::set_shared_gate_pos(p as u8);
+            v.push(step(&ctx, &mut caches, false).0);
+        }
+    }
+    ornith_rs::ops::moe::set_shared_gate_pos(want_gate_pos);
+    let names = ["beside the router", "beside the gathers", "after the gathers"];
+    for (p, name) in names.iter().enumerate() {
+        let pairs: Vec<f64> = gate[p].iter().zip(&gate[1]).map(|(a, b)| a - b).collect();
+        let mean = pairs.iter().sum::<f64>() / pairs.len() as f64;
+        println!(
+            "  {name:<24} {:>9.3} {mean:>11.3}  {:.3?}  {} of {} down",
+            median(&mut gate[p].clone()),
+            gate[p],
+            pairs.iter().filter(|d| **d < 0.0).count(),
+            pairs.len(),
+        );
+    }
 
     // --- and what the router's sort costs, which removal cannot say --------
     //
