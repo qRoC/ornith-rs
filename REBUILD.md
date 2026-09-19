@@ -5708,6 +5708,13 @@ about 63 ns or 435 ns a dispatch would be a sentence about one of two
 readings. Eight interleaved pairs near the top of a run would settle it;
 this phase did not spend them.
 
+**Phase 36's first run produced a third reading, and it changes sign:**
+`1438.4 -> 1442.2`, **+0.26%, 1 of 4 pairs down**, same cell, same four
+draws, same artifact. So the three are -0.31%, -2.34% and +0.26%, and the
+honest summary is now not "somewhere between" but **"this cell has not
+been measured"**. It is still a cell of four draws in the second position
+of a run that throttles; the eight interleaved pairs are still unspent.
+
 What *is* established, and does not rest on this cell: launches are 0.22%
 of a chunk, so nothing here is bought by removing one -- and the two
 block-shaped kernels read -5.3% and -4.7% below. The mechanism is
@@ -5993,6 +6000,16 @@ there is no instrument that reports this -- which is the same lesson as
 the side where *the control itself* is the thing that moved.
 
 ### What is left in it
+
+**Two things this phase measured and two it did not.** The per-dispatch
+inventory was re-taken *before* the change and not after, so what a chunk
+is made of now -- and what the next-largest row in it is -- is unmeasured;
+and the direct old-against-new prompt pair was attempted and thrown away,
+because the machine went to a load average of 15 with another session's
+Spotlight index and four Python processes on it, and the same control arm
+that had read 4.22-4.27 GPU s an hour earlier read 4.57-5.48. The affine
+figure above is composed from the two clean pairs instead, and says so.
+Both are a sitting's work on a quiet machine, not a question.
 
 `gather_rows_div_wide` is still issued 40 times a chunk on the affine
 parent, because mlx's sorted kernel cannot be handed a permutation. Giving
