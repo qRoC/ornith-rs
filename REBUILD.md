@@ -5409,8 +5409,8 @@ the one thing `nr0` changes.
 two points puts the plain mat-vec ~10 us a dispatch *cheaper* at nr0 = 4 than
 at ggml's 2, which would be a free change to every k-quant matvec in the
 model. It rests on assuming the per-group prologue cost does not move with
-the width, and the plain kernel was never instantiated at those widths to
-check. Two A/Bs would settle it; this phase did not run them.)
+the width. **It was then tested and it is wrong -- see the next section --
+and wrong in sign, which is what a residual from two points is worth.**)
 
 **And the isolated extra is what the step paid, within the noise**: 0.277 ms
 predicted against +0.304 measured at nr0 = 2, 0.059 against +0.079 and
@@ -5461,9 +5461,62 @@ where Phase 33 already found the elementwise chain costing bytes rather than
 launches. Nothing here measures that, and the instrument for it does not
 exist.
 
+### The hint, tested and refuted, and ggml's width confirmed
+
+The fit above was worth one afternoon because `N_SG = N_R0 = 2` has been in
+this port since Q4_K landed on the assumption that ggml tuned it, and ggml
+did not tune it here. Both mat-vecs were instantiated at four more widths --
+the change is a pure schedule, since `first_row = (tgx * NSG + sgitg) * nr0`
+decides only which threadgroup owns which output row, and
+`tests/q4k::every_matvec_width_is_ggmls_width` holds all of them to
+`max_abs == 0.0`.
+
+    8 interleaved pairs against 2 x 2 in the same draw, two processes
+    (rows a simdgroup x simdgroups a threadgroup)
+
+      the plain mat-vec            process 1          process 2
+        2 x 2, ggml's, its zero    +0.026, 3 of 8     +0.021, 3 of 8
+        4 x 2                      +0.264, 0 of 8     +0.233, 0 of 8
+        2 x 4                      -0.001, 3 of 8     +0.051, 2 of 8
+        4 x 4                      +0.304, 0 of 8     +0.241, 0 of 8
+        8 x 4                      +0.755, 0 of 8     +0.744, 0 of 8
+
+      the routed mat-vec
+        2 x 2, ggml's, its zero    -0.012, 6 of 8     -0.033, 5 of 8
+        4 x 2                      +0.033, 1 of 8     +0.030, 2 of 8
+        2 x 4                      +0.037, 4 of 8     +0.021, 2 of 8
+        4 x 4                      +0.017, 3 of 8     +0.060, 1 of 8
+        8 x 4                      +0.161, 0 of 8     +0.212, 0 of 8
+
+**Nothing beats ggml's shape.** More rows a simdgroup is worse for the plain
+mat-vec at every width tried and a wash for the routed one until it is worse;
+more simdgroups a threadgroup at the same rows is a wash. End to end the
+ranking holds: 126.6, 122.1 and 117.3 tok/s at 2 x 2, 4 x 4 and 8 x 4, every
+one byte-identical. **The fit's ~10 us a dispatch of improvement is instead
+~1.6 us a dispatch of loss**, and the sign flip is the whole lesson: what the
+two-point fit attributed to the mat-vec getting better at nr0 = 4 was the
+*prologue* getting cheaper per group at 128 threads.
+
+Two things this is worth. The assumption in the port since Q4_K -- that
+ggml's tuning transfers to this machine -- is now measured rather than
+inherited, on both mat-vecs and at four widths. And Phase 34's U decomposes,
+with one conversion: **this table moves all 194 plain mat-vec dispatches in
+the step, where the fused kernel is 30 of them**, so the degradation the U's
+right-hand side inherits is roughly `30/194` of it -- ~0.04 ms at 4 x 4
+rather than 0.24. Against a fused extra of +0.079 and +0.146 at that width,
+the redundancy is most of it; at ggml's 2 x 2, where there is no degradation
+to subtract because that *is* the baseline shape, the +0.304 and +0.376 are
+redundancy entire. That is consistent with the isolated ratio above (4.70
+for a 4x change in the threadgroup count) and it is as far as two arms can
+decompose it.
+
 ### What was kept
 
-The kernel, **off by default** -- the only switch in this port that way round
+The widths, as a knob (`ORNITH_QMV_SHAPE`, `ORNITH_GQMV_SHAPE`), defaulting
+to ggml's -- the sweep above is one command and the exactness test covers
+every width, so the next machine re-prices this in minutes.
+
+The fused kernel, **off by default** -- the only switch in this port that way round
 -- at `nr0 = 4`, the measured best of the four. `ORNITH_FUSE_NORM_PROJ=1`
 turns it on and `ORNITH_RMSGATE_NR0` picks the width, so the sweep above is
 one command. A negative expires with its artifact and its instrument, and

@@ -2569,7 +2569,11 @@ reads much more invitingly than it should.
   **`ORNITH_FUSE_NORM_PROJ=1`** folds `RMSNormGated` into `out_proj` and is
   the one switch here that is off by default, because it lost -- it is the
   control that says why, with `ORNITH_RMSGATE_NR0=2|4|8|16` for the width
-  sweep that found its floor;
+  sweep that found its floor; `ORNITH_QMV_SHAPE=<nr0>x<nsg>` and
+  `ORNITH_GQMV_SHAPE` set the k-quant mat-vec's rows a simdgroup and
+  simdgroups a threadgroup, where ggml's `2x2` is the default **and is
+  measured rather than inherited**: 4x2, 2x4, 4x4 and 8x4 are all level or
+  worse, in two processes, on both mat-vecs (`REBUILD.md` Phase 34);
   `ORNITH_ROUTER_SORT=1` puts mlx's argsort back in place of the selection
   kernel, and `ORNITH_FAKE_SORT=1` swaps the argsort for a stand-in that
   keeps its contract and does not sort (**the output is wrong while it is
