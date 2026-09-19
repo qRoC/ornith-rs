@@ -34,7 +34,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder,
     MTLBarrierScope, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice,
     MTLDispatchType, MTLFence, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSize,
 };
@@ -854,6 +855,7 @@ impl Context {
         if let Some(cb) = waiting_on {
             let t0 = self.prof.borrow().on.then(std::time::Instant::now);
             cb.waitUntilCompleted();
+            Self::check_completed(&cb, "sync");
             if let Some(t0) = t0 {
                 let resume = host_seconds();
                 let end = cb.GPUEndTime();
@@ -874,6 +876,30 @@ impl Context {
                 p.sync_pending = true;
             }
         }
+    }
+
+    /// Panic if a command buffer failed, because the alternative is worse
+    /// than a panic.
+    ///
+    /// A failed `MTLCommandBuffer` reports `GPUStartTime == GPUEndTime == 0`,
+    /// so every profiling number downstream of it reads as **0 ms of GPU
+    /// time** and every array it should have written holds whatever was in
+    /// the pool. `REBUILD.md` Phase 35: a prefill run under memory pressure
+    /// printed a whole boundary table of zeros with correct dispatch counts
+    /// beside them, which is exactly the shape of "this change is free".
+    /// Nothing in this port checked the status until then.
+    fn check_completed(cb: &CommandBuffer, when: &str) {
+        if cb.status() != MTLCommandBufferStatus::Error {
+            return;
+        }
+        let msg = cb
+            .error()
+            .map(|e| e.localizedDescription().to_string())
+            .unwrap_or_else(|| "no NSError attached".to_string());
+        panic!(
+            "Metal command buffer failed ({when}): {msg}\n\
+             Everything after this point is garbage, and a failed buffer times as 0 ms."
+        );
     }
 
     /// Keep a buffer alive until the current batch completes.
@@ -1037,6 +1063,7 @@ impl Context {
             return;
         }
         for (cb, name, first, after_sync) in std::mem::take(&mut p.pending) {
+            Self::check_completed(&cb, "profiling harvest");
             let (start, end) = (cb.GPUStartTime(), cb.GPUEndTime());
             if p.last_end > 0.0 && start > p.last_end {
                 let gap = start - p.last_end;
