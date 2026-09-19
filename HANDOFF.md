@@ -1296,6 +1296,13 @@ raw tokens (no chat template, so both sides tokenise it identically), chunk
 | wall | 6.26-12.46 s, **37-72% busy** | 5.29-5.71 s, **90-97% busy** |
 | `mlx_lm.generate`, same artifact, same ids | **3.68-3.87 s, 1654-1740 tok/s** | mlx cannot load a k-quant artifact |
 
+**Read that last row as a floor on the gap, not a measurement of it.**
+`mlx_lm` reports a wall clock and the port's row is GPU busy; a wall swings
+with load where GPU busy does not, and re-running mlx in a later sitting
+gave 1650 *and* 1192 tok/s within one minute, so the best of its draws is
+the estimator. Its own GPU time can only be below its wall, so the port's
+remaining 12% is the smallest the difference can be.
+
 Two things in that table, and the first one is the harder news.
 
 **The port was behind mlx on prefill by 22% of *GPU work*, not just on the

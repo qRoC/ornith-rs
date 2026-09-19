@@ -5679,6 +5679,32 @@ estimator and 3.68-3.87 s stands. And the comparison is generous to mlx by
 construction: mlx's own GPU time can only be *below* its wall, so 12% is a
 floor on what is left rather than a ceiling.
 
+### The first elementwise number at this width, and what is not measured yet
+
+The bin's A/B cells run at a prefill chunk too, and the one that got a
+reading before this phase went after the sort says the same thing the
+launch arithmetic does, from the fusion's own side:
+
+    the residual add and the norm that reads it, a 2048-token chunk
+    (4 draws, from the run this phase then abandoned -- a weak reading)
+
+      separate   1645.2 ms   1505 dispatches
+      fused      1640.1      1425
+      so           -5.1 ms, -0.31%
+
+80 dispatches removed for 5 ms, i.e. **63 ns a dispatch** where the same
+fusion is worth 1.1 us a dispatch at a decode step. The launch is not what
+it buys here; what it buys is one intermediate not written and read back,
+and at this width that is 0.3% rather than 1.3%.
+
+**And the measurement this instrument was built for has not been run yet.**
+`step_inventory prefill border` -- the census and the elementwise chain's
+boundary at a chunk, which is what would price a deferred op layer on
+something other than a decode step's 3.8% -- exists and is one command. The
+sort was found on the way to it and was worth stopping for. The boundary is
+the next number, and it means *bytes* at this width where the same table at
+a decode step means launches.
+
 ### What is left in it
 
 `gather_rows_div` (78.9 ms) and `unsort_rows` (78.2 ms) are another **9% of
