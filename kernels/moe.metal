@@ -204,27 +204,38 @@ template <typename T>
     const constant uint& n_experts [[buffer(3)]],
     const constant uint& n_blocks [[buffer(4)]],
     uint tgpig [[threadgroup_position_in_grid]],
+    uint n_tgs [[threadgroups_per_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint tgsize [[threads_per_threadgroup]]) {
   threadgroup atomic_uint hist[1024];
-  for (uint e = lid; e < n_experts; e += tgsize) {
-    atomic_store_explicit(&hist[e], 0, metal::memory_order_relaxed);
-  }
-  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-
-  const uint b = tgpig;
-  const uint start = b * ORNITH_SORT_BLOCK;
-  for (uint j = lid; j < ORNITH_SORT_BLOCK; j += tgsize) {
-    const uint i = start + j;
-    if (i < n) {
-      atomic_fetch_add_explicit(&hist[keys[i]], 1, metal::memory_order_relaxed);
+  // Grid-stride over blocks, so a threadgroup count smaller than `n_blocks`
+  // still produces the whole, correct permutation. That is not a
+  // generality: `Context::set_grid1` clamps every grid to one threadgroup
+  // to measure the issue floor, and this kernel's output is an *address*.
+  // A partially written permutation does not make the step slower the way
+  // Phase 31's dropped argsort did -- it indexes out of bounds and faults
+  // the GPU, and every command buffer in flight comes back "innocent
+  // victim" and times as 0 ms. Written this way the clamp is merely slow.
+  for (uint b = tgpig; b < n_blocks; b += n_tgs) {
+    for (uint e = lid; e < n_experts; e += tgsize) {
+      atomic_store_explicit(&hist[e], 0, metal::memory_order_relaxed);
     }
-  }
-  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
-  for (uint e = lid; e < n_experts; e += tgsize) {
-    blk_counts[e * n_blocks + b] =
-        atomic_load_explicit(&hist[e], metal::memory_order_relaxed);
+    const uint start = b * ORNITH_SORT_BLOCK;
+    for (uint j = lid; j < ORNITH_SORT_BLOCK; j += tgsize) {
+      const uint i = start + j;
+      if (i < n) {
+        atomic_fetch_add_explicit(&hist[keys[i]], 1, metal::memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    for (uint e = lid; e < n_experts; e += tgsize) {
+      blk_counts[e * n_blocks + b] =
+          atomic_load_explicit(&hist[e], metal::memory_order_relaxed);
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
   }
 }
 
@@ -273,17 +284,21 @@ template <typename T>
     device uint32_t* inv_order [[buffer(3)]],
     const constant uint& n [[buffer(4)]],
     const constant uint& n_blocks [[buffer(5)]],
-    uint b [[thread_position_in_grid]]) {
+    uint tid [[thread_position_in_grid]],
+    uint n_threads [[threads_per_grid]]) {
   // One thread a block: within a block the elements must be taken in input
   // order, which is the inner key of the sort. Serial depth is the block,
   // not the array, and no two blocks touch the same (expert, block) slot.
-  const uint start = b * ORNITH_SORT_BLOCK;
-  const uint end = metal::min(start + ORNITH_SORT_BLOCK, n);
-  for (uint i = start; i < end; ++i) {
-    const uint e = keys[i];
-    const uint slot = blk_off[e * n_blocks + b]++;
-    order[slot] = i;
-    inv_order[i] = slot;
+  // Grid-stride for the same reason as the histogram above.
+  for (uint b = tid; b < n_blocks; b += n_threads) {
+    const uint start = b * ORNITH_SORT_BLOCK;
+    const uint end = metal::min(start + ORNITH_SORT_BLOCK, n);
+    for (uint i = start; i < end; ++i) {
+      const uint e = keys[i];
+      const uint slot = blk_off[e * n_blocks + b]++;
+      order[slot] = i;
+      inv_order[i] = slot;
+    }
   }
 }
 
