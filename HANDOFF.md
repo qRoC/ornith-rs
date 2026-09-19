@@ -1314,17 +1314,38 @@ The older row here read "2600 tokens, ~1230 tok/s of GPU work, mlx_lm 809"
 and both sides have roughly doubled since; the *sign* of the gap is what did
 not change.
 
-**Two things `step_inventory prefill` says that the decode bin does not.**
-The clamp is not a launch floor at this width -- a clamped dispatch costs
-143.7 us against a decode step's 2.55, because the surviving threadgroup of
-a *tile* still walks the whole K -- so the launch cost is the dispatch count
-times ~2.09 us, **2.9 ms of 1523, 0.2%**, and the fusion project has nothing
-to remove here. And one dispatch a command buffer inflates a chunk by 8%
-against a decode step's 29%, because a prefill dispatch fills the machine on
-its own: the per-dispatch table is nearly a decomposition here and
-explicitly is not one there. **Divide its rows by that run's own level** --
-two prefill runs an hour apart read 1522.8 and 1752.7 ms for the same chunk,
-and crossing them inflates every share by 15%.
+**What `step_inventory prefill` says that the decode bin does not**, and
+most of it is about reading an instrument on a second object.
+
+- **The clamp is not a launch floor at this width.** A clamped dispatch
+  costs 50.5 us against a decode step's 2.55, because the surviving
+  threadgroup of a *tile* still walks the whole K. So the launch cost is the
+  dispatch count times ~2.09 us, **3.1 ms of 1408, 0.22%**: there is nothing
+  here for a *launch* fusion to remove. The fusions still pay, and more than
+  at decode -- the gated-delta front end is **-5.3% of a chunk against -4.3%
+  of a step** and the MoE tail **-4.7% against -3.6%** -- because what they
+  remove at this width is intermediates, not launches. `rms_gated`, which
+  measures exactly zero at decode, reads -17.8 ms here.
+- **Divide a per-dispatch row by its own run's level**, and take the level
+  from the same run. One dispatch a command buffer inflates a chunk by 8%
+  against a decode step's 29%, so the table is nearly a decomposition here
+  and explicitly is not one there -- but two prefill runs read 1522.8 and
+  1752.7 ms for the same chunk, and crossing them inflates every share
+  by 15%.
+- **The machine throttles across a prefill run, and the boundary section
+  does not survive it.** A cell is 16 chunks of 1.4 s at full ALU; over
+  eleven cells the *base* arm climbed **1407 ms to 2100-2200**,
+  monotonically. Interleaved pairs inside a cell survive that; comparing
+  cells does not, and the partition check said so at once -- three disjoint
+  buckets at **466%** of the whole. `border` stays a decode-shaped mode
+  until it has a protocol that does not ask for four minutes of full-ALU
+  work in one sitting.
+- **And a ceiling's garbage is not free once it feeds a gemm.** Dropping
+  `rms_gated` at a chunk read **+82 ms, 1 of 8** -- a removal cannot make a
+  step slower unless what it left behind changed the arithmetic's cost.
+  Phase 31's rule was that removal cannot price a dispatch whose output is
+  an *address*; at this width it also cannot price one whose output is a
+  number a gemm will multiply.
 
 **And the idle is sized by the artifact, not by the era.** The same machine
 within one hour ran the 25.5 GB affine artifact at 37-72% busy and the 21.5
@@ -2620,6 +2641,16 @@ reads much more invitingly than it should.
   so except the dispatch count, which was the same 753 in both arms. Every
   control here changes a *counter*, so read the counter before reading the
   result; it is the same reflex `Context::prof_dropped` exists for.
+- **A failed command buffer panics rather than timing as zero.** An
+  `MTLCommandBuffer` that fails reports `GPUStartTime == GPUEndTime == 0`,
+  so by the only clock here it costs **0 ms of GPU** and the arrays it owned
+  hold whatever was in the pool. Nothing checked `status()` until Phase 35,
+  when a prefill run under a GPU reset printed a whole boundary table of
+  zeros with correct dispatch counts beside them. `Context::check_completed`
+  now panics with the driver's own message, from `sync` and from the
+  profiling harvest. If it fires, nothing measured after the failure means
+  anything -- the usual cause here is another process faulting the GPU
+  ("Discarded (victim of GPU error/recovery)").
 - `ORNITH_PROF=1` prints the per-token breakdown at the end of a run;
   `ORNITH_COMMIT_EVERY=N` sets the commit size (`N=1` attributes GPU time per
   kernel, and is ~3x slower); `ORNITH_SERIAL=1` puts back the serial encoder
