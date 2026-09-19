@@ -57,6 +57,21 @@ pub fn argsort_last_axis(ctx: &Context, x: &Array) -> Array {
     let n_rows = x.numel() / n;
     let out = Array::empty(ctx, &x.shape, Dtype::U32);
 
+    // The instrument, not a kernel: see `router_fake_order` in
+    // kernels/moe.metal. It answers what the sort costs where it runs, which
+    // dropping the sort cannot, and it makes the model produce nonsense.
+    // Since Phase 31 the sort is not on the default path at all, so this
+    // needs `ORNITH_ROUTER_SORT=1` beside it to reach anything.
+    if fake_sort() {
+        let (grid, tg) = flat(n_rows * n);
+        ctx.kernel(&format!("router_fake_order_{}", tname(x.dtype)))
+            .arr(x)
+            .out(&out)
+            .bytes(&(n as u32))
+            .threads(grid, tg);
+        return out;
+    }
+
     // `gpu_merge_sort`: tn is always 4, and bn is the first bucket that fits.
     let tn = 4usize;
     let potential_bn = n.div_ceil(tn);
@@ -98,6 +113,26 @@ pub fn argsort_last_axis(ctx: &Context, x: &Array) -> Array {
 pub fn top_k(ctx: &Context, gates: &Array, k: usize) -> (Array, Array) {
     let n = gates.dim(-1);
     let rows = gates.numel() / n;
+
+    // One selection kernel instead of a full sort, a slice and a gather.
+    // Exact, and `kernels/moe.metal` explains why: the last k of a stable
+    // ascending sort are the k largest by value then by index, and that is
+    // what k rounds of selection under the same order produce. Worth 0.385 ms
+    // a token -- `REBUILD.md` Phase 31. `ORNITH_ROUTER_SORT=1` puts mlx's
+    // sort back, and so does a k this kernel does not carry.
+    if router_select() && k <= 8 && n <= 256 {
+        let inds = Array::empty(ctx, &[rows, k], Dtype::U32);
+        let scores = Array::empty(ctx, &[rows, k], gates.dtype);
+        ctx.kernel(&format!("router_top_k_{}", tname(gates.dtype)))
+            .arr(gates)
+            .out(&inds)
+            .out(&scores)
+            .bytes(&(n as u32))
+            .bytes(&(k as u32))
+            .groups((rows, 1, 1), (32, 1, 1));
+        return (inds, scores);
+    }
+
     let order = argsort_last_axis(ctx, gates);
 
     let inds = Array::empty(ctx, &[rows, k], Dtype::U32);
@@ -348,6 +383,47 @@ pub fn sparse_moe_block(
 
     let out = super::elementwise::add(ctx, &mixed, &shared_y);
     out.reshape(&x.shape)
+}
+
+/// Whether the router's top-k selects rather than sorting. See [`top_k`].
+static ROUTER_SELECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static ROUTER_SELECT_ENV: std::sync::Once = std::sync::Once::new();
+
+fn router_select() -> bool {
+    ROUTER_SELECT_ENV.call_once(|| {
+        if std::env::var("ORNITH_ROUTER_SORT").as_deref() == Ok("1") {
+            ROUTER_SELECT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    ROUTER_SELECT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Swap between the selection and mlx's sort at runtime; returns what it was.
+pub fn set_router_select(on: bool) -> bool {
+    let was = router_select();
+    ROUTER_SELECT.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
+}
+
+/// Whether the router's argsort is replaced by the stand-in that prices it.
+static FAKE_SORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FAKE_SORT_ENV: std::sync::Once = std::sync::Once::new();
+
+fn fake_sort() -> bool {
+    FAKE_SORT_ENV.call_once(|| {
+        if std::env::var("ORNITH_FAKE_SORT").as_deref() == Ok("1") {
+            FAKE_SORT.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    FAKE_SORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Swap the router's sort for the stand-in at runtime. **The model's output
+/// is wrong while this is on.** Returns what it was.
+pub fn set_fake_sort(on: bool) -> bool {
+    let was = fake_sort();
+    FAKE_SORT.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
 }
 
 /// Where the shared expert's gate goes. See [`sparse_moe_block`].

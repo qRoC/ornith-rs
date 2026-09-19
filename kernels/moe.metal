@@ -172,3 +172,116 @@ instantiate_kernel("gather_rows_by_id_uint8", gather_rows_by_id, uint8_t)
 // And a k-quant's super-scales are float16: FR-Spec prunes `lm_head` by rows,
 // and a Q4_K row is three tensors rather than a slice.
 instantiate_kernel("gather_rows_by_id_float16", gather_rows_by_id, half)
+
+// A stand-in for the router's argsort, for **pricing** it and nothing else.
+//
+// `carg_block_sort` is 10.5 us a layer, 40 a token, one threadgroup ordering
+// 256 numbers of which only the last eight are ever read -- the biggest
+// single-dispatch cost left in a decode step after `REBUILD.md` Phase 31.
+// What it is worth cannot be measured by dropping it: its output is an
+// *address*, and without it the expert gather reads eight experts at random,
+// which is slower than reading the eight the router chose. So this writes a
+// valid order instead of no order: `i * 37 + seed (mod 256)` is a
+// permutation, since 37 is coprime with 256, so the last k of it are k
+// distinct experts and everything downstream indexes in range and reads the
+// same number of distinct weights.
+//
+// The tokens that come out are wrong, and that is the point -- this is an
+// instrument, not a kernel. `ORNITH_FAKE_SORT=1`, inert by default.
+template <typename T>
+[[kernel]] void router_fake_order(
+    const device T* gates [[buffer(0)]],
+    device uint32_t* out [[buffer(1)]],
+    const constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]]) {
+  uint row = i / n;
+  uint col = i % n;
+  // Seeded from the row's own scores, so the eight it picks vary from layer
+  // to layer the way the real selection does.
+  uint seed = as_type<uint>(static_cast<float>(gates[row * n])) >> 3;
+  out[i] = (col * 37u + seed) % n;
+}
+
+instantiate_kernel("router_fake_order_bfloat16", router_fake_order, bfloat16_t)
+instantiate_kernel("router_fake_order_float32", router_fake_order, float)
+
+// The most experts a token may take: `num_experts_per_tok` is 8 in this
+// model, and the dispatcher falls back to mlx's sort above it.
+#define ROUTER_MAX_K 8
+// And the widest row it carries: one simdgroup holds 32 * 8 = 256 experts,
+// which is this model's `num_experts` exactly.
+#define ROUTER_MAX_PER_LANE 8
+
+// The router's top-k, without sorting the 255 experts it will not use.
+//
+// mlx-lm routes `mx.argpartition(gates, kth=-k)[..., -k:]` through a full
+// ascending sort of all 256 and then slices the last k. That sort is the most
+// expensive single dispatch left in a decode step -- 10.5 us a layer, 40 a
+// token, one threadgroup, and 0.385 ms of a 7.0 ms step measured against a
+// stand-in (`REBUILD.md` Phase 31). This does k rounds of selection instead,
+// and the whole of its correctness is the tie rule:
+//
+// mlx's block sort is **stable ascending** -- `LessThan` compares values
+// alone, `ThreadSort` swaps only on a strict `<`, and `merge_step` takes from
+// the right run only when `b < a` -- so equal values keep their input order
+// and the last k of the result are exactly the k largest under "by value,
+// then by index". Selecting the maximum under that same total order, k
+// times, and writing the r'th into slot `k - 1 - r` reproduces the slice of
+// the sort element for element. `tests/moe.rs` checks the indices against
+// mlx's own at T = 1, 7, 24 and 512.
+//
+// One simdgroup a row: each lane strides over its share of the experts,
+// `simd_max` picks the winning value and then the largest index holding it,
+// and the r already-taken indices are held in registers rather than marked
+// in memory. That is k * (n/32) comparisons, all of them out of a 512-byte
+// row that stays in cache.
+template <typename T>
+[[kernel]] void router_top_k(
+    const device T* gates [[buffer(0)]],
+    device uint32_t* inds [[buffer(1)]],
+    device T* scores [[buffer(2)]],
+    const constant uint& n [[buffer(3)]],
+    const constant uint& k [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  const device T* g = gates + row * size_t(n);
+
+  // The row, once, into registers: lane `l` holds experts l, l+32, l+64 ...
+  // so the winner's owner is `mi % 32` and its slot `mi / 32`, and a taken
+  // expert is removed by writing -INF over it rather than by remembering it.
+  float v[ROUTER_MAX_PER_LANE];
+  uint held = 0;
+  for (uint i = lane, s = 0; i < n; i += 32, ++s) {
+    v[s] = static_cast<float>(g[i]);
+    held = s + 1;
+  }
+
+  for (uint r = 0; r < k; ++r) {
+    float best = -INFINITY;
+    uint besti = 0;
+    for (uint s = 0; s < held; ++s) {
+      uint i = lane + 32 * s;
+      // "By value, then by index", which is what a stable ascending sort
+      // leaves behind.
+      if (v[s] > best || (v[s] == best && i > besti)) {
+        best = v[s];
+        besti = i;
+      }
+    }
+    float m = simd_max(best);
+    // Among the lanes holding the winning value, the largest index wins.
+    // The +1 keeps "this lane has no candidate" distinct from index 0.
+    uint mi = simd_max(best == m ? besti + 1 : 0u) - 1;
+    if (mi % 32 == lane) {
+      v[mi / 32] = -INFINITY;
+    }
+    if (lane == 0) {
+      uint slot = row * k + (k - 1 - r);
+      inds[slot] = mi;
+      scores[slot] = g[mi];
+    }
+  }
+}
+
+instantiate_kernel("router_top_k_bfloat16", router_top_k, bfloat16_t)
+instantiate_kernel("router_top_k_float32", router_top_k, float)
