@@ -74,7 +74,7 @@ pub fn transpose_lh(ctx: &Context, x: &Array) -> Array {
         return x.reshape(&[b, h, l, d]);
     }
     let out = Array::empty(ctx, &[b, h, l, d], x.dtype);
-    let (grid, tg, name) = transpose_launch(x, &out, d);
+    let (grid, tg, name) = transpose_launch(x, &out);
     ctx.kernel(&format!("transpose_lh{name}_{}", tname(x.dtype)))
         .arr(x)
         .out(&out)
@@ -92,7 +92,7 @@ pub fn transpose_hl(ctx: &Context, x: &Array) -> Array {
         return x.reshape(&[b, l, h, d]);
     }
     let out = Array::empty(ctx, &[b, l, h, d], x.dtype);
-    let (grid, tg, name) = transpose_launch(x, &out, d);
+    let (grid, tg, name) = transpose_launch(x, &out);
     ctx.kernel(&format!("transpose_hl{name}_{}", tname(x.dtype)))
         .arr(x)
         .out(&out)
@@ -115,22 +115,15 @@ pub fn transpose_hl(ctx: &Context, x: &Array) -> Array {
 /// number of vectors and **both bases 16-byte aligned**, because an
 /// [`Array`] may be a view with a byte offset (see `ops::elementwise::vec16`
 /// for the trap) -- and so is the control, `ORNITH_WIDE_ELEM=0`.
-fn transpose_wide(x: &Array, out: &Array, d: usize) -> bool {
-    let lanes = 16 / x.dtype.size();
-    crate::ops::elementwise::wide_elem()
-        && lanes > 0
-        && d % lanes == 0
-        && x.offset % 16 == 0
-        && out.offset % 16 == 0
-}
-
 fn transpose_launch(
     x: &Array,
     out: &Array,
-    d: usize,
 ) -> ((usize, usize, usize), (usize, usize, usize), &'static str) {
     let lanes = 16 / x.dtype.size();
-    if transpose_wide(x, out, d) {
+    // The destination is a fresh allocation, so its base is the allocator's
+    // rather than a view's -- but it is checked rather than assumed, and
+    // `transpose_would_widen` is the same predicate so the two cannot drift.
+    if transpose_would_widen(x) && out.offset % 16 == 0 {
         let (grid, tg) = flat(out.numel() / lanes);
         (grid, tg, "_wide")
     } else {
@@ -139,17 +132,27 @@ fn transpose_launch(
     }
 }
 
-/// Whether [`transpose_lh`] / [`transpose_hl`] would take the wide path on
-/// this array, so a test can assert which path it covered rather than
-/// leaving a green wide/narrow pair to mean nothing. The first such
-/// assertion in this port failed on its first run; see
+/// Whether [`transpose_lh`] / [`transpose_hl`] move sixteen bytes a thread on
+/// this array -- the guard itself, so a test can assert which path it
+/// covered rather than leaving a green wide/narrow pair to mean nothing. The
+/// first such assertion in this port failed on its first run; see
 /// `ops::elementwise::would_widen`.
+///
+/// **A transpose here is a permutation of contiguous runs, not a strided
+/// copy.** `L` and `H` both sit outside `D`, so run `d` of the source lands
+/// whole somewhere in the destination and both ends of the move are already
+/// coalesced; what the one-element-a-thread form was losing is the width
+/// `swiglu`, `sigmoid_gate` and `slice_inner` were losing in Phase 36/37,
+/// and it comes back the same way. The conditions are theirs too -- `d` a
+/// whole number of vectors and **the base 16-byte aligned**, because an
+/// [`Array`] may be a view with a byte offset (see `ops::elementwise::vec16`
+/// for the trap) -- and so is the control, `ORNITH_WIDE_ELEM=0`.
 pub fn transpose_would_widen(x: &Array) -> bool {
-    let d = x.shape[3];
-    // The output of either transpose is a fresh allocation of the same
-    // element count, so its own alignment is the allocator's, not a view's.
     let lanes = 16 / x.dtype.size();
-    crate::ops::elementwise::wide_elem() && lanes > 0 && d % lanes == 0 && x.offset % 16 == 0
+    crate::ops::elementwise::wide_elem()
+        && lanes > 0
+        && x.shape[3] % lanes == 0
+        && x.offset % 16 == 0
 }
 
 /// `mx.concatenate([a, b], axis=-1)`.
