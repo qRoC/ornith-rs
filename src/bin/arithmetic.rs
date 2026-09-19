@@ -34,9 +34,11 @@
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
 use ornith_rs::ops::kquant::{
-    KMatrix, KQuant, QK_K, gather_qmm_t, qmm_t, set_mm_half, set_mm_rows, set_mm_rows_id,
+    KMatrix, KQuant, QK_K, gather_qmm_t, qmm_t, qmm_t_bare, set_mm_half, set_mm_rows,
+    set_mm_rows_id,
 };
 use ornith_rs::ops::matmul::matmul;
+use ornith_rs::ops::quantized::{QuantMatrix, QuantMode, quantized_matmul};
 
 /// Dispatches inside one sync window. `bin/kquant_mm`'s lesson: a single
 /// dispatch between two syncs measures the ~120 us submit-and-wait round
@@ -376,6 +378,110 @@ fn decompose_routed(ctx: &Context, ceiling: f64) {
     set_mm_rows_id(32);
 }
 
+// --- 5. what the unpack itself costs, which is not the gap to mlx's gemm -----
+
+/// The gap between the k-quant tile (79%) and mlx's dense bf16 gemm (96%) is
+/// **not** the price of unpacking 4-bit weights, however tempting it is to
+/// read it that way. Those are two kernels that differ in their tiling,
+/// their loaders and their threadgroup shape as well as in whether they
+/// unpack anything -- the eighth axis, and this bin walked into it once
+/// already with the routed gemm's eight points.
+///
+/// The control is the same tile with only the arithmetic gone
+/// (`Q4KBareFmt`): same loads, same registers, same everything else. What
+/// the difference prices is `scale_min`, the `d / 16`, and the mask,
+/// multiply and subtract a weight.
+///
+/// The static count says ~3 ALU ops a weight against `NR1` MACs a weight, so
+/// with matrix and scalar throughput equal on this machine (14.5 against
+/// 14.1 TFLOP/s) the arithmetic predicts **3/64 = 4.7%** at the 64-row tile
+/// and 9.4% at 32. A prediction from an op count is a hypothesis; this is
+/// the A/B.
+fn unpack_cost(ctx: &Context, ceiling: f64) {
+    const M: usize = 16384;
+    const K: usize = 2048;
+    const N: usize = 2048;
+    println!("\nwhat unpacking a 4-bit weight costs, against the same tile without it\n");
+    println!(
+        "  {:<30} {:>6} {:>9} {:>9} {:>7} {:>9}",
+        "arm", "tile", "ms", "TFLOP/s", "of mma", "vs bare"
+    );
+    let x = Array::from_f32_as_bf16(ctx, &vec![0.01f32; M * K], &[M, K]);
+    let w = fake(ctx, KQuant::Q4K, N, K);
+    let flop = 2.0 * M as f64 * N as f64 * K as f64;
+    for rows in [32usize, 64] {
+        set_mm_rows(rows);
+        let bare = best_of(ctx, 5, || {
+            let _ = qmm_t_bare(ctx, &x, &w);
+        });
+        let real_t = best_of(ctx, 5, || {
+            let _ = qmm_t(ctx, &x, &w);
+        });
+        for (name, secs) in [("no unpack (wrong answers)", bare), ("Q4KFmt, as it ships", real_t)] {
+            let t = tflops(flop, secs);
+            println!(
+                "  {name:<30} {rows:>6} {:>9.3} {t:>9.2} {:>6.0}% {:>8.1}%",
+                secs * 1e3,
+                100.0 * t / ceiling,
+                100.0 * (secs / bare - 1.0)
+            );
+        }
+    }
+    set_mm_rows(64);
+
+    // And mlx's dense bf16 gemm at **exactly** this M, N and K, because the
+    // earlier "96% against 79%" row was taken at another shape entirely
+    // (M=2048, N=8192) and comparing across it is the mistake this whole
+    // section exists to stop making.
+    {
+        let a = Array::from_f32_as_bf16(ctx, &vec![0.01f32; M * K], &[M, K]);
+        let b = Array::from_f32_as_bf16(ctx, &vec![0.01f32; N * K], &[N, K]);
+        let secs = best_of(ctx, 5, || {
+            let _ = matmul(ctx, &a, &b, true);
+        });
+        let t = tflops(flop, secs);
+        println!(
+            "  {:<30} {:>6} {:>9.3} {t:>9.2} {:>6.0}%",
+            "mlx steel gemm, dense bf16", "-", secs * 1e3, 100.0 * t / ceiling
+        );
+    }
+
+    // And the arm that decides whether the 16% between the two is "what a
+    // quantized gemm costs" or "what *this* tile costs": mlx's own affine
+    // quantized gemm, same M, N and K, same 4 bits and group of 32 the
+    // experts use. It unpacks too -- but on steel's `BlockMMA` tiling
+    // rather than ggml's.
+    {
+        let mut st: u32 = 0x1234_5678;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        let groups = K / 32;
+        let packed: Vec<u32> = (0..N * K / 8).map(|_| next()).collect();
+        let sc: Vec<f32> = (0..N * groups).map(|_| 0.01).collect();
+        let bi: Vec<f32> = (0..N * groups).map(|_| -0.08).collect();
+        let qw = QuantMatrix {
+            w: Array::from_slice(ctx, &packed, &[N, K / 8], Dtype::U32),
+            scales: Array::from_f32_as_bf16(ctx, &sc, &[N, groups]),
+            biases: Some(Array::from_f32_as_bf16(ctx, &bi, &[N, groups])),
+            mode: QuantMode::Affine,
+            group_size: 32,
+            bits: 4,
+        };
+        let secs = best_of(ctx, 5, || {
+            let _ = quantized_matmul(ctx, &x, &qw);
+        });
+        let t = tflops(flop, secs);
+        println!(
+            "  {:<30} {:>6} {:>9.3} {t:>9.2} {:>6.0}%",
+            "mlx affine qmm, 4-bit g32", "-", secs * 1e3, 100.0 * t / ceiling
+        );
+    }
+}
+
 fn main() {
     let ctx = Context::new().unwrap();
     println!("{}", ctx.device_name());
@@ -384,6 +490,7 @@ fn main() {
     println!("\n  matrix units are {:.1}x the scalar ALUs here", mma / alu.max(1e-9));
     real(&ctx, mma);
     decompose_routed(&ctx, mma);
+    unpack_cost(&ctx, mma);
 
     // The flag the tile carries, on the real kernel, beside the synthetic
     // ratio above. If the matrix unit prefers half and the kernel does not,

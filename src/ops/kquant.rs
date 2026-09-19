@@ -811,6 +811,41 @@ pub fn qmm_t(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
     out
 }
 
+/// [`qmm_t`] with `Q4KFmt`'s arithmetic taken out, and nothing in the model
+/// dispatches it.
+///
+/// An instrument, in the same family as `ORNITH_FAKE_SORT`: **the output is
+/// wrong while this runs.** It exists because Phase 37 priced "the cost of
+/// the format" as the gap between the k-quant tile and mlx's dense steel
+/// gemm, and those two kernels differ in their tiling, their loaders and
+/// their threadgroup shape as well as in whether they unpack anything. A
+/// difference between two kernels cannot price one term of it. This is the
+/// same tile with the same loads and only the unpack's arithmetic gone --
+/// see `Q4KBareFmt` in kernels/q4k.metal for exactly what it drops.
+pub fn qmm_t_bare(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
+    let (o, k) = (w.out_dims(), w.in_dims());
+    assert_eq!(w.kind, KQuant::Q4K, "the bare stand-in is instantiated for Q4_K only");
+    let m = x.numel() / k;
+    let mut shape = x.shape.clone();
+    let n = shape.len();
+    shape[n - 1] = o;
+    let out = Array::empty(ctx, &shape, x.dtype);
+    let rows = mm_rows();
+    assert!(rows == 32 || rows == 64, "the bare stand-in is instantiated at 32 and 64 rows");
+    ctx.kernel(&format!("q4k_qmm_t_bare_r{rows}_{}", type_name(x.dtype)))
+        .arr(&w.qs)
+        .arr(&w.scales)
+        .arr(&w.dm)
+        .arr(x)
+        .out(&out)
+        .bytes(&(k as i32))
+        .bytes(&(o as i32))
+        .bytes(&(m as i32))
+        .threadgroup_memory(mm_shmem(rows), 0)
+        .groups((m.div_ceil(rows), o.div_ceil(MM_NR0), 1), (MM_THREADS, 1, 1));
+    out
+}
+
 /// `mx.gather_qmm(..., transpose=True)` at M > 1: ggml's `kernel_mul_mm_id`,
 /// tiled the way mlx's `gather_qmm_rhs` is.
 ///

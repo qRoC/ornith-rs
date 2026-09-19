@@ -1740,9 +1740,14 @@ no model load. Scalar fp32 FMA sustains **14.1 TFLOP/s** and a simdgroup
   dependent FMA chain reads 2.6 TFLOP/s; thirty-two independent ones read
   14.1. The same kernel, and only one of those is the machine.
 - **The ceiling is validated by a kernel nobody here wrote**: mlx's dense
-  bf16 steel gemm reaches 95-96% of it at this model's own shapes. The
-  quantized gemms reach 79-80%, the routed one 72%, and that 20% gap is the
-  dequantize, paid in arithmetic on the same ALUs the multiply wants.
+  bf16 steel gemm reaches 94-96% of it at this model's own shapes. At one
+  shape (M=16384, N=2048, K=2048) the whole stack reads: dense bf16
+  **94%**, mlx's affine 4-bit gemm **84%**, ggml's tile with its unpack
+  removed **76%**, ggml's tile as it ships **75%**. So unpacking costs
+  anyone 10 points, **ggml's tiling costs 8 more**, and the k-quant unpack
+  itself costs 1-3 -- predicted at 4.7% from an op count before it was
+  measured. Four fifths of what first looked like "the price of the
+  format" is the price of *that tile*.
 
 | a kernel that only reads | GB/s | of peak |
 |---|---|---|
@@ -2106,18 +2111,27 @@ In order:
    whole gap is the cost of unpacking 4-bit weights, on the same ALUs the
    multiply needs. So **the total remaining arithmetic headroom in a
    prefill chunk is ~16%**, none of it reachable by scheduling, fusing or
-   removing anything. **One candidate, because the other was closed in the
-   same phase.** The routed expert gemm's 8 points against its own family
-   are neither `N` nor routing nor the weight footprint -- all three were
-   moved one at a time and none of them matters -- they are the tile
-   width, 32 on the routed path against 64 on the dense one. And 64 is not
-   available: at perfectly uniform 64-row runs it wins back almost all of
-   it, but on the **real** router, whose expert load is skewed,
-   `ORNITH_KQUANT_TILE_ROWS_ID=64` is **14% worse, 0 of 3 pairs down**. So
-   those eight points are the measured price of routing 16384 rows over
-   256 unevenly loaded experts, not headroom. What is left is the unpack:
-   20% of every quantized gemm, where the first question is how many ALU
-   ops a weight `Q4KFmt::dequantize` spends against how few it could.
+   removing anything, and **both candidates it first named are now
+   closed.** The routed gemm's 8 points are neither `N` nor routing nor
+   the weight footprint -- each was moved on its own and none matters --
+   they are the tile width, and the wider tile is **14% worse on the real
+   router** (0 of 3 pairs), so they are the price of routing over 256
+   unevenly loaded experts rather than headroom. And the unpack is **2-3%
+   of the gemm**, not the 20% the dense comparison suggested: an op count
+   predicted 4.7% and a stand-in with the arithmetic removed
+   (`Q4KBareFmt`) measured 2.0-3.2%.
+   **What is left is one thing, and only on a k-quant artifact.** At one
+   shape the stack reads dense bf16 94%, mlx's affine 4-bit gemm 84%,
+   ggml's tile 75-76%. **mlx's quantized gemm is 13% faster than ggml's
+   tile while doing more work**, so ~8 points -- ~6% of a chunk -- are
+   ggml's `kernel_mul_mm` tiling against steel's `BlockMMA`. Reaching it
+   means carrying Q4_K and Q6_K into a steel-tiled gemm: a real kernel
+   project, with a measured prize and a ready oracle (`max_abs == 0.0`
+   against the tile it replaces). **On the affine parent there is nothing
+   here** -- its gemms already run on mlx's kernel at 84%. It also
+   explains why `q6k-full` prefills 18% slower than the parent while
+   being 4 GB smaller: the k-quants buy memory and pay in prefill
+   arithmetic, mostly for the tiling.
 1. **A machine that is not swapping.** This is first because it is what the
    next two are waiting on, and it is not something the code can fix. Every
    GPU-side number in this document is now current and trustworthy -- they

@@ -6114,11 +6114,11 @@ This one has its control built in.
       q6k_qmm_t       [2048, 4096]   11.98   80%
       q4k_gather_qmm_t experts       10.70   72%   <- 16384 rows, 256 experts
 
-**The price of the format is 20%, in arithmetic, and it is now a
-measurement.** Same M, N and K, same machine, same sitting: 4.85 ms dense
-against 5.81 ms quantized, and 2.39 against 2.88. That is what unpacking
-4-bit weights costs, and it costs it *on the same ALUs the multiply needs*,
-which is exactly why it shows up as arithmetic and not as bytes.
+**The quantized gemms are 20% off the dense one at the same shape**, and
+the first draft of this section called that "the price of the format".
+**It is not, and the next section takes it apart** -- those are two
+different kernels and they differ in more than whether they unpack
+anything.
 
 **And the routed gemm is eight points worse than the dense ones**, at 72%,
 on perfectly aligned 64-row expert runs -- so it is not the straddling
@@ -6206,6 +6206,68 @@ that produces it is right, and **the eight points are not headroom at all
 loaded experts.** Six minutes of measurement against a day of kernel work
 that would have made the model slower.
 
+### The 20% is not the format, and four fifths of it is the tiling
+
+The tempting reading of the table above is "unpacking 4-bit weights costs
+20%". It is the eighth axis again: `q4k_qmm_t` is ggml's tile and
+`steel_gemm` is mlx's, and they differ in their tiling, their loaders and
+their threadgroup shape as well as in whether they unpack anything.
+
+**The control is the same tile with only the arithmetic removed.**
+`Q4KBareFmt` in `kernels/q4k.metal` keeps every load, every register and
+every dispatch of `Q4KFmt` and drops `scale_min`, the `d / 16` and the
+mask, multiply and subtract a weight. Nothing in the model dispatches it
+and the answers it produces are wrong, exactly like `ORNITH_FAKE_SORT`.
+
+**And an op count predicted the answer before it was measured**, which is
+worth recording because the schedule model in this document is 0 for 3.
+`Q4KFmt` spends ~3 ALU ops a weight; the tile does `NR1` MACs per
+dequantized weight; Phase 37's own ceilings say a matrix MAC and a scalar
+FMA cost the same here. So the arithmetic predicts **3/64 = 4.7%** at the
+64-row tile and **9.4%** at 32:
+
+    M = 16384, N = 2048, K = 2048, one shape for every row
+
+      arm                            tile   TFLOP/s   of mma   vs bare
+      ggml tile, no unpack             64     11.54      76%      --
+      ggml tile, Q4KFmt as it ships    64     11.32      75%     2.0%
+      ggml tile, no unpack             32     12.01      79%      --
+      ggml tile, Q4KFmt as it ships    32     11.02      73%     9.0%
+
+Measured 2.0-3.2% at 64 against 4.7% predicted, and 9.0-17.1% at 32
+against 9.4%. (Three runs: the 64-row arm reads 3.2, 2.9, 2.0 and the
+32-row arm reads 10.3, 17.1, 9.0 -- **the narrow arm is not settled and
+the wide one is**, and the wide one is what ships.) A static instruction
+count predicting an A/B to a point or two is the strongest this record
+has; take the prediction, and keep the disagreement.
+
+**So where is the other 17 points?** At the same shape, with mlx's own
+quantized gemm added -- which unpacks too, on steel's `BlockMMA` tiling
+instead of ggml's:
+
+      mlx steel gemm, dense bf16              14.21      94%
+      mlx affine qmm, 4-bit group 32          12.78      84%
+      ggml tile, no unpack                    11.54      76%
+      ggml tile, as it ships                  11.32      75%
+
+    dense -> quantized at all      -10 points   what unpacking costs anyone
+    mlx's tiling -> ggml's tile     -8 points   <- and this is not the format
+    k-quant unpack on top of that   -1 point
+
+**mlx's quantized gemm is 13% faster than ggml's tile on the same shape**,
+and it is doing more work, not less. Four fifths of what looked like the
+price of the format is the price of *this tile*.
+
+### Which explains something the prompt table had shown and not explained
+
+`q6k-full` prefills at **4.47 GPU s against the affine parent's 3.80** on
+the same 6621 ids -- the k-quant artifact is 18% *slower* at prefill while
+being 4 GB smaller and faster at decode. The k-quant gemms run at 75% of
+the ceiling and mlx's affine ones at 84%, and 0.81 x 1.13 + 0.19 = 1.11 of
+the 1.18. **The k-quants buy memory and pay for it in prefill
+arithmetic**, and the payment is mostly ggml's tiling rather than ggml's
+format. That belongs beside every other entry in the quantization ledger.
+
 ### What it says about where to go, which is mostly "not far"
 
 Prefill is 81% gemm; the gemm is at 72-80% of a ceiling a real kernel
@@ -6214,15 +6276,20 @@ arithmetic headroom in a prefill chunk is ~16%**, all of it inside kernels
 whose job is to unpack 4-bit weights, and none of it reachable by
 scheduling, fusing or removing anything. The two candidates, in order:
 
-- ~~the routed gemm's 8 points~~ -- **closed in this phase, above.** They
-  are the tile width, the tile width is already at its optimum for this
-  model's run lengths, and the wider one is 14% worse on the real router.
-- **the unpack itself**, which is 20% of every quantized gemm and is now
-  the only candidate left. Halving it is ~10% of 81% of a chunk. That is a
-  kernel-arithmetic problem and the first thing to ask of it is how many
-  ALU ops a weight the current `Q4KFmt::dequantize` spends, against how
-  few it could -- and the second is whether anything in this port is
-  allowed to be cheaper than ggml's unpack without changing a number.
+- ~~the routed gemm's 8 points~~ -- **closed above.** They are the tile
+  width, it is already at its optimum for this model's run lengths, and
+  the wider one is 14% worse on the real router.
+- ~~the unpack~~ -- **closed above.** 2-3% of the gemm at the shipping
+  tile width, predicted by an op count and confirmed by a stand-in.
+  Halving it would buy ~1% of a chunk.
+- **What is left is ggml's tiling against mlx's, and only on a k-quant
+  artifact**: 8 points, ~6% of a chunk, and reaching it means carrying
+  Q4_K and Q6_K into a steel `BlockMMA` gemm rather than ggml's
+  `kernel_mul_mm`. That is a real kernel project with a measured prize
+  and a ready oracle (`max_abs == 0.0` against the tile it replaces).
+  **On the affine parent -- the primary artifact -- there is nothing
+  here at all**: its gemms already run on mlx's quantized kernel at 84%,
+  and the 10 points below dense are what unpacking costs anyone.
 
 **None of this touches a decode step**, which reads 1.8-2.8 GB against
 ~250-400 GB/s and is memory-bound end to end. This is a prefill instrument

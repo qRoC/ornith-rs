@@ -705,10 +705,54 @@ struct Q4KFmt {
   }
 };
 
+// The stand-in that prices the unpack, and nothing in the model dispatches it.
+//
+// Phase 37 read the quantized gemm at 79% of this machine's matrix ceiling
+// and mlx's dense bf16 gemm at 96%, and called the 20% between them "the
+// price of the format". That is a difference between **two kernels**, which
+// differ in their tiling, their loaders and their threadgroup shape as well
+// as in whether they unpack anything -- the same over-attribution
+// `REBUILD.md`'s eighth axis is about. This is the control that separates
+// them: the same tile, the same loads, the same registers, the same
+// everything, with only `Q4KFmt`'s arithmetic taken out.
+//
+// What it drops, per 16 weights: `scale_min`'s bit-shuffling, the `d / 16`,
+// two multiplies for `dl` and `ml`, and per weight the mask, the multiply
+// and the subtract. What it keeps: the byte load and the conversion, so the
+// memory traffic and the register pressure are unchanged.
+//
+// **The model produces nonsense while this runs**, exactly like
+// `ORNITH_FAKE_SORT`. It exists because a removal cannot price a dispatch
+// this one is inside of, and because the difference between two kernels
+// cannot price one term of it.
+struct Q4KBareFmt {
+  static constant constexpr const short QK = QK_K;
+  static constant constexpr const short NL = 16;
+  static constant constexpr const int CODES = 128;
+  static constant constexpr const int SCALES = 12;
+  static constant constexpr const int DM = 2;
+
+  static inline void dequantize(
+      const device uint8_t* qs,
+      const device uint8_t* scales,
+      const device half* dm,
+      short il,
+      thread float4x4& reg) {
+    const device uint8_t* q = qs + (il / 4) * 32 + 16 * (il & 1);
+    for (short i = 0; i < 16; ++i) {
+      reg[i / 4][i % 4] = float(q[i]);
+    }
+  }
+};
+
 // The tile scalar is `float`: see `kquant_mm.h` for why it is not ggml's
 // `half`.
 #define instantiate_q4k(tname, type)                                           \
   instantiate_kernel("q4k_dequantize_" #tname, q4k_dequantize, type)           \
+  instantiate_kernel(                                                          \
+      "q4k_qmm_t_bare_r64_" #tname, kquant_qmm_t, type, Q4KBareFmt, float, 64) \
+  instantiate_kernel(                                                          \
+      "q4k_qmm_t_bare_r32_" #tname, kquant_qmm_t, type, Q4KBareFmt, float, 32) \
   instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)                   \
   instantiate_kernel("q4k_qmv_w4x2_" #tname, q4k_qmv, type, 4, 2) \
   instantiate_kernel("q4k_qmv_w2x4_" #tname, q4k_qmv, type, 2, 4) \
