@@ -2108,7 +2108,9 @@ In order:
    **And Phase 37 then measured how much room is left at all, which is not
    much.** After Phase 36 a chunk is **89.4% quantized gemm**, 3.8% data
    movement, 6.7% everything else -- so what is left is an arithmetic
-   question and nothing else. At one shape the gemm's distance from the
+   question and nothing else. (Phase 38 took ~8.5 ms of the data movement
+   -- the two transposes, which were a width and not the tiled kernel they
+   had been priced as -- so a chunk is now about 90% / 3% / 7%.) At one shape the gemm's distance from the
    ceiling decomposes: dense bf16 94%, mlx's own quantized gemm 84%,
    ggml's k-quant tile 75-76%. Of the ~19 points the k-quant gemm is down,
    **10 are what unpacking costs anyone, 8 are ggml's tiling against
@@ -2127,9 +2129,7 @@ In order:
    **What is left is one thing, and only on a k-quant artifact.** At one
    shape the stack reads dense bf16 94%, mlx's affine 4-bit gemm 84%,
    ggml's tile 75-76%. **mlx's quantized gemm is 13% faster than ggml's
-   tile while doing more work**, so ~8 points -- **~8% of a chunk**, from
-   the four k-quant gemms being 82.6% of the stream and 75.5% -> 84% of
-   the ceiling taking 10.1% off their time -- are ggml's `kernel_mul_mm`
+   tile while doing more work**, so ~8 points are ggml's `kernel_mul_mm`
    tiling against steel's `BlockMMA`. Reaching it
    means carrying Q4_K and Q6_K into a steel-tiled gemm: a real kernel
    project, with a measured prize and a ready oracle (`max_abs == 0.0`
@@ -2138,6 +2138,22 @@ In order:
    explains why `q6k-full` prefills 18% slower than the parent while
    being 4 GB smaller: the k-quants buy memory and pay in prefill
    arithmetic, mostly for the tiling.
+   **Phase 38 priced the one term that decomposition left out, and the
+   prize is ~6% of a chunk rather than ~8%.** mlx reaches its 84% while
+   dequantizing into a threadgroup tile of `T` -- the activation type --
+   so every weight it multiplies has been rounded to **bfloat16, eight
+   significand bits**. `kquant_mm.h` declined `half`'s eleven for that
+   reason (Phase 23), so a steel-tiled k-quant gemm either gives up
+   `max_abs == 0.0` against its own mat-vec or instantiates the tile at
+   `float` and pays two to three of the eight points back. Both ends are
+   measured: mlx's own gemm at float operands is **+2.7%** (an upper
+   bound -- it widens the activation tile and the output too) and
+   `ORNITH_KQUANT_TILE_HALF` on this port's tile is **3.0-3.6%**. So
+   75.5% -> ~81% rather than -> 84%, which is **~6% of a chunk**:
+   `q6k-full` would prefill ~4.2 GPU s against the parent's 3.99, still
+   slower. **Priced and not built, and recorded as an estimate rather
+   than a debt** -- the k-quants are taken for 4 GB and -13.1% of a
+   decode step, and this is the prefill they knowingly pay for it.
 1. **A machine that is not swapping.** This is first because it is what the
    next two are waiting on, and it is not something the code can fix. Every
    GPU-side number in this document is now current and trustworthy -- they
@@ -2752,9 +2768,15 @@ reads much more invitingly than it should.
   `REBUILD.md` Phase 35).
 - **`ORNITH_WIDE_ELEM=0` narrows the elementwise kernels** the way
   `ORNITH_MOE_GATHER_WIDE=0` narrows the MoE copies: `swiglu`,
-  `sigmoid_gate` and `slice_inner` go back to one element a thread. Wide
+  `sigmoid_gate`, `slice_inner` and (since Phase 38) `transpose_lh` and
+  `transpose_hl` go back to one element a thread. Wide
   they are 2.7-5.5x faster and sit at the memory ceiling (430-504 GB/s
-  against 465), worth ~17.8 ms a chunk isolated. `step_inventory prefill
+  against 465), worth ~17.8 ms a chunk isolated, and the two transposes
+  are another 8.5 -- **and those two are not the strided copy their name
+  suggests**: `L` and `H` both sit outside `D`, so a `D`-run is
+  contiguous at both ends and the 32x32 threadgroup tile they had been
+  priced for has nothing to do (`REBUILD.md` Phase 38).
+  `layout::transpose_would_widen` is their `would_widen`. `step_inventory prefill
   elem` is the third single-cell mode and it **cannot resolve that** --
   its control-against-itself row reads +12 ms on a ~1200 ms chunk -- so
   the numbers come from `bin/arithmetic`, which times the kernels alone.
@@ -2798,6 +2820,15 @@ reads much more invitingly than it should.
   string at dispatch time, so a missed call site is not a compile error; it
   is a panic the first time that path runs, which may be a path no test
   takes.
+- **On a shared machine the census's mean is not the kernel.**
+  `step_inventory`'s per-kernel table averages, and in Phase 38 the wide
+  `transpose_hl`'s ten dispatches read 71-82 us seven times and 885, 913
+  and 1062 us three times: **mean 337.8, median 74.8**. Read straight off
+  the table the change would have looked like a fifth of what it was.
+  The minima of that same census agree with `bin/arithmetic`'s isolated
+  `best_of` to 3%, which is the whole argument for a minimum -- take the
+  median or the minimum whenever `uptime` is not in single digits, and
+  say which one the number is.
 - **A failed command buffer panics rather than timing as zero.** An
   `MTLCommandBuffer` that fails reports `GPUStartTime == GPUEndTime == 0`,
   so by the only clock here it costs **0 ms of GPU** and the arrays it owned

@@ -6422,6 +6422,13 @@ a width change -- one side of a transpose is strided, so it wants a
 32x32 tile staged through threadgroup memory with a padded stride -- and
 at ~0.8% of a chunk that is priced and not built.
 
+> **The two sentences above about striding are wrong, and Phase 38 is
+> where that is taken apart.** These transposes swap two axes that both
+> sit *outside* the innermost one, so a `D`-run is contiguous at both
+> ends and there is nothing for a threadgroup tile to do. It was the
+> access width, like the four kernels in the section above it, and it
+> came back the same way: **-8.5 ms a chunk for fifteen lines each.**
+
 ### What it says about where to go, which is mostly "not far"
 
 Prefill is **89.4% gemm**, and the gemm's distance from the ceiling is now
@@ -6431,7 +6438,9 @@ the k-quant gemm is down, **10 are what unpacking costs anyone**, **8 are
 ggml's tiling against mlx's**, and **1-3 are the k-quant unpack itself**.
 
 That makes the reachable headroom **~8% of a chunk, and only on a k-quant
-artifact**. The derivation, because "8 points" is a share of a *ceiling*
+artifact** -- **~6% once Phase 38 prices the one term this paragraph does
+not**, which is that mlx reaches its 84% while rounding every dequantized
+weight to bfloat16 in threadgroup memory, and this port's tile may not. The derivation, because "8 points" is a share of a *ceiling*
 and not of a time: the four k-quant gemms are 1301 ms of the 1575 ms
 stream, **82.6%**; going from 75.5% of the ceiling to 84% takes
 `1 - 75.5/84 = 10.1%` off their time; `0.826 x 0.101` is **8.4%**. (An
@@ -6458,8 +6467,9 @@ The candidates, in order:
   tile width, predicted by an op count and confirmed by a stand-in.
   Halving it would buy ~1% of a chunk.
 - **What is left is ggml's tiling against mlx's, and only on a k-quant
-  artifact**: 8 points, **~8% of a chunk** (derived above). Start with
-  the routed pair: `q4k_gather_qmm_t` and `q6k_gather_qmm_t` are **706 ms
+  artifact**: 8 points, **~8% of a chunk** (derived above; **~6% after
+  Phase 38**, which prices what keeping the exactness contract costs of
+  those eight points). Start with the routed pair: `q4k_gather_qmm_t` and `q6k_gather_qmm_t` are **706 ms
   of the 1575 ms stream, 45%** -- more than the two dense ones together
   (595 ms, 38%) -- and they are the half that also has to keep mlx's
   answer to raggedness, walking `rhs_indices` for each maximal run of one
@@ -6475,6 +6485,214 @@ The candidates, in order:
 ~250-400 GB/s and is memory-bound end to end. This is a prefill instrument
 and its numbers are prefill numbers -- the same two-objects rule Phase 35
 was built on.
+
+
+## Phase 38 -- the transposes were a width and not a tile, and the tiling prize is three quarters of what it was written down as -- **DONE**
+
+Phase 37 left prefill with exactly two objects named. This phase is the
+answer to both, and neither answer is the one the name implied: the small
+one was built and it was not the kernel project it had been priced as, and
+the large one is re-priced and **not** built.
+
+### The premise was wrong, and the index arithmetic is what said so
+
+Phase 37 put the two transposes in the bucket with a plan attached: "they
+are not a width change -- one side of a transpose is strided, so it wants a
+32x32 tile staged through threadgroup memory with a padded stride". That is
+true of transposing a matrix. **It is not true of these two, and nothing
+had to be measured to find out.**
+
+`transpose_lh` is `[B, L, H, D] -> [B, H, L, D]`. It swaps two axes that are
+both *outside* `D`, so run `d` of the source lands whole somewhere in the
+destination: both ends of the move are contiguous, and at this model's
+shapes a run is 512 bytes (`head_dim` 256, bfloat16), or 144 in the vision
+tower. Nothing is strided at the granularity a thread works at. What these
+kernels were losing is what `swiglu`, `sigmoid_gate` and `slice_inner` were
+losing one phase earlier, for the same reason and in nearly the same
+amount: **one element a thread**.
+
+So it is the same fifteen lines a fifth time, behind the same control
+(`ORNITH_WIDE_ELEM=0`) and the same guard -- `d` a whole number of vectors
+and **both bases 16-byte aligned**, with `layout::transpose_would_widen` so
+a test can assert the wide path is the one it covered.
+
+### What it is worth, on two instruments that agree
+
+Isolated first, for the reason Phase 37 gives: the effect is under 1% of a
+chunk and the paired chunk cell's noise floor is larger than that.
+
+    bin/arithmetic, best of 5, chains of 10, at a chunk's own shapes
+
+      kernel / shape               narrow     wide    GB/s    x10
+      transpose_lh, 16 q heads    0.467 ms   0.084     401   3.8 ms
+      transpose_lh, 2 k heads     0.067      0.022     191   0.4
+      transpose_lh, 2 v heads     0.066      0.021     197   0.4
+      transpose_hl, 16 heads out  0.462      0.080     419   3.8
+                                                            8.5 ms a chunk
+
+And then in the stream, which is available here in a way it was not for the
+elementwise kernels: `step_inventory`'s census times **one dispatch to a
+command buffer**, so it resolves a single kernel where the paired chunk
+cannot. Both arms in one sitting, medians over the dispatches:
+
+      kernel                MB    n    narrow      wide
+      transpose_lh, q     16.0   10   439.7 us    66.3 us
+      transpose_lh, k/v    2.0   20    60.6       13.1
+      transpose_hl        16.0   10   814.2       74.8
+      ------------------------------------------------
+      median-weighted                 13.75 ms    1.67 ms
+      minimum-weighted                10.15       1.60    -> -8.55 ms
+
+**The minima agree with the isolated bin to 3%** -- 8.55 ms against 8.5 --
+and the medians do not, for a reason that is the next section. 33.5 MB
+moved in 71.0 us is 472 GB/s against `bin/bandwidth`'s 465, the last few
+percent being the source still in cache from the kernel that wrote it.
+
+**And the control is the same object Phase 37 measured**, which is what
+licenses comparing them at all: the narrow arm's `transpose_lh` averages
+187 us over its 30 dispatches against the 207.1 us Phase 37's inventory
+recorded, and Phase 37's 619.0 us for `transpose_hl` sits between this
+arm's 460.8 minimum and its 814.2 median.
+
+### And the census reads as a mean, which here was three outliers
+
+The census prints a total and a count, so a per-dispatch figure taken from
+it -- which is what "207.1 us over 30 dispatches" is -- is a mean. The wide
+arm's ten `transpose_hl` dispatches read
+
+    71.0  71.4  71.6  72.8  73.6  75.9  82.0    885.1  912.9  1061.7
+
+-- mean **337.8 us**, median **74.8**. The three are a co-tenant, not the
+kernel, and read straight off the census's own table they would have said
+this change bought a fifth of what it bought. The machine was at load 12-14
+with a VM in it for the whole of this phase; **on a shared machine the
+census's mean is not the kernel, and the minimum or the median is.** That
+is the same lesson as `best_of`, arriving at the one table here that had
+not applied it -- `step_inventory`'s A/B cells already take medians over
+their draws; its census does not, because until now nothing had read a
+single kernel out of it.
+
+### The large object: steel's tiling, and the term nobody had priced
+
+Phase 37's remaining candidate was carrying Q4_K and Q6_K onto
+`mlx::steel::BlockMMA`, priced at eight points of the arithmetic ceiling
+and **~8% of a chunk** on a k-quant artifact. The decomposition behind that
+stands. **But one term of it is not available to this port, and reading
+mlx's loader rather than its timings is what says so.**
+
+`QuantizedBlockLoader` dequantizes into `threadgroup T*`, and `T` is the
+activation type. `BlockMMA::mma` then loads its fragments out of that
+array -- the fragments are `float` (`MMATile<AccumType, ...>`), but the
+values in them have been through **bfloat16 on the way into shared memory,
+eight significand bits**. Every weight mlx's quantized gemm multiplies has
+been rounded there.
+
+`kernels/kquant_mm.h` declined a milder version of exactly this. ggml
+dequantizes into `half`; the tile is instantiated at `float` instead,
+because "eleven significand bits is a 5e-4 perturbation where reassociation
+is 2e-6" (Phase 23). Eight bits is 8x worse again. So "carry the k-quants
+onto steel's tiling" is two different projects:
+
+  * with `T` tiles it reaches mlx's 84% **and stops agreeing with the
+    mat-vec it replaces** -- and `max_abs == 0.0` against that tile is
+    precisely the oracle this project was handed;
+  * with `float` tiles it keeps the contract and pays part of the eight
+    points back in threadgroup traffic.
+
+**And that part is measurable without writing the kernel, from both ends.**
+One run, load ~7, both arms inside it:
+
+    mlx's own quantized gemm, M=16384 N=2048 K=2048, 4 bits group 32
+
+      bfloat16 operands   12.050 ms
+      float operands      12.370      +2.7%
+
+    the port's own tile, the same question from the other side
+
+      S = float            6.583 ms
+      S = half             6.389      +3.0%   (3.6% in Phase 37, quiet)
+
+The first is an **upper bound**: `T` widens the activation tile and the
+output as well as the weight tile, where a k-quant port would widen only
+the weights. The second is the same term on ggml's tiling, where `S` widens
+the fragments too. Both say two to three points, and they are ratios inside
+one run rather than levels across sittings, which is what makes them
+readable on a machine at load 7.
+
+So the target is 84 points less two or three:
+
+    the four k-quant gemms are 82.6% of the stream, at 75.5% of the ceiling
+
+      to 84.0%   mlx's, with mlx's rounding    10.1% of their time   8.4% of a chunk
+      to 81.7%   less the 2.7% upper bound      7.6%                 6.3%
+      to 81.0%   less the 3.6% ggml-tile term   6.8%                 5.6%
+
+**So ~6% of a chunk and not ~8%**, on a k-quant artifact, and on the affine
+parent still exactly nothing -- its gemms already run on mlx's kernel, with
+mlx's rounding, at 84%.
+
+### It is not built, and that is recorded as an estimate rather than a debt
+
+At ~6% a chunk, `q6k-full` prefills 6621 ids in **~4.2 GPU s against the
+4.47 it does now and the affine parent's 3.99**. The k-quant artifact stays
+slower at prefill after the whole project than the parent is before it, by
+about 5% instead of 18%. Nothing in this port's ledger turns on that: the
+k-quants are taken for 4 GB and -13.1% of a decode step, and "pays for it
+in prefill arithmetic" is already what the entry says.
+
+What that buys the next session is a decision it does not have to re-derive.
+The oracle is ready, the tile it must match is one file, the two loaders are
+the work, and the routed half (`q4k_gather_qmm_t` + `q6k_gather_qmm_t`,
+45% of the stream) has to keep mlx's answer to raggedness on top. **What it
+cannot do is take mlx's tiling and mlx's exactness contract separately** --
+the eight points are quoted with mlx's rounding included, and this phase is
+what says how much of them survives without it.
+
+### How it is held
+
+- The suite green: **124 tests, 0 failed, 0 ignored**, `--include-ignored`
+  with `--test-threads=1`.
+- `tests/ops::the_wide_transposes_are_the_narrow_ones`, with two references
+  rather than one, because a wide/narrow pair alone cannot catch a mistake
+  both arms share: float32 at **distinct** values against the permutation
+  computed in the test (no two source positions hold the same number, so a
+  misaddressed element cannot look right), and bfloat16 at the model's own
+  `[1, L, 16, 256]` head shape against the narrow kernel. Plus the round
+  trip, plus `transpose_would_widen` asserted true on both and asserted
+  **false** on a `d` that is not a whole number of vectors.
+- **The wide path is live in the model**, which the tests cannot say: the
+  census names `transpose_lh_wide_bfloat16` x30 and
+  `transpose_hl_wide_bfloat16` x10 at grid 1048576 = 8388608 / 8.
+- Byte-identity, six pairs, **with the byte count printed beside every
+  hash** because `md5` of nothing equals `md5` of nothing:
+
+      artifact     case                        bytes   md5
+      parent       200 greedy                    608   206e68be307d850b...
+      parent       --mtp --mtp-depth 1 --frspec  608   206e68be307d850b...
+      parent       6621-token prompt, --raw       26   bae75e6f3f7799ff...
+      q6k-full     200 greedy                    534   e5fd6c15bdc8d5cf...
+      q6k-full     --mtp --mtp-depth 1 --frspec  534   e5fd6c15bdc8d5cf...
+      q6k-full     6621-token prompt, --raw       40   0c904f9373342bf7...
+
+  each identical between the default and `ORNITH_WIDE_ELEM=0`, and none of
+  them empty.
+
+### What is left in the bucket after this
+
+Nothing. The transposes were the last entry, they now run at 401-419 GB/s
+isolated and 472 in the stream, and what remains of them is **1.67 ms**,
+0.11% of a chunk.
+
+One number in Phase 37 does not survive this, and it is worth saying which:
+it recorded the pair at **12.4 ms** from an inventory whose `us` column is a
+mean. This phase's narrow arm, the same kernels in the same instrument,
+reads **13.75 ms by medians and 10.15 by minima** -- so the 12.4 was a mean
+with the same outliers in it, and the saving is the **8.5 ms** two
+instruments agree on rather than the 10.7 the difference of the two
+recorded levels would suggest. The share is unchanged either way: a chunk is
+now about **90% quantized gemm**, ~3% data movement and ~7% everything else,
+and the only object left in the gemm is the one above -- one artifact, ~6%,
+and a real kernel project.
 
 
 ## Disk
