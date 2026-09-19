@@ -1440,9 +1440,26 @@ in two processes, against a zero-control band of -0.023 .. +0.054. It is kept
 it did not pay. What the same run shows is that the 0.145 ms sitting on those
 two dispatches (**4.8 us each, three times the chain's average**, because
 they are the serial spine between the recurrence and `out_proj`) is not
-reachable by gluing two elementwise ops together at all. Only folding the
-norm into the matvec that reads it reaches it, which is what a deferred op
-layer is for.
+reachable by gluing two elementwise ops together at all.
+
+**Phase 34 then folded the norm into the matvec that reads it -- the
+deferred op layer's own mechanism, on the one norm in this model with
+exactly one consumer -- and it lost.** Four widths, two processes, each
+paired against the unfused arm in the same draw: **+0.304/+0.376 at ggml's
+512 threadgroups, +0.079/+0.146 at the best of the four, +0.188/+0.266 and
++0.468/+0.537 wider still**; 2 of 16 pairs down at the minimum, against a
+0.145 ms prize. Bit-exact throughout (`max_abs == 0.0`, and 200 greedy
+tokens byte-identical at every width, 1009 dispatches to 979).
+
+The reason generalises and is the end of the question: **a mat-vec
+parallelises over output rows and every threadgroup reads the whole input**,
+so folding a producer into it is not computing it once, it is computing it
+once per threadgroup. The producer is O(K) and gets multiplied by the
+threadgroup count; the consumer does not. Fusing an elementwise op into its
+consumer is a *gemm* idea and a decode step has no gemms. Every other norm
+here feeds four or six matvecs, which multiplies the same redundancy again.
+The kernel is kept off by default as the control that says so
+(`ORNITH_FUSE_NORM_PROJ=1`, `ORNITH_RMSGATE_NR0`).
 
 **And the fusion pays outside the decode step, which nothing had measured.**
 A 6406-token prompt: **5.47 -> 5.17 GPU seconds, -5.7%, 3 of 3 interleaved
@@ -2011,17 +2028,22 @@ In order:
      into one (0.34) -- for **-500 dispatches, -299 barriers, -305 epochs,
      -4 command buffers and 117 tok/s to 130** between them.
 
-     **What is left for a deferred op layer is 211 dispatches and 0.49 ms of
-     ceiling: ~0.25 ms realized, 3.8% of a 6.5 ms trunk.** That is the whole
-     of its case on a decode step and it is not a large one. Two things
-     sharpen it. Half of that 0.49 is 30 dispatches worth 4.8 us each -- the
-     norm and gate that close every gated-delta layer, on the serial spine
-     with nothing to overlap into -- and a pairwise fusion of the two
-     measures exactly zero; only folding the norm into the matvec that reads
-     it reaches that. And the layer's prize **outside** the decode step has
-     never been measured: one block-shaped kernel took **5.7% off a
-     6406-token prefill**, by not writing intermediates rather than by not
-     launching, and every remaining elementwise op has that shape there.
+     **The deferred op layer is closed on this step, and by its mechanism
+     rather than by its prize.** The prize was 211 dispatches and 0.49 ms of
+     ceiling, ~0.25 ms realized, 3.8% of a 6.5 ms trunk -- small. Phase 34
+     then tried the mechanism itself on the one norm in the model with a
+     single consumer and it **cost +0.08 to +0.15 ms against a 0.145 ms
+     prize**, because a mat-vec parallelises over output rows and every
+     threadgroup reads the whole input, so the producer gets computed once
+     per threadgroup rather than once. Fusing an op into its consumer is a
+     gemm idea; a decode step has no gemms.
+
+     **Prefill is the shape where it might still hold**, and it is
+     unmeasured: at `M >= 8` the k-quant tile takes over, a threadgroup owns
+     a block of the input, and the repeat count falls from `O / (NSG * nr0)`
+     to `O / BN` -- 32 rather than 512 for `out_proj`. Phase 33 already found
+     the elementwise chain costing *bytes* there rather than launches (one
+     block kernel, **-5.7% on a 6406-token prompt**). See item 0.
 
      Price a fusion at ~half of what removing its dispatches measures (twice
      measured), and a rewrite at ~half of the isolated time it removes (once)
@@ -2544,6 +2566,10 @@ reads much more invitingly than it should.
   as the ten it was, `ORNITH_FUSE_GDN_NORM=0` issues `RMSNormGated` as two,
   `ORNITH_MOE_GATE_POS=0|1|2` puts the shared expert's gate beside
   the router, beside the gathers (the default) or after them,
+  **`ORNITH_FUSE_NORM_PROJ=1`** folds `RMSNormGated` into `out_proj` and is
+  the one switch here that is off by default, because it lost -- it is the
+  control that says why, with `ORNITH_RMSGATE_NR0=2|4|8|16` for the width
+  sweep that found its floor;
   `ORNITH_ROUTER_SORT=1` puts mlx's argsort back in place of the selection
   kernel, and `ORNITH_FAKE_SORT=1` swaps the argsort for a stand-in that
   keeps its contract and does not sort (**the output is wrong while it is

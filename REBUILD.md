@@ -5338,6 +5338,102 @@ actually removed is the check that fails loudly, and it is the same check
 Phase 32 added `prof_dropped` for.
 
 
+## Phase 34 -- the norm folded into the matvec that reads it, and why that is the end of the deferred op layer -- **DONE**
+
+Phase 33 ended with a claim worth testing rather than believing: the 0.145 ms
+sitting on the two dispatches that close every gated-delta layer -- 4.8 us
+each, three times the elementwise chain's average, because they are the
+serial spine between the recurrence and `out_proj` -- is not reachable by
+gluing two elementwise ops together, and *only* folding the norm into the
+matvec that reads it can reach it. That was called the sharpest argument for
+a deferred op layer this project had measured. This phase built it.
+
+It was the best case available. `RMSNormGated -> out_proj` is the **only**
+norm in this model with exactly one consumer: every other one feeds four
+(the gated-delta layer's four input projections) or six (the MoE block's
+router, two shared-expert projections, its gate and two expert gathers).
+
+### What was built
+
+`q4k_rmsgate_qmv` in `kernels/q4k.metal`. Each threadgroup normalises the
+whole activation row into threadgroup memory with `ornith_rmsgate.h`'s
+prologue, then runs the existing mat-vec body over it **unchanged** -- the
+body gained one template parameter for the activation pointer's address
+space and not one other character, so what it computes cannot have moved.
+
+Bit-exact by construction and checked twice: the prologue is
+`rms_gated_single_row`'s reduction -- 32 lanes, four contiguous elements, one
+`simd_sum`, which at `head_dim = 128` is exactly one simdgroup -- and
+`tests/q4k::the_fused_norm_projection_is_the_two_dispatches` holds it to
+`max_abs == 0.0` against the two dispatches it replaces, at every width.
+End to end, 200 greedy tokens are byte-identical with it on at any width,
+and the dispatch count says the control took: **1009 -> 979**.
+
+### It loses, and it loses at every width
+
+    the trunk, 8 interleaved pairs, each paired against the unfused arm in
+    the same draw; two processes
+
+    rows a threadgroup   threadgroups   process 1         process 2
+      nr0 = 2 (ggml's)       512        +0.304, 0 of 8    +0.376, 0 of 8
+      nr0 = 4                128        +0.079, 2 of 8    +0.146, 0 of 8
+      nr0 = 8                 64        +0.188, 0 of 8    +0.266, 0 of 8
+      nr0 = 16                32        +0.468, 0 of 8    +0.537, 0 of 8
+
+**The best width costs +0.08 to +0.15 ms where the entire pair it absorbs is
+worth 0.145.** 2 of 16 pairs down. The sweep is a U and both of its sides are
+named: leftward the prologue repeats more often, rightward the mat-vec itself
+degrades as a threadgroup takes more output rows.
+
+### Why, and it is not about this kernel
+
+**A mat-vec parallelises over output rows, and every threadgroup reads the
+whole input.** There is no thread, and no threadgroup, that *owns* an input
+element. So "fold the producer into the consumer" does not mean computing the
+producer once inside the consumer; it means computing all of it once **per
+threadgroup** -- 512 times at ggml's shape for a 2048-row projection. The
+only knob is how few threadgroups the mat-vec can be made to run with, and
+that is the same knob that decides whether the mat-vec is any good.
+
+That is why the U has a floor above zero, and the floor is not a property of
+this kernel. It is arithmetic: the producer is O(K) work, the consumer is
+O(K*O/G) work spread over G threadgroups, and the fusion multiplies the
+producer by G while leaving the consumer alone.
+
+### What it says about the deferred op layer, which is that it is closed
+
+The layer's premise is the textbook one -- an elementwise op belongs in the
+kernel that consumes it. **That is a gemm idea, and a decode step has no
+gemms.** Phase 32 and 33 priced the layer's prize on this step at 211
+dispatches and 0.49 ms of ceiling, ~0.25 ms realized, 3.8% of the trunk, and
+called it small. It is worse than small: on the one call site in the model
+where the mechanism has its easiest possible shape, the mechanism **costs
+more than the thing it was reaching for**, and every other call site has four
+to six consumers, which multiplies the redundancy again.
+
+So the deferred op layer is not blocked by the effort of building it. Its
+mechanism does not work at batch 1. That is a firmer answer than the ceiling
+was, and it was one kernel to get.
+
+**What this does not close.** At `M >= 8` rows `kquant_mm.h`'s tile takes over
+from the mat-vec, and a tile *does* give a threadgroup a block of the input to
+own: the repeat count falls from `O / (NSG * nr0)` to `O / BN` -- 32 rather
+than 512 for this projection -- while the work each repeat serves rises with
+the rows. Prefill is the shape where the premise might hold, and prefill is
+where Phase 33 already found the elementwise chain costing bytes rather than
+launches. Nothing here measures that, and the instrument for it does not
+exist.
+
+### What was kept
+
+The kernel, **off by default** -- the only switch in this port that way round
+-- at `nr0 = 4`, the measured best of the four. `ORNITH_FUSE_NORM_PROJ=1`
+turns it on and `ORNITH_RMSGATE_NR0` picks the width, so the sweep above is
+one command. A negative expires with its artifact and its instrument, and
+this one has an obvious expiry date on it: the sentence above about tiles.
+Keeping it makes the re-price a measurement instead of a rebuild.
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
