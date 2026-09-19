@@ -24,7 +24,7 @@ use crate::ops::gdn::{
 };
 use crate::ops::layout::{slice_inner, transpose_hl, transpose_lh};
 use crate::ops::moe::sparse_moe_block;
-use crate::ops::norm::rms_norm;
+use crate::ops::norm::{add_rms_norm, rms_norm};
 use crate::ops::quantized::{QuantMatrix, quantized_matmul};
 use crate::ops::rope::rope;
 use crate::weights::WeightStore;
@@ -161,6 +161,15 @@ impl TextModel {
         make_cache(&self.cfg)
     }
 
+    /// The norm the add closing layer `i` feeds: the next layer's input norm,
+    /// or the model's own final norm after the last one.
+    fn next_norm(&self, i: usize) -> &Array {
+        match self.layers.get(i + 1) {
+            Some(l) => &l.input_layernorm,
+            None => &self.norm,
+        }
+    }
+
     /// The full forward pass. Returns `(logits, hidden)` where `hidden` is the
     /// pre-final-norm residual stream -- the MTP head's input.
     pub fn forward(
@@ -187,21 +196,29 @@ impl TextModel {
         let n = ids.numel();
         let base_offsets: Vec<usize> = caches.iter().map(|c| c.offset()).collect();
         let mut gdn: Vec<Option<GdnSnaps>> = (0..caches.len()).map(|_| None).collect();
-        let mut h = embedding(ctx, &self.embed_tokens, ids).reshape(&[1, n, self.cfg.hidden_size]);
+        let mut x = embedding(ctx, &self.embed_tokens, ids).reshape(&[1, n, self.cfg.hidden_size]);
+        let mut normed =
+            rms_norm(ctx, &x, Some(&self.layers[0].input_layernorm), self.cfg.rms_norm_eps);
         for (i, layer) in self.layers.iter().enumerate() {
-            h = match &layer.mixer {
+            let (h, m) = match &layer.mixer {
                 Mixer::Linear(_) => {
-                    let (out, snaps) = layer.forward_capture(ctx, &self.cfg, &h, &mut caches[i]);
+                    let (h, m, snaps) =
+                        layer.forward_capture_parts(ctx, &self.cfg, &x, &normed, &mut caches[i]);
                     gdn[i] = Some(snaps);
-                    out
+                    (h, m)
                 }
-                Mixer::Full(_) => layer.forward(ctx, &self.cfg, &h, &mut caches[i]),
+                Mixer::Full(_) => {
+                    layer.forward_parts(ctx, &self.cfg, &x, &normed, &mut caches[i])
+                }
             };
+            let w = self.next_norm(i);
+            let (nx, nn) = add_rms_norm(ctx, &h, &m, Some(w), self.cfg.rms_norm_eps);
+            x = nx;
+            normed = nn;
         }
-        let normed = rms_norm(ctx, &h, Some(&self.norm), self.cfg.rms_norm_eps);
         (
             normed,
-            h,
+            x,
             TrunkCapture {
                 gdn,
                 base_offsets,
@@ -235,12 +252,30 @@ impl TextModel {
         caches: &mut [LayerCache],
     ) -> (Array, Array) {
         let n = embeddings.numel() / self.cfg.hidden_size;
-        let mut h = embeddings.reshape(&[1, n, self.cfg.hidden_size]);
+        let mut x = embeddings.reshape(&[1, n, self.cfg.hidden_size]);
+        // Only the first layer's input norm stands on its own; every other
+        // one is fused into the add that closes the layer before it, and so
+        // is the model's final norm.
+        let mut normed =
+            rms_norm(ctx, &x, Some(&self.layers[0].input_layernorm), self.cfg.rms_norm_eps);
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(ctx, &self.cfg, &h, &mut caches[i]);
+            // Where one layer's dispatches end and the next begin, for a
+            // trace that wants to be read a layer at a time. Free unless a
+            // trace is recording.
+            ctx.prof_section(
+                match layer.mixer {
+                    Mixer::Linear(_) => "layer.linear",
+                    Mixer::Full(_) => "layer.full",
+                },
+                i,
+            );
+            let (h, m) = layer.forward_parts(ctx, &self.cfg, &x, &normed, &mut caches[i]);
+            let w = self.next_norm(i);
+            let (nx, nn) = add_rms_norm(ctx, &h, &m, Some(w), self.cfg.rms_norm_eps);
+            x = nx;
+            normed = nn;
         }
-        let normed = rms_norm(ctx, &h, Some(&self.norm), self.cfg.rms_norm_eps);
-        (normed, h)
+        (normed, x)
     }
 }
 
@@ -322,15 +357,42 @@ impl DecoderLayer {
         cache: &mut LayerCache,
     ) -> Array {
         let normed = rms_norm(ctx, x, Some(&self.input_layernorm), cfg.rms_norm_eps);
+        let (h, m) = self.forward_parts(ctx, cfg, x, &normed, cache);
+        add(ctx, &h, &m)
+    }
+
+    /// The layer from an input already normalised by the caller, and without
+    /// its last add: `(h, m)` are the residual and the MoE block's output, so
+    /// the layer's result is `h + m`.
+    ///
+    /// The split is here because of what comes next. Every layer ends by
+    /// adding `m` to the residual and the next one begins by normalising the
+    /// sum, which is one dispatch and one barrier epoch each where it can be
+    /// one of each -- see [`ops::norm::add_rms_norm`]. Handing the caller the
+    /// two halves is what lets it fuse across the boundary; nothing else
+    /// about the layer moves.
+    fn forward_parts(
+        &self,
+        ctx: &Context,
+        cfg: &TextConfig,
+        x: &Array,
+        normed: &Array,
+        cache: &mut LayerCache,
+    ) -> (Array, Array) {
         let r = match &self.mixer {
-            Mixer::Linear(g) => g.forward(ctx, cfg, &normed, cache.as_gdn()),
-            Mixer::Full(a) => a.forward(ctx, cfg, &normed, cache.as_kv()),
+            Mixer::Linear(g) => g.forward(ctx, cfg, normed, cache.as_gdn()),
+            Mixer::Full(a) => a.forward(ctx, cfg, normed, cache.as_kv()),
         };
-        let h = add(ctx, x, &r);
-        let normed2 = rms_norm(ctx, &h, Some(&self.post_attention_layernorm), cfg.rms_norm_eps);
-        let m = sparse_moe_block(
+        let (h, normed2) =
+            add_rms_norm(ctx, x, &r, Some(&self.post_attention_layernorm), cfg.rms_norm_eps);
+        let m = self.moe(ctx, cfg, &normed2);
+        (h, m)
+    }
+
+    fn moe(&self, ctx: &Context, cfg: &TextConfig, normed2: &Array) -> Array {
+        sparse_moe_block(
             ctx,
-            &normed2,
+            normed2,
             &self.mlp.gate,
             &self.mlp.switch_gate,
             &self.mlp.switch_up,
@@ -341,40 +403,26 @@ impl DecoderLayer {
             &self.mlp.shared_expert_gate,
             cfg.num_experts_per_tok,
             cfg.norm_topk_prob,
-        );
-        add(ctx, &h, &m)
+        )
     }
 }
 
 impl DecoderLayer {
     /// The gated-delta branch with per-token snapshots.
-    fn forward_capture(
+    fn forward_capture_parts(
         &self,
         ctx: &Context,
         cfg: &TextConfig,
         x: &Array,
+        normed: &Array,
         cache: &mut LayerCache,
-    ) -> (Array, GdnSnaps) {
+    ) -> (Array, Array, GdnSnaps) {
         let Mixer::Linear(g) = &self.mixer else { panic!("not a gated-delta layer") };
-        let normed = rms_norm(ctx, x, Some(&self.input_layernorm), cfg.rms_norm_eps);
-        let (r, snaps) = g.forward_capture(ctx, cfg, &normed, cache.as_gdn());
-        let h = add(ctx, x, &r);
-        let normed2 = rms_norm(ctx, &h, Some(&self.post_attention_layernorm), cfg.rms_norm_eps);
-        let m = sparse_moe_block(
-            ctx,
-            &normed2,
-            &self.mlp.gate,
-            &self.mlp.switch_gate,
-            &self.mlp.switch_up,
-            &self.mlp.switch_down,
-            &self.mlp.shared_gate,
-            &self.mlp.shared_up,
-            &self.mlp.shared_down,
-            &self.mlp.shared_expert_gate,
-            cfg.num_experts_per_tok,
-            cfg.norm_topk_prob,
-        );
-        (add(ctx, &h, &m), snaps)
+        let (r, snaps) = g.forward_capture(ctx, cfg, normed, cache.as_gdn());
+        let (h, normed2) =
+            add_rms_norm(ctx, x, &r, Some(&self.post_attention_layernorm), cfg.rms_norm_eps);
+        let m = self.moe(ctx, cfg, &normed2);
+        (h, m, snaps)
     }
 }
 

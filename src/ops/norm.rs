@@ -63,6 +63,98 @@ pub fn rms_norm(ctx: &Context, x: &Array, w: Option<&Array>, eps: f32) -> Array 
     out
 }
 
+/// `h = a + b`, then `rms_norm(h, w, eps)` -- one dispatch for both, and both
+/// arrays out, since the sum is the residual the layer needs again.
+///
+/// The pair is the most frequent barrier in a decode step (78 a token: every
+/// layer adds its residual and then normalises it) and neither half does any
+/// work -- `REBUILD.md` Phase 31 measured the two at 0.33 and 0.22 ms a token
+/// with their grids clamped to a single threadgroup, which is to say all of
+/// it is the launch. This removes one of the two launches and the barrier
+/// between them.
+///
+/// Bit-exact by construction rather than by tolerance: the kernel evaluates
+/// `a[i] + b[i]` in the array's own dtype, exactly as `add_elem` does, and
+/// the sum of squares accumulates the **rounded** result, exactly as
+/// `rms_norm` would having read it back from memory. `ORNITH_FUSE_ADD_RMS=0`
+/// runs the two separately, as the control.
+pub fn add_rms_norm(
+    ctx: &Context,
+    a: &Array,
+    b: &Array,
+    w: Option<&Array>,
+    eps: f32,
+) -> (Array, Array) {
+    let axis_size = a.dim(-1);
+    if !fuse_add_rms() || axis_size > RMS_LOOPED_LIMIT {
+        let h = crate::ops::elementwise::add(ctx, a, b);
+        let normed = rms_norm(ctx, &h, w, eps);
+        return (h, normed);
+    }
+    assert_eq!(a.shape, b.shape, "the residual and the branch must have one shape");
+    let n_rows = a.numel() / axis_size;
+    let h = Array::empty(ctx, &a.shape, a.dtype);
+    let out = Array::empty(ctx, &a.shape, a.dtype);
+
+    let name = format!(
+        "add_rms_{}",
+        match a.dtype {
+            Dtype::BF16 => "bfloat16",
+            Dtype::F32 => "float32",
+            d => panic!("no add_rms kernel for {}", d.name()),
+        }
+    );
+
+    let ones;
+    let (w_arr, w_stride) = match w {
+        Some(w) => {
+            assert_eq!(w.numel(), axis_size, "rms_norm weight must match the last axis");
+            (w, w.strides()[0] as u32)
+        }
+        None => {
+            ones = scalar_one(ctx, a.dtype);
+            (&ones, 0u32)
+        }
+    };
+
+    let d = ctx.kernel(&name);
+    let threadgroup_size = 32 * axis_size.div_ceil(RMS_N_READS).div_ceil(32);
+    assert!(threadgroup_size <= d.max_threads_per_threadgroup());
+    d.arr(a)
+        .arr(b)
+        .arr(w_arr)
+        .out(&h)
+        .out(&out)
+        .bytes(&eps)
+        .bytes(&(axis_size as u32))
+        .bytes(&w_stride)
+        .threads((n_rows * threadgroup_size, 1, 1), (threadgroup_size, 1, 1));
+    (h, out)
+}
+
+/// An atomic rather than a `OnceLock` so that one process can run both code
+/// paths: a change worth ~0.15 ms a token is below what a 200-token run
+/// separates on this machine, and the only measurement that resolves it is
+/// the two paths alternating inside one process.
+static FUSE_ADD_RMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static FUSE_READ_ENV: std::sync::Once = std::sync::Once::new();
+
+fn fuse_add_rms() -> bool {
+    FUSE_READ_ENV.call_once(|| {
+        if std::env::var("ORNITH_FUSE_ADD_RMS").as_deref() == Ok("0") {
+            FUSE_ADD_RMS.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    FUSE_ADD_RMS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the fusion on or off at runtime; returns what it was.
+pub fn set_fuse_add_rms(on: bool) -> bool {
+    let was = fuse_add_rms();
+    FUSE_ADD_RMS.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
+}
+
 const LN_LOOPED_LIMIT: usize = 6656;
 
 /// `layer_norm(x, w, b, eps)`, normalising over the last axis.
