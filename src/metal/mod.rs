@@ -227,6 +227,9 @@ pub struct Prof {
     trace: Option<Vec<String>>,
     pub commits: usize,
     pub dispatches: usize,
+    /// Of those, the ones `neuter` dropped: counted, bound, barriered and
+    /// never issued.
+    dropped: usize,
     /// Round trips to the host: every one drains the queue and leaves the GPU
     /// with nothing to do until the CPU queues the next thing.
     pub syncs: usize,
@@ -483,7 +486,7 @@ pub struct Context {
     /// the dispatch count are all what they were; the only difference is the
     /// dispatch itself. Both need the selective encoder, since that is what
     /// maintains the name.
-    neuter: RefCell<Option<(String, bool)>>,
+    neuter: RefCell<Option<(Vec<String>, bool)>>,
     prof: RefCell<Prof>,
     barriers: BarrierMode,
     hazards: RefCell<Hazards>,
@@ -1184,7 +1187,26 @@ impl Context {
 
     /// See [`Context::neuter`]. `None` puts every dispatch back.
     pub fn set_neuter(&self, what: Option<(&str, bool)>) {
-        *self.neuter.borrow_mut() = what.map(|(k, all)| (k.to_string(), all));
+        *self.neuter.borrow_mut() = what.map(|(k, all)| (vec![k.to_string()], all));
+    }
+
+    /// The same, for several patterns taken out together: a dispatch is
+    /// neutered if any of them matches its kernel's name.
+    ///
+    /// One class at a time prices one fusion. A list at once prices the
+    /// *ceiling* of fusing all of them -- which is a different number from
+    /// the sum of the removals, since removing one dispatch lets its
+    /// neighbours overlap and removing all of them cannot.
+    pub fn set_neuter_many(&self, pats: &[&str], all: bool) {
+        *self.neuter.borrow_mut() =
+            Some((pats.iter().map(|p| p.to_string()).collect(), all));
+    }
+
+    /// Dispatches dropped since the last [`Context::prof_reset`]. A pattern
+    /// list is a silent no-op when it matches nothing, so this is what says
+    /// a measurement removed what it meant to.
+    pub fn prof_dropped(&self) -> usize {
+        self.prof.borrow().dropped
     }
 
     /// `(clamp this dispatch's grid, drop it entirely)` for the kernel being
@@ -1194,10 +1216,11 @@ impl Context {
     /// floor gets decomposed into the same classes as the work.
     fn neutered(&self) -> (bool, bool) {
         let n = self.neuter.borrow();
-        if let Some((pat, all)) = n.as_ref()
-            && self.cur_kernel.borrow().contains(pat.as_str())
-        {
-            return if *all { (false, true) } else { (true, false) };
+        if let Some((pats, all)) = n.as_ref() {
+            let k = self.cur_kernel.borrow();
+            if pats.iter().any(|p| k.contains(p.as_str())) {
+                return if *all { (false, true) } else { (true, false) };
+            }
         }
         (self.grid1.get(), false)
     }
@@ -1278,6 +1301,7 @@ impl Context {
             p.trace = Some(Vec::new());
         }
         p.dispatches = 0;
+        p.dropped = 0;
         p.gpu_s = 0.0;
         p.wait_s = 0.0;
         p.wake_s = 0.0;
@@ -1292,12 +1316,13 @@ impl Context {
         p.gpu_mixed = 0.0;
     }
 
-    fn count_dispatch(&self) {
+    fn count_dispatch(&self, dropped: bool) {
         {
             let mut p = self.prof.borrow_mut();
             if p.on {
                 p.dispatches += 1;
                 p.epoch_dispatches += 1;
+                p.dropped += dropped as usize;
             }
         }
         let mut n = self.dispatches.borrow_mut();
@@ -1506,7 +1531,7 @@ impl<'a> Dispatch<'a> {
                 MTLSize { width: tg.0, height: tg.1, depth: tg.2 },
             );
         }
-        self.ctx.count_dispatch();
+        self.ctx.count_dispatch(dropped);
     }
 
     /// `dispatchThreads:` -- grid is counted in threads, like mlx's
@@ -1529,7 +1554,7 @@ impl<'a> Dispatch<'a> {
                 MTLSize { width: tg.0, height: tg.1, depth: tg.2 },
             );
         }
-        self.ctx.count_dispatch();
+        self.ctx.count_dispatch(dropped);
     }
 }
 
