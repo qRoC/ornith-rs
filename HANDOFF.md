@@ -1286,11 +1286,34 @@ took the launches themselves -- two block-shaped kernels, **-500 dispatches,
 the share is now **38%**. The section "What the dispatches cost" below is the
 whole of it.
 
-| the prompt, at chunk 2048 | |
-|---|---|
-| GPU busy | 2.05-2.34 s for 2600 tokens -- ~1230 tokens a second of GPU work |
-| wall | 380-614 tok/s, i.e. 33-49% busy, the rest lost to memory pressure |
-| `mlx_lm.generate`, same prompt | 809 tok/s |
+**The prompt, re-measured 2026-09-19 on one text and one set of ids** -- 6394
+raw tokens (no chat template, so both sides tokenise it identically), chunk
+2048, three draws a cell:
+
+| the prompt, 6394 tokens | affine parent | `q6k-full` |
+|---|---|---|
+| GPU busy | **4.50-4.61 s**, i.e. 1408 tok/s of GPU work | **5.16-5.19 s**, 1237 tok/s |
+| wall | 6.26-12.46 s, **37-72% busy** | 5.29-5.71 s, **90-97% busy** |
+| `mlx_lm.generate`, same artifact, same ids | **3.68-3.87 s, 1654-1740 tok/s** | mlx cannot load a k-quant artifact |
+
+Two things in that table, and the first one is the harder news.
+
+**The port is behind mlx on prefill by 22% of *GPU work*, not just on the
+wall.** 4.54 s median against mlx's 3.72 s of wall at what must be near-full
+occupancy. This is the one object left where the port loses to the reference
+it was written against -- decode is 130 tok/s against mlx's 86-92 -- and
+unlike decode it has never been inventoried: `step_inventory` is a decode
+instrument and there is no prefill equivalent. The older row here read "2600
+tokens, ~1230 tok/s of GPU work, mlx_lm 809" and both sides have roughly
+doubled since; the *sign* of the gap is what did not change.
+
+**And the idle is sized by the artifact, not by the era.** The same machine
+within one hour ran the 25.5 GB affine artifact at 37-72% busy and the 21.5
+GB k-quant one at 90-97%, with GPU busy holding to 2% in both. So "prefill's
+GPU is half idle" is a memory-pressure statement about a particular
+artifact's resident size, not a property of the prefill path -- and the
+wall figure swings 2x between draws while the GPU figure does not, which is
+the usual instruction to read the GPU column.
 
 So the step is GPU-bound, and the earlier guess -- that the per-step `sync` and
 the ~800 dispatches were the problem -- was wrong on both counts: the sync
@@ -1942,6 +1965,16 @@ question with an instrument attached -- see "What the dispatches cost" above.
 
 In order:
 
+0. **Prefill, which is now the only place the port loses to mlx.** 4.54 s of
+   GPU work against mlx's 3.72 s wall on the same artifact and the same 6394
+   ids -- **22% behind on GPU work alone**, with a memory-pressure idle on
+   top of it that is worth another 40-170% of wall depending on the day.
+   Decode has been inventoried three times and is down to 0.89 ms of
+   elementwise ceiling; prefill has never been inventoried at all, and the
+   one kernel that happened to touch it (Phase 33's `gdn_front`) took 5.7%
+   off it by accident. A prefill `step_inventory` is the missing instrument,
+   and it is also the only way to price the deferred op layer on something
+   other than the 3.8% it is worth on a decode step.
 1. **A machine that is not swapping.** This is first because it is what the
    next two are waiting on, and it is not something the code can fix. Every
    GPU-side number in this document is now current and trustworthy -- they
