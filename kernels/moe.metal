@@ -62,13 +62,70 @@ template <typename T>
   out[i] = x[(order[row] / k) * dim + col];
 }
 
-// `indices.flatten()[order]`.
+// `x[idx]` over a flat u32 array. The MoE block had this to itself until
+// `gather_expert_rows` below took its call site; `src/frspec.rs` still maps
+// a draft's local row back to a vocabulary id with it.
 [[kernel]] void gather_u32(
     const device uint32_t* x [[buffer(0)]],
     const device uint32_t* order [[buffer(1)]],
     device uint32_t* out [[buffer(2)]],
     uint i [[thread_position_in_grid]]) {
   out[i] = x[order[i]];
+}
+
+// The same gather, sixteen bytes a thread instead of two.
+//
+// The scalar form above is one `bfloat16_t` per thread: 33.5M threads to
+// move 67 MB, and the inventory reads it at **38 GB/s against this
+// machine's 465** (`REBUILD.md` Phase 36). Nothing about it is scattered
+// enough to explain that -- consecutive threadgroups walk one row -- so the
+// suspect is the access width, and this is that hypothesis as a kernel.
+// A pure copy either way, so bit-exact by construction; the caller takes it
+// only when a row is a whole number of 16-byte vectors, and
+// `ORNITH_MOE_GATHER_WIDE=0` is the control.
+template <typename T>
+struct alignas(16) GatherVec {
+  uint8_t b[16];
+};
+
+template <typename T>
+[[kernel]] void gather_rows_div_wide(
+    const device T* x [[buffer(0)]],
+    const device uint32_t* order [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    const constant uint& dim [[buffer(3)]],
+    const constant uint& k [[buffer(4)]],
+    uint i [[thread_position_in_grid]]) {
+  const uint per_row = dim / (16 / sizeof(T));
+  const uint row = i / per_row;
+  const uint col = i - row * per_row;
+  const device GatherVec<T>* src =
+      (const device GatherVec<T>*)(x + (size_t)(order[row] / k) * dim);
+  device GatherVec<T>* dst = (device GatherVec<T>*)(out + (size_t)row * dim);
+  dst[col] = src[col];
+}
+
+// `indices.flatten()[order]`, and beside it the row of the activations that
+// each sorted row reads.
+//
+// `order[r]` indexes the flattened `[tokens, k]` selection, so the row of `x`
+// behind sorted row `r` is `order[r] / k`. That is the number
+// `gather_rows_div` used to copy 2048 activations behind, and it is what a
+// gathered gemm takes as `lhs_indices` instead -- see `switch_glu_sorted`.
+// Both outputs are one u32 a row and this writes them whether or not the
+// caller wants the second, so the fused arm and its control issue the same
+// kernel over the same bytes and the difference between them is the copy
+// alone.
+[[kernel]] void gather_expert_rows(
+    const device uint32_t* x [[buffer(0)]],
+    const device uint32_t* order [[buffer(1)]],
+    device uint32_t* out [[buffer(2)]],
+    device uint32_t* rows [[buffer(3)]],
+    const constant uint& k [[buffer(4)]],
+    uint i [[thread_position_in_grid]]) {
+  const uint o = order[i];
+  out[i] = x[o];
+  rows[i] = o / k;
 }
 
 // `x[inv_order]`: mlx_lm's `_scatter_unsort`.
@@ -82,6 +139,27 @@ template <typename T>
   uint row = i / dim;
   uint col = i % dim;
   out[i] = x[inv_order[row] * dim + col];
+}
+
+// The same inverse permutation, sixteen bytes a thread. See
+// `gather_rows_div_wide`: the copy this replaces is the *control* for the
+// indexed tail, and a control has to be the best version of what it
+// replaces or the fusion is ranked against a kernel's width instead of
+// against itself.
+template <typename T>
+[[kernel]] void unsort_rows_wide(
+    const device T* x [[buffer(0)]],
+    const device uint32_t* inv_order [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    const constant uint& dim [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+  const uint per_row = dim / (16 / sizeof(T));
+  const uint row = i / per_row;
+  const uint col = i - row * per_row;
+  const device GatherVec<T>* src =
+      (const device GatherVec<T>*)(x + (size_t)inv_order[row] * dim);
+  device GatherVec<T>* dst = (device GatherVec<T>*)(out + (size_t)row * dim);
+  dst[col] = src[col];
 }
 
 // `y * scores[..., None]`: one scalar per row of `dim` values.
@@ -121,17 +199,23 @@ template <typename T>
 // rounds to bfloat16 at the same point it used to: the score sum, the
 // normalised score, each weighted expert row, the mixture, and the gated
 // shared expert.
-template <typename T>
-[[kernel]] void moe_combine(
-    const device T* scores [[buffer(0)]],  // [tokens, k]
-    const device T* y [[buffer(1)]],       // [tokens, k, dim]
-    const device T* gate [[buffer(2)]],    // [tokens, 1]
-    const device T* shared [[buffer(3)]],  // [tokens, dim]
-    device T* out [[buffer(4)]],           // [tokens, dim]
-    const constant uint& k [[buffer(5)]],
-    const constant uint& dim [[buffer(6)]],
-    const constant uint& normalize [[buffer(7)]],
-    uint i [[thread_position_in_grid]]) {
+//
+// `ROWS` says where expert output `j` of a token lives: at `token * k + j`,
+// which is where an unsorted `y` has it, or at `rows[token * k + j]`, which
+// is where the expert gemm left it. Everything else is the same statement in
+// the same order, and the two therefore agree bit for bit.
+template <typename T, bool ROWS>
+static inline void moe_combine_impl(
+    const device T* scores,
+    const device T* y,
+    const device T* gate,
+    const device T* shared,
+    const device uint32_t* rows,
+    device T* out,
+    uint k,
+    uint dim,
+    uint normalize,
+    uint i) {
   uint token = i / dim;
   uint col = i - token * dim;
 
@@ -143,17 +227,62 @@ template <typename T>
     }
   }
 
-  const device T* row = y + (token * k) * dim + col;
   T acc = 0;
   for (uint j = 0; j < k; ++j) {
     T w = normalize ? T(s[j] / denom) : s[j];
-    T weighted = row[j * dim] * w;
+    uint row = token * k + j;
+    if constexpr (ROWS) {
+      row = rows[row];
+    }
+    T weighted = y[row * dim + col] * w;
     acc = weighted + acc;
   }
 
   T g = mlx_sigmoid(gate[token]);
   T gated = g * shared[i];
   out[i] = acc + gated;
+}
+
+template <typename T>
+[[kernel]] void moe_combine(
+    const device T* scores [[buffer(0)]],  // [tokens, k]
+    const device T* y [[buffer(1)]],       // [tokens, k, dim]
+    const device T* gate [[buffer(2)]],    // [tokens, 1]
+    const device T* shared [[buffer(3)]],  // [tokens, dim]
+    device T* out [[buffer(4)]],           // [tokens, dim]
+    const constant uint& k [[buffer(5)]],
+    const constant uint& dim [[buffer(6)]],
+    const constant uint& normalize [[buffer(7)]],
+    uint i [[thread_position_in_grid]]) {
+  moe_combine_impl<T, false>(scores, y, gate, shared, nullptr, out, k, dim, normalize, i);
+}
+
+// The same tail, reading `y` where the expert gemm left it.
+//
+// The sorted path used to put `y` back in token order first: `unsort_rows`,
+// a whole pass over 67 MB read and 67 MB written a layer, **78 ms of a
+// prefill chunk** (`REBUILD.md` Phase 35). Nothing downstream needs that
+// copy -- this kernel is the only consumer, it already indexes `y` a row at
+// a time, and the permutation is a u32 a row. So it takes the permutation.
+//
+// Bit-identical, and for the reason that matters in a reduction: `j` still
+// ascends, each step still folds one whole expert row of the same numbers
+// into a bfloat16 accumulator, and only the *address* of that row moves.
+// The one thing that would break it is reordering `j`, which nothing here
+// does.
+template <typename T>
+[[kernel]] void moe_combine_rows(
+    const device T* scores [[buffer(0)]],      // [tokens, k]
+    const device T* y [[buffer(1)]],           // [tokens * k, dim], sorted
+    const device T* gate [[buffer(2)]],        // [tokens, 1]
+    const device T* shared [[buffer(3)]],      // [tokens, dim]
+    const device uint32_t* rows [[buffer(4)]], // [tokens, k] -> row of `y`
+    device T* out [[buffer(5)]],               // [tokens, dim]
+    const constant uint& k [[buffer(6)]],
+    const constant uint& dim [[buffer(7)]],
+    const constant uint& normalize [[buffer(8)]],
+    uint i [[thread_position_in_grid]]) {
+  moe_combine_impl<T, true>(scores, y, gate, shared, rows, out, k, dim, normalize, i);
 }
 
 // A stable counting sort of the expert indices, producing the same permutation
@@ -337,9 +466,12 @@ template <typename T>
   instantiate_kernel("take_along_last_" #tname, take_along_last, type) \
   instantiate_kernel("div_by_row_" #tname, div_by_row, type)           \
   instantiate_kernel("gather_rows_div_" #tname, gather_rows_div, type) \
+  instantiate_kernel("gather_rows_div_wide_" #tname, gather_rows_div_wide, type) \
   instantiate_kernel("unsort_rows_" #tname, unsort_rows, type)         \
+  instantiate_kernel("unsort_rows_wide_" #tname, unsort_rows_wide, type) \
   instantiate_kernel("mul_by_row_" #tname, mul_by_row, type)           \
-  instantiate_kernel("moe_combine_" #tname, moe_combine, type)
+  instantiate_kernel("moe_combine_" #tname, moe_combine, type)               \
+  instantiate_kernel("moe_combine_rows_" #tname, moe_combine_rows, type)
 
 instantiate_moe(bfloat16, bfloat16_t)
 instantiate_moe(float32, float)

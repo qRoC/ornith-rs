@@ -507,12 +507,24 @@ pub fn gather_qmm_rows(
     // `GatherQMM::eval_gpu`, in order: the rhs-sorted batched path first, then
     // the matrix path, then the vector path. M is 1 here, so the matrix path
     // (M >= vector_limit) is unreachable.
-    if rows >= 16 && sorted && rows / experts >= 4 && !invariant::all() {
+    if takes_rhs_path(rows, experts, sorted) {
         gather_qmm_rhs(ctx, x, qw, rhs_indices, &out, rows, n, k);
     } else {
         gather_qmv(ctx, x, qw, lhs_indices, rhs_indices, &out, n, k);
     }
     out
+}
+
+/// Which of the two branches [`gather_qmm_rows`] takes, asked separately.
+///
+/// It is the caller's question as much as the dispatcher's: the rhs-sorted
+/// kernel **has no `lhs_indices`**. `gather_qmm_rhs` reads row `r` of `x` for
+/// output row `r` and nothing else, which is why mlx-lm gathers the
+/// activations into expert order before calling it. The vector path does
+/// index, so on that branch the caller may hand over a permutation instead of
+/// a copy. See [`crate::ops::linear::Linear::gather_reads_lhs`].
+pub fn takes_rhs_path(rows: usize, experts: usize, sorted: bool) -> bool {
+    rows >= 16 && sorted && rows / experts >= 4 && !invariant::all()
 }
 
 /// `gather_qmv` / `gather_qmv_fast`: one output row per (token, expert) pair.

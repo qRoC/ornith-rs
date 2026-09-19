@@ -348,6 +348,58 @@ fn the_routed_gemm_picks_the_right_experts() {
     assert!(d.max_rel <= ONE_HOT_MAX_REL, "routed gemm one-hot: {d}");
 }
 
+/// The activation gather the MoE block used to do is the gemm's own indexing.
+///
+/// `switch_glu_rows` hands this kernel `x` and the permutation where it used
+/// to hand it `x[order]` and the identity -- which removes a 67 MB copy a
+/// layer at a prefill chunk (`REBUILD.md` Phase 36). The two are the same
+/// tile loading the same row of the same numbers against the same weights,
+/// so the test is `max_abs == 0.0` and not a tolerance: nothing here may
+/// reassociate, and the one failure this shape can have -- a row read from
+/// the wrong place -- is not small.
+#[test]
+fn indexing_the_rows_is_gathering_them() {
+    let Some(case) = RefCase::open_or_skip("q6k") else { return };
+    if !case.has("moes_x") {
+        eprintln!("skipping: the reference predates the gemm; rerun dump_q6k.py");
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    let w = KMatrix::new(
+        KQuant::Q6K,
+        case.array(&ctx, "moe_qs"),
+        case.array(&ctx, "moe_scales"),
+        case.array(&ctx, "moe_dm"),
+    );
+    let cols = case.meta_usize("moe_cols");
+    let n = case.meta_usize("moes_n");
+    let x = case.array(&ctx, "moes_x");
+    let lhs = case.array(&ctx, "moes_lhs");
+    let rhs = case.array(&ctx, "moes_rhs");
+
+    // `xs[r] = x[lhs[r]]`, which is what `gather_rows_div` wrote. bf16 to f32
+    // and back is exact, so the copy is the copy.
+    let lhs_ids = case.get("moes_lhs").to_u32();
+    let xh = x.to_vec_f32(&ctx);
+    let mut gathered = Vec::with_capacity(n * cols);
+    for r in 0..n {
+        let src = lhs_ids[r] as usize * cols;
+        gathered.extend_from_slice(&xh[src..src + cols]);
+    }
+    let xs = match x.dtype {
+        Dtype::BF16 => Array::from_f32_as_bf16(&ctx, &gathered, &[n, cols]),
+        _ => Array::from_f32(&ctx, &gathered, &[n, cols]),
+    };
+    let ident: Vec<u32> = (0..n as u32).collect();
+    let ident = Array::from_slice(&ctx, &ident, &[n], Dtype::U32);
+
+    let copied = gather_qmm_t(&ctx, &xs, &w, &ident, &rhs).to_vec_f32(&ctx);
+    let indexed = gather_qmm_t(&ctx, &x, &w, &lhs, &rhs).to_vec_f32(&ctx);
+    let d = compare(&indexed, &copied);
+    eprintln!("routed gemm, {n} rows indexed against gathered: {d}");
+    assert_eq!(d.max_abs, 0.0, "indexing the rows is not gathering them: {d}");
+}
+
 /// Unsorted rows are slower, not wrong -- see `tests/q4k.rs`.
 #[test]
 fn the_routed_gemm_does_not_need_sorted_rows() {

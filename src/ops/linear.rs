@@ -78,6 +78,24 @@ impl Linear {
         }
     }
 
+    /// Whether [`Self::gather_matmul`] will read `lhs_indices` for a call of
+    /// this shape -- i.e. whether the caller may pass the permutation and
+    /// keep its activations where they are, instead of gathering them into
+    /// expert order first.
+    ///
+    /// The two families answer differently and that is the whole point of
+    /// asking. mlx's sorted kernel, `gather_qmm_rhs`, takes no index array
+    /// for the left side at all: it reads row `r` of `x` for output row `r`,
+    /// so a sorted call on an mlx-mode weight needs the copy. The k-quant
+    /// tile indexes every row it loads (`kquant_mm_tile`'s `GATHER`), so it
+    /// never does.
+    pub fn gather_reads_lhs(&self, rows: usize, sorted: bool) -> bool {
+        match self {
+            Linear::Mlx(q) => !crate::ops::quantized::takes_rhs_path(rows, q.num_experts(), sorted),
+            Linear::K(_) => true,
+        }
+    }
+
     /// Experts for a routed weight, else 1.
     pub fn num_experts(&self) -> usize {
         match self {

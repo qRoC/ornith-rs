@@ -190,6 +190,10 @@ pub fn switch_glu(
 
 /// `force_sort` overrides mlx-lm's threshold; sorting is a permutation, so it
 /// must not change the result, which makes this a useful cross-check.
+///
+/// Returns `[tokens, k, dim]` in token order, which is what mlx-lm's
+/// `SwitchGLU` returns. The block itself takes [`switch_glu_rows`] instead
+/// and skips the pass that puts it back.
 pub fn switch_glu_sorted(
     ctx: &Context,
     x: &Array,
@@ -199,6 +203,65 @@ pub fn switch_glu_sorted(
     down_proj: &Linear,
     force_sort: Option<bool>,
 ) -> Array {
+    let (tokens, k) = (x.shape[0], inds.shape[1]);
+    let (y, rows) = switch_glu_rows(ctx, x, inds, gate_proj, up_proj, down_proj, force_sort);
+    let dim = y.shape[1];
+    match rows {
+        Some(inv) => unsort_rows(ctx, &y, &inv).reshape(&[tokens, k, dim]),
+        None => y.reshape(&[tokens, k, dim]),
+    }
+}
+
+/// The experts' outputs as `[tokens * k, dim]`, and -- when they are left in
+/// expert-sorted order -- the row of them each `(token, j)` pair landed in.
+///
+/// mlx-lm's `_gather_sort` / `_scatter_unsort` are a pair of copies that
+/// exist only to put rows where the next kernel expects them. At a decode
+/// step the sorted path is not taken at all; at a prefill chunk of 2048 the
+/// inventory read them at 71.7 ms and 78.9 ms over 40 layers, **~10% of the
+/// chunk**. Neither consumer needs its copy:
+///
+///   * the gathered matmul already reads its activations through
+///     `lhs_indices` -- that is `mx.gather_qmm`'s contract, and the
+///     *unsorted* branch below is built on it -- so where that holds it can
+///     take `x` and the permutation in place of a gathered `xs`;
+///   * the only consumer of the unsorted output is the block's tail, which
+///     indexes `y` a row at a time anyway, so it can take the inverse
+///     permutation in place of a permuted `y`.
+///
+/// Both are addressing and not arithmetic: the same rows meet the same
+/// weights, and the tail folds the same `k` rows in the same order. So both
+/// are bit-exact and what moves is the cache. `ORNITH_FUSE_MOE_GATHER=0` and
+/// `ORNITH_FUSE_MOE_UNSORT=0` are the controls.
+///
+/// **And that 10% is mostly not what this removes.** Against the copies as
+/// they were -- one element a thread -- removing them read -8.3% of a
+/// chunk; against the same copies at sixteen bytes a thread it reads
+/// **-0.6%, 7 of 8 pairs down** (`REBUILD.md` Phase 36). The kernels were
+/// moving 67 and 134 MB at 38 and 69 GB/s on a machine that does 465, and
+/// most of what the inventory was pointing at was their access width and
+/// not their existence. See [`gather_rows`]. This is kept because it is
+/// strictly less work and consistently signed, not because it is the large
+/// half -- and because a control has to be the best version of what it
+/// replaces, the number above is the one against the wide copy.
+///
+/// **The front one has a precondition the back one does not**, and it is
+/// worth naming because `gather_matmul` hides it: mlx's sorted kernel,
+/// `gather_qmm_rhs`, takes no `lhs_indices` at all. It reads row `r` of `x`
+/// for output row `r`, which is exactly why mlx-lm gathers first. So on an
+/// artifact whose experts are one of mlx's modes the copy stays, and on one
+/// whose experts are k-quants it goes, because `kquant_mm_tile` indexes
+/// every row it loads. [`Linear::gather_reads_lhs`] is that asked of the
+/// weight rather than assumed of the call.
+pub fn switch_glu_rows(
+    ctx: &Context,
+    x: &Array,
+    inds: &Array,
+    gate_proj: &Linear,
+    up_proj: &Linear,
+    down_proj: &Linear,
+    force_sort: Option<bool>,
+) -> (Array, Option<Array>) {
     let tokens = x.shape[0];
     let dim = x.shape[1];
     let k = inds.shape[1];
@@ -208,68 +271,132 @@ pub fn switch_glu_sorted(
     // dominate: `do_sort = indices.size >= 64`.
     let do_sort = force_sort.unwrap_or(rows >= 64);
 
-    let (xs, idx, inv_order) = if do_sort {
-        let (order, inv_order) = counting_sort(ctx, inds, gate_proj.num_experts());
-        let xs = Array::empty(ctx, &[rows, dim], x.dtype);
-        let (grid, tg) = flat(rows * dim);
-        ctx.kernel(&format!("gather_rows_div_{}", tname(x.dtype)))
-            .arr(x)
-            .arr(&order)
-            .out(&xs)
-            .bytes(&(dim as u32))
-            .bytes(&(k as u32))
-            .threads(grid, tg);
-
-        let idx = Array::empty(ctx, &[rows], Dtype::U32);
-        let (g2, t2) = flat(rows);
-        ctx.kernel("gather_u32").arr(inds).arr(&order).out(&idx).threads(g2, t2);
-        (xs, idx, Some(inv_order))
-    } else {
+    if !do_sort {
         // Unsorted: each token's row is reused for all k experts, which the
         // kernel expresses through `lhs_indices`.
-        (x.clone(), inds.reshape(&[rows]), None)
-    };
+        let lhs: Vec<u32> = (0..rows as u32).map(|i| i / k as u32).collect();
+        let lhs_indices = Array::from_slice(ctx, &lhs, &[rows], Dtype::U32);
+        let idx = inds.reshape(&[rows]);
+        return (glu(ctx, x, &lhs_indices, &idx, gate_proj, up_proj, down_proj, false), None);
+    }
 
-    // lhs_indices: which row of `xs` each output row reads. Sorted rows are
-    // already one-to-one; unsorted ones repeat each token k times.
-    let lhs: Vec<u32> = if do_sort {
-        (0..rows as u32).collect()
+    let (order, inv_order) = counting_sort(ctx, inds, gate_proj.num_experts());
+
+    // `idx` is the expert each sorted row goes to, `src` the row of `x` it
+    // reads. One dispatch for the pair, and it is the same one either way:
+    // see `gather_expert_rows` in kernels/moe.metal.
+    let idx = Array::empty(ctx, &[rows], Dtype::U32);
+    let src = Array::empty(ctx, &[rows], Dtype::U32);
+    let (g2, t2) = flat(rows);
+    ctx.kernel("gather_expert_rows")
+        .arr(inds)
+        .arr(&order)
+        .out(&idx)
+        .out(&src)
+        .bytes(&(k as u32))
+        .threads(g2, t2);
+
+    let indexed = fuse_moe_gather()
+        && up_proj.gather_reads_lhs(rows, true)
+        && gate_proj.gather_reads_lhs(rows, true);
+
+    let y = if indexed {
+        glu(ctx, x, &src, &idx, gate_proj, up_proj, down_proj, true)
     } else {
-        (0..rows as u32).map(|i| i / k as u32).collect()
+        let xs = Array::empty(ctx, &[rows, dim], x.dtype);
+        gather_rows(ctx, x, &order, &xs, dim, k);
+        // Sorted rows are one-to-one with the gathered copy.
+        let identity: Vec<u32> = (0..rows as u32).collect();
+        let lhs_indices = Array::from_slice(ctx, &identity, &[rows], Dtype::U32);
+        glu(ctx, &xs, &lhs_indices, &idx, gate_proj, up_proj, down_proj, true)
     };
-    let lhs_indices = Array::from_slice(ctx, &lhs, &[rows], Dtype::U32);
 
-    let x_up = up_proj.gather_matmul(ctx, &xs, &lhs_indices, &idx, do_sort);
-    let x_gate = gate_proj.gather_matmul(ctx, &xs, &lhs_indices, &idx, do_sort);
+    if fuse_moe_unsort() { (y, Some(inv_order)) } else { (unsort_rows(ctx, &y, &inv_order), None) }
+}
+
+/// The three projections and the activation between them, over whatever rows
+/// `lhs` and `idx` name.
+fn glu(
+    ctx: &Context,
+    x: &Array,
+    lhs: &Array,
+    idx: &Array,
+    gate_proj: &Linear,
+    up_proj: &Linear,
+    down_proj: &Linear,
+    sorted: bool,
+) -> Array {
+    let rows = idx.numel();
+    let x_up = up_proj.gather_matmul(ctx, x, lhs, idx, sorted);
+    let x_gate = gate_proj.gather_matmul(ctx, x, lhs, idx, sorted);
     let act = super::elementwise::swiglu(ctx, &x_gate, &x_up);
     // down_proj consumes the activation row-for-row, so its lhs indices are
     // the identity regardless of sorting.
     let identity: Vec<u32> = (0..rows as u32).collect();
     let lhs_down = Array::from_slice(ctx, &identity, &[rows], Dtype::U32);
-    let y = down_proj.gather_matmul(ctx, &act, &lhs_down, &idx, do_sort);
-
-    match inv_order {
-        Some(inv) => {
-            let out = Array::empty(ctx, &[rows, dim], y.dtype);
-            let (grid, tg) = flat(rows * dim);
-            ctx.kernel(&format!("unsort_rows_{}", tname(y.dtype)))
-                .arr(&y)
-                .arr(&inv)
-                .out(&out)
-                .bytes(&(dim as u32))
-                .threads(grid, tg);
-            out.reshape(&[tokens, k, dim])
-        }
-        None => y.reshape(&[tokens, k, dim]),
-    }
+    down_proj.gather_matmul(ctx, &act, &lhs_down, idx, sorted)
 }
 
-/// Exposed for the unsort debug test.
-pub fn unsort_for_test(ctx: &Context, y: &Array, inv: &Array) -> Array {
+/// `xs[r] = x[order[r] / k]`: mlx-lm's `_gather_sort`, a whole pass over `x`.
+///
+/// Two kernels for one copy, and the difference between them is only how
+/// many bytes a thread moves. One element a thread is 33.5M threads and 67
+/// MB at a prefill chunk, and it measured **38 GB/s** against this
+/// machine's 465; sixteen bytes a thread is the same copy at an access
+/// width the machine is built for, and it was worth **-4.6% of a 6621-token
+/// prompt, 3 of 3 down** -- four times what removing the copy outright is
+/// worth. Nothing about this kernel is scattered enough to explain 38 GB/s:
+/// consecutive threadgroups walk one row. The width was the whole of it.
+/// A row has to be a whole number of vectors for the wide form, which every
+/// hidden size in this model is, and `ORNITH_MOE_GATHER_WIDE=0` is the
+/// control -- which also picks the width of [`unsort_rows`], since the two
+/// are one question. Bit-exact either way: it is a copy, and neither form
+/// touches a value.
+fn gather_rows(ctx: &Context, x: &Array, order: &Array, xs: &Array, dim: usize, k: usize) {
+    let lanes = 16 / x.dtype.size();
+    let wide = gather_wide() && lanes > 0 && dim % lanes == 0;
+    let n = if wide { xs.numel() / lanes } else { xs.numel() };
+    let (grid, tg) = flat(n);
+    let name = if wide { "gather_rows_div_wide" } else { "gather_rows_div" };
+    ctx.kernel(&format!("{name}_{}", tname(x.dtype)))
+        .arr(x)
+        .arr(order)
+        .out(xs)
+        .bytes(&(dim as u32))
+        .bytes(&(k as u32))
+        .threads(grid, tg);
+}
+
+/// Whether the gather moves sixteen bytes a thread. See [`gather_rows`].
+static GATHER_WIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static GATHER_WIDE_ENV: std::sync::Once = std::sync::Once::new();
+
+fn gather_wide() -> bool {
+    GATHER_WIDE_ENV.call_once(|| {
+        if std::env::var("ORNITH_MOE_GATHER_WIDE").as_deref() == Ok("0") {
+            GATHER_WIDE.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    GATHER_WIDE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the wide gather on or off at runtime; returns what it was.
+pub fn set_gather_wide(on: bool) -> bool {
+    let was = gather_wide();
+    GATHER_WIDE.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
+}
+
+/// `y[inv_order]`: mlx-lm's `_scatter_unsort`, a whole pass over `y`.
+fn unsort_rows(ctx: &Context, y: &Array, inv: &Array) -> Array {
     let (rows, dim) = (y.shape[0], y.shape[1]);
-    let out = Array::empty(ctx, &y.shape, y.dtype);
-    let (grid, tg) = flat(rows * dim);
-    ctx.kernel(&format!("unsort_rows_{}", tname(y.dtype)))
+    let out = Array::empty(ctx, &[rows, dim], y.dtype);
+    let lanes = 16 / y.dtype.size();
+    let wide = gather_wide() && lanes > 0 && dim % lanes == 0;
+    let n = if wide { out.numel() / lanes } else { out.numel() };
+    let (grid, tg) = flat(n);
+    let name = if wide { "unsort_rows_wide" } else { "unsort_rows" };
+    ctx.kernel(&format!("{name}_{}", tname(y.dtype)))
         .arr(y)
         .arr(inv)
         .out(&out)
@@ -278,19 +405,17 @@ pub fn unsort_for_test(ctx: &Context, y: &Array, inv: &Array) -> Array {
     out
 }
 
+/// Exposed for the unsort debug test.
+pub fn unsort_for_test(ctx: &Context, y: &Array, inv: &Array) -> Array {
+    unsort_rows(ctx, y, inv)
+}
+
 /// Exposed for the gather debug test.
 pub fn gather_rows_for_test(ctx: &Context, x: &Array, order: &Array, k: usize) -> Array {
     let rows = order.numel();
     let dim = x.shape[1];
     let xs = Array::empty(ctx, &[rows, dim], x.dtype);
-    let (grid, tg) = flat(rows * dim);
-    ctx.kernel(&format!("gather_rows_div_{}", tname(x.dtype)))
-        .arr(x)
-        .arr(order)
-        .out(&xs)
-        .bytes(&(dim as u32))
-        .bytes(&(k as u32))
-        .threads(grid, tg);
+    gather_rows(ctx, x, order, &xs, dim, k);
     xs
 }
 
@@ -387,40 +512,103 @@ pub fn set_parallel_sort(on: bool) -> bool {
 /// what had to be reproduced to keep it bit-exact -- both sums accumulate in
 /// bfloat16, in ascending order, because that is what mlx's `Sum` does.
 ///
-/// `ORNITH_FUSE_MOE_TAIL=0` issues the six separately, as the control.
+/// `rows` is [`switch_glu_rows`]'s permutation when the expert outputs were
+/// left in expert order, and `None` when `y` is already `[tokens, k, dim]`.
+/// Taking it here is what removes `unsort_rows` -- see the kernel comment.
+///
+/// `ORNITH_FUSE_MOE_TAIL=0` issues the six separately, as the control. Those
+/// six are mlx's own ops and read `y` in token order, so under that control
+/// the copy comes back: a control has to compute the same thing.
 pub fn combine(
     ctx: &Context,
     scores: &Array,
     y: &Array,
+    rows: Option<&Array>,
     gate: &Array,
     shared: &Array,
     normalize: bool,
 ) -> Array {
-    assert_eq!(y.ndim(), 3, "expert outputs are [tokens, k, dim]");
-    let (tokens, k, dim) = (y.shape[0], y.shape[1], y.shape[2]);
-    assert_eq!(shared.numel(), tokens * dim, "the shared expert is one row a token");
+    let k = scores.dim(-1);
+    let tokens = scores.numel() / k;
     assert_eq!(gate.numel(), tokens, "the shared expert's gate is one number a token");
+    let dim = shared.numel() / tokens;
+    assert_eq!(shared.numel(), tokens * dim, "the shared expert is one row a token");
+    assert_eq!(y.numel(), tokens * k * dim, "expert outputs are k rows a token");
+    if let Some(r) = rows {
+        assert_eq!(r.numel(), tokens * k, "one row of `y` per (token, expert) pair");
+    }
 
     if !fuse_moe_tail() {
+        let y = match rows {
+            Some(r) => unsort_rows(ctx, &y.reshape(&[tokens * k, dim]), r),
+            None => y.clone(),
+        };
+        let y = y.reshape(&[tokens, k, dim]);
         let scores = if normalize { normalize_scores(ctx, scores) } else { scores.clone() };
-        let mixed = mix_experts(ctx, y, &scores);
+        let mixed = mix_experts(ctx, &y, &scores);
         let gated = super::elementwise::sigmoid_gate(ctx, gate, shared);
         return super::elementwise::add(ctx, &mixed, &gated);
     }
 
     let out = Array::empty(ctx, &[tokens, dim], y.dtype);
     let (grid, tg) = flat(tokens * dim);
-    ctx.kernel(&format!("moe_combine_{}", tname(y.dtype)))
-        .arr(scores)
-        .arr(y)
-        .arr(gate)
-        .arr(shared)
-        .out(&out)
+    let name = match rows {
+        Some(_) => format!("moe_combine_rows_{}", tname(y.dtype)),
+        None => format!("moe_combine_{}", tname(y.dtype)),
+    };
+    let d = ctx.kernel(&name).arr(scores).arr(y).arr(gate).arr(shared);
+    let d = match rows {
+        Some(r) => d.arr(r),
+        None => d,
+    };
+    d.out(&out)
         .bytes(&(k as u32))
         .bytes(&(dim as u32))
         .bytes(&(normalize as u32))
         .threads(grid, tg);
     out
+}
+
+/// Whether the expert gemm reads `x` through the permutation or a gathered
+/// copy of it. See [`switch_glu_rows`].
+static FUSE_MOE_GATHER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static FUSE_MOE_GATHER_ENV: std::sync::Once = std::sync::Once::new();
+
+fn fuse_moe_gather() -> bool {
+    FUSE_MOE_GATHER_ENV.call_once(|| {
+        if std::env::var("ORNITH_FUSE_MOE_GATHER").as_deref() == Ok("0") {
+            FUSE_MOE_GATHER.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    FUSE_MOE_GATHER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the indexed gather on or off at runtime; returns what it was.
+pub fn set_fuse_moe_gather(on: bool) -> bool {
+    let was = fuse_moe_gather();
+    FUSE_MOE_GATHER.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
+}
+
+/// Whether the block's tail reads `y` through the permutation or a
+/// reordered copy of it. See [`switch_glu_rows`].
+static FUSE_MOE_UNSORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static FUSE_MOE_UNSORT_ENV: std::sync::Once = std::sync::Once::new();
+
+fn fuse_moe_unsort() -> bool {
+    FUSE_MOE_UNSORT_ENV.call_once(|| {
+        if std::env::var("ORNITH_FUSE_MOE_UNSORT").as_deref() == Ok("0") {
+            FUSE_MOE_UNSORT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    FUSE_MOE_UNSORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the indexed tail on or off at runtime; returns what it was.
+pub fn set_fuse_moe_unsort(on: bool) -> bool {
+    let was = fuse_moe_unsort();
+    FUSE_MOE_UNSORT.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
 }
 
 /// Whether the block's tail is one dispatch or six. See [`combine`].
@@ -499,7 +687,7 @@ pub fn sparse_moe_block(
         gate_scalar = Some(shared_expert_gate.matmul(ctx, &x2));
     }
 
-    let y = switch_glu(ctx, &x2, &inds, switch_gate, switch_up, switch_down);
+    let (y, rows) = switch_glu_rows(ctx, &x2, &inds, switch_gate, switch_up, switch_down, None);
 
     // Position 2, measured and rejected. Fusing the tail (Phase 32) took
     // `sigmoid_gate` out of the epoch that used to cover position 1, and
@@ -514,8 +702,15 @@ pub fn sparse_moe_block(
         gate_scalar = Some(shared_expert_gate.matmul(ctx, &x2));
     }
 
-    let out =
-        combine(ctx, &scores, &y, gate_scalar.as_ref().unwrap(), &shared_y, norm_topk_prob);
+    let out = combine(
+        ctx,
+        &scores,
+        &y,
+        rows.as_ref(),
+        gate_scalar.as_ref().unwrap(),
+        &shared_y,
+        norm_topk_prob,
+    );
     out.reshape(&x.shape)
 }
 
@@ -711,6 +906,6 @@ pub fn sparse_moe_block_dense(
     let shared_y = matmul(ctx, &sact, shared_down, true);
     let gate_scalar = matmul(ctx, &x2, shared_expert_gate, true);
 
-    let out = combine(ctx, &scores, &y, &gate_scalar, &shared_y, norm_topk_prob);
+    let out = combine(ctx, &scores, &y, None, &gate_scalar, &shared_y, norm_topk_prob);
     out.reshape(&x.shape)
 }

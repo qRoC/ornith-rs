@@ -147,6 +147,78 @@ fn mixture_and_shared_expert_match_mlx() {
     }
 }
 
+/// The two copies the sorted path used to make, against the indexing that
+/// replaced them.
+///
+/// `gather_rows_div` and `unsort_rows` put rows where the next kernel
+/// expected them; the gemm and the block's tail both index, so both copies
+/// are gone (`REBUILD.md` Phase 36). The claim is not that the answers are
+/// close. The same rows meet the same weights and the tail folds the same
+/// `k` of them in the same order, so all four combinations of the two
+/// controls have to reproduce mlx **exactly**, and a tolerance here would
+/// hide the one mistake this can make -- an off-by-one in a permutation,
+/// which moves a whole row and nothing else.
+#[test]
+fn the_indexed_moe_block_is_the_copied_one() {
+    let Some(case) = RefCase::open_or_skip("moe") else { return };
+    let dir = model_dir();
+    if !dir.exists() {
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    let mut ws = WeightStore::open(&dir, &[]).unwrap();
+    let gate = ws.linear(&ctx, &format!("{P}.gate"));
+    let sg = ws.linear(&ctx, &format!("{P}.switch_mlp.gate_proj"));
+    let su = ws.linear(&ctx, &format!("{P}.switch_mlp.up_proj"));
+    let sd = ws.linear(&ctx, &format!("{P}.switch_mlp.down_proj"));
+    let hg = ws.linear(&ctx, &format!("{P}.shared_expert.gate_proj"));
+    let hu = ws.linear(&ctx, &format!("{P}.shared_expert.up_proj"));
+    let hd = ws.linear(&ctx, &format!("{P}.shared_expert.down_proj"));
+    let seg = ws.linear(&ctx, &format!("{P}.shared_expert_gate"));
+    let k = case.meta_usize("top_k");
+
+    // Only the sorted widths exercise either of them, and only a weight
+    // whose gathered matmul reads `lhs_indices` exercises the front one --
+    // which mlx's own sorted kernel does not. Say which artifact this is, so
+    // a green run on an affine one is not read as covering both.
+    let sorted: Vec<usize> = TS.iter().copied().filter(|t| t * k >= 64).collect();
+    for &t in &sorted {
+        eprintln!(
+            "T={t}: the expert gemm {} lhs_indices on this artifact",
+            if sg.gather_reads_lhs(t * k, true) { "reads" } else { "ignores" },
+        );
+    }
+
+    for &t in &sorted {
+        let x = case.array(&ctx, &format!("x_t{t}"));
+        let want = case.f32(&format!("out_t{t}"));
+        for gather in [true, false] {
+            for unsort in [true, false] {
+                // And the two widths of the copy that is left when the
+                // front is not indexed -- one element a thread and sixteen
+                // bytes a thread. A copy may not round anything, so this
+                // belongs under the same `max_abs == 0.0`.
+                for wide in [true, false] {
+                    ornith_rs::ops::moe::set_fuse_moe_gather(gather);
+                    ornith_rs::ops::moe::set_fuse_moe_unsort(unsort);
+                    ornith_rs::ops::moe::set_gather_wide(wide);
+                    let out = sparse_moe_block(
+                        &ctx, &x, &gate, &sg, &su, &sd, &hg, &hu, &hd, &seg, k, true,
+                    );
+                    exact(
+                        &format!("moe block T={t} gather={gather} unsort={unsort} wide={wide}"),
+                        &out.to_vec_f32(&ctx),
+                        &want,
+                    );
+                }
+            }
+        }
+    }
+    ornith_rs::ops::moe::set_fuse_moe_gather(true);
+    ornith_rs::ops::moe::set_fuse_moe_unsort(true);
+    ornith_rs::ops::moe::set_gather_wide(true);
+}
+
 /// The expert-sort permutation against mlx's `_gather_sort`.
 #[test]
 fn sort_permutation_matches_mlx() {
