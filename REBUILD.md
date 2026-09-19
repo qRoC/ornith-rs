@@ -4176,13 +4176,31 @@ neighbour's VM at 350% CPU, so read the ranks and not the levels:
     q6k dense mat-vec           2.136       2.529      **1.839**
     q4k dense mat-vec           5.959     **5.228**      5.406
 
-The magnitudes are a different question from the ranks and this machine could
-not answer it that hour: `--mtp-depth 1 --frspec` read 7.78 GPU ms a token
-against the 6.78 of an hour before, with both kernels inside the noise of each
-other. The `-2.8%` and `-5.0%` above stand as measured on 26.3 on a quieter
-machine, and they are the numbers to re-take first if this phase is ever
-doubted. `target/kernels-xcode26.3.metallib` is the old compiler's output,
-kept for exactly that comparison.
+Re-taken once the neighbour's VM stopped (`busy 0%`), three interleaved draws
+a cell, the acceptance identical throughout:
+
+    GPU ms a token, Xcode 27.0     a row each          this phase
+    --mtp-depth 1 --frspec      7.45/7.38/7.47   **7.16/7.35/7.17**   -2.7%
+    --mtp-depth 3 --frspec           9.33            **9.04**         -3.1%
+
+    per kernel, width-4 verify   a row each   one read   + unpacked once
+    q6k dense mat-vec              2.123       2.532      **1.686**
+    q4k dense mat-vec              5.514     **5.423**      5.556
+
+**-2.7% against 26.3's -2.8%, and the per-kernel table lands on 26.3's within
+2%.** So the compiler moved nothing, which is worth a line because the *level*
+did move: the same configuration read 6.79 GPU ms a token this morning and
+7.4 in the afternoon, on an idle machine both times.
+
+That looked like a 9% compiler regression until it was controlled, and the
+control is cheap enough to be the rule rather than the exception:
+`target/kernels-xcode26.3.metallib` is the old compiler's output, and
+`include_bytes!` means swapping that one file and relinking gives **the same
+Rust binary over two metallibs**. On the machine as it stood in the afternoon,
+26.3's kernels read **7.44 / 7.30 / 7.65** against 27.0's **7.45 / 7.38 /
+7.47**. The toolchain is the same speed; the machine is not the same machine
+it was three hours earlier. This is the third time in this rebuild that a
+level moved between sittings while every ratio inside a sitting held.
 
 ### The lesson, and it is Phase 27's own, one level down
 
