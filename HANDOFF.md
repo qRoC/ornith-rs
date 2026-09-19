@@ -2740,8 +2740,8 @@ reads much more invitingly than it should.
   both of those copies back to one element a thread** -- which is the
   control that has to be *off* for the other two to be ranked against
   anything but a kernel's access width (`REBUILD.md` Phase 36).
-  `step_inventory` A/Bs all of them in one process, and it has two
-  single-cell modes for the reason prefill's thermal drift gives -- a cell
+  `step_inventory` A/Bs all of them in one process, and it has **three
+  single-cell modes** for the reason prefill's thermal drift gives -- a cell
   placed eleventh is measured in a state the first one was not:
   `step_inventory prefill only` runs the Phase 36 gather/unsort cell alone
   with eight interleaved pairs and stops, and `step_inventory prefill

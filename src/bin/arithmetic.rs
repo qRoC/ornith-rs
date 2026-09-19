@@ -6,7 +6,8 @@
 //! about prefill is an arithmetic question, and the arithmetic side had no
 //! such ceiling at all. This is that sibling.
 //!
-//! Three things, in the order that makes each one interpretable:
+//! Six things, in the order that makes each one interpretable -- the first
+//! three are the ceiling, the last three are what it was built to ask:
 //!
 //!   1. **the scalar ALUs**, swept over how many independent FMA chains a
 //!      thread carries. A dependent chain measures FMA *latency*; the sweep
@@ -19,9 +20,18 @@
 //!      the real kernel -- if the two differ here and not there, the real
 //!      kernel is not matrix-unit-bound, and that is a finding;
 //!   3. **the real kernels at prefill shapes** against that ceiling, with a
-//!      dense bf16 gemm at the identical shape beside them. The gap between
-//!      the dense gemm and the quantized one at the same M, N, K is the
-//!      price of the format, paid in arithmetic rather than in bytes.
+//!      dense bf16 gemm at the identical shape beside them;
+//!   4. **the routed gemm's eight points**, one term at a time -- `N`,
+//!      routing, the weight footprint, the tile width -- because a ratio
+//!      between two cells that differ in four ways is evidence about none
+//!      of them;
+//!   5. **what the unpack itself costs**, against the same tile with only
+//!      its arithmetic removed (`Q4KBareFmt`) and against mlx's own
+//!      quantized gemm. The gap in (3) is *not* the price of the format,
+//!      and this is what says so;
+//!   6. **the elementwise kernels' access width**, measured here rather
+//!      than at a chunk because the chunk cell's own noise is larger than
+//!      the effect.
 //!
 //! No model load: the weights are random bytes, because these kernels' time
 //! depends on their shapes and not on their values (`bin/kquant_mm` makes the

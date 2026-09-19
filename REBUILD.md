@@ -6100,6 +6100,12 @@ all of them the way Phase 36 widened the copies might return ~2% of a
 chunk. Everything else is already at the ceiling: `add_rms` 425 GB/s,
 `block_softmax` 404, `gdn_front` 298.
 
+(**Three of those four were then widened in Phase 37** -- `swiglu`,
+`sigmoid_gate` and `slice_inner`, 2.7-5.5x each and all now at 430-504
+GB/s, 17.8 ms a chunk. The estimate above was ~2% and the measurement is
+~1.4%. The two transposes are what is left, and they are not a width
+change.)
+
 The direct old-against-new prompt pair was attempted once and thrown away,
 because the machine went to a load average of 15 with another session's
 Spotlight index and four Python processes on it -- the same control arm
