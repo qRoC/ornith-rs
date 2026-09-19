@@ -1318,6 +1318,11 @@ run the *same* dispatch stream with one term taken out of it.
   their bindings to the tracker -- so barriers, epochs and commits are
   untouched and only the dispatch is gone. Its zero is a pattern that matches
   nothing: 0.02-0.06 ms.
+- `Context::set_neuter_many` takes a **list** of patterns, which is how a
+  whole chain of kernels is priced at once rather than one class at a time --
+  see "The boundary of the fusion project" below. `Context::prof_dropped`
+  counts what the list actually removed, because a list that matches nothing
+  is a measurement of nothing and reads as a boundary of zero.
 - `cargo run --release --bin step_inventory` joins `ORNITH_COMMIT_EVERY=1`
   per-dispatch times to `ORNITH_TRACE`'s per-dispatch bindings, grids and
   layer markers, so every dispatch in a layer has its bytes, its grid, its
@@ -1352,6 +1357,35 @@ router's argsort the expert gather reads eight experts at random and loses
 0.58 ms. Those need a **stand-in** rather than a hole -- `ORNITH_FAKE_SORT=1`
 writes a valid order cheaply in place of the sort, and the 0.385 ms that
 measured is what justified replacing it.
+
+### The boundary of the fusion project, and what it costs to reach
+
+`REBUILD.md` Phase 32. One class at a time prices one fusion; the whole
+elementwise chain dropped at once prices the *project*, and the two are
+different numbers, because removing one dispatch lets its neighbours overlap
+into the hole and removing all of them cannot.
+
+**The whole chain is 811 of 1505 dispatches and 1.35 ms of a 6.70 ms trunk --
+20%.** That is the ceiling on every fusion that could be written here. Three
+processes, 8 interleaved pairs a cell; the partition into three disjoint
+buckets sums to 92-99% of the whole, which is what says the garbage output
+did not change what the step reads.
+
+**Per dispatch the chain is not uniform, and the category is not the
+object.** `swiglu` is 110 dispatches worth 0.6 us each -- already hidden
+under the expert gathers, so the textbook fusion, an activation into its
+consumer matvec, is the worst-paid one here. `rms` and `add_rms` are worth
+2.5 us each. The MoE block's tail was 240 dispatches worth 1.6 us each, and
+that is the one that got a kernel.
+
+**A fusion returns about half of what removing its dispatches measures.**
+Phase 31's add+rms: 0.068 of 0.145, 47%. Phase 32's `moe_combine`: 0.21 of
+0.375, 56%. Price the next one at half.
+
+**What is left after `moe_combine`**: 611 dispatches and 1.14 ms of ceiling,
+of which the gated-delta chain is 200 and 0.29, and everything a general
+deferred op layer would be for is 361 and 0.63 -- so ~0.3 ms realized, 4.5%
+of the trunk. That is the number the layer has to be worth.
 
 **And `tools/epoch_slack.py` asks the reordering question of every dispatch
 at once**, since the one reorder that paid was found by eye: which dispatches
@@ -1883,14 +1917,19 @@ In order:
      question is not "how many epochs" but "which dispatch is the longest
      thing in its own epoch, and does anything nearby have room for it" --
      which `step_inventory` answers directly and the model cannot.
-   - **The launch floor, which is half the step.** Phase 31: the same
-     dispatch stream with its work clamped away is 46% of a decode step, and
-     what is left runs at the machine's ceiling. The fusions that take it
-     back are worth ~0.85 us a removed dispatch, and the list of what is
-     still fusable -- `rms` into `scalar_mul` and `precise_swiglu`, the
-     router's argsort, the gated-delta chain -- is at the end of `REBUILD.md`
-     Phase 31 with a price against each. Past that the ratio only moves with
-     a decomposition into fewer, longer kernels.
+   - **The launch floor, which is half the step, and now priced whole.**
+     Phase 31: the same dispatch stream with its work clamped away is 46% of
+     a decode step, and what is left runs at the machine's ceiling.
+     **Phase 32 measured the ceiling on taking it back**: the entire
+     elementwise chain gone is 1.35 ms, 20% of the trunk, and one kernel --
+     the MoE block's tail, six dispatches into one -- took 0.21 of it
+     (-200 dispatches, -121 barriers, 126 tok/s). What is left is the
+     gated-delta chain (0.29 ms of ceiling, a rewrite rather than a fusion)
+     and 0.63 ms over `rms`, `add_rms`, `swiglu` and `scalar_mul`, which is
+     what a deferred op layer would be for and comes to ~0.3 ms realized.
+     A fusion returns ~half of what its removal measures, twice measured.
+     Past that the ratio only moves with a decomposition into fewer, longer
+     kernels.
    - **The bytes are spent, but the *rounding* was not, and it paid.**
      `REBUILD.md` Phase 7: GPTQ over the same 91 modules, same bits, same
      coverage, same kernels, **same 2.0761 GB a token and the same 1078-epoch
@@ -2392,6 +2431,17 @@ reads much more invitingly than it should.
   levelises into the fewest epochs the dependencies permit. The barrier and
   epoch counts do not care what else the machine is running -- they are the
   numbers to reach for when it is busy.
+- **Every fusion and every reorder has a control, and they are how a change
+  is ranked against the code it replaced**: `ORNITH_FUSE_ADD_RMS=0` issues
+  the residual add and the norm that reads it separately,
+  `ORNITH_FUSE_MOE_TAIL=0` issues the MoE block's tail as the six dispatches
+  it was, `ORNITH_MOE_GATE_POS=0|1|2` puts the shared expert's gate beside
+  the router, beside the gathers (the default) or after them,
+  `ORNITH_ROUTER_SORT=1` puts mlx's argsort back in place of the selection
+  kernel, and `ORNITH_FAKE_SORT=1` swaps the argsort for a stand-in that
+  keeps its contract and does not sort (**the output is wrong while it is
+  on**; it exists because removal cannot price a dispatch whose output is an
+  address). `step_inventory` A/Bs all of them in one process.
 - `ORNITH_PROF=1` prints the per-token breakdown at the end of a run;
   `ORNITH_COMMIT_EVERY=N` sets the commit size (`N=1` attributes GPU time per
   kernel, and is ~3x slower); `ORNITH_SERIAL=1` puts back the serial encoder

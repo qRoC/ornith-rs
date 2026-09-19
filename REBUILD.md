@@ -4863,6 +4863,199 @@ controls set, and `--mtp --mtp-depth 1 --frspec` byte-identical again.
    the step is 46% before this phase and 46% after it.
 
 
+## Phase 32 -- the elementwise chain priced whole, and the piece worth a kernel -- **DONE**
+
+Phase 31 left a list: twelve classes of dispatch that do no work, each priced
+by removing it on its own, summing to 1.8 ms of a 6.74 ms trunk. It left the
+warning with it -- the sum is not a term of a decomposition, since removing
+one dispatch lets its neighbours overlap into the hole, and the one fusion
+that phase built returned 0.068 of the 0.145 its removal had promised. So the
+list could not answer the question it raised: whether fusing the elementwise
+chain into the matvecs is worth the deferred op layer it would need. The
+number that answers it is the step with the whole chain **gone**, and nobody
+had measured it.
+
+### A list instead of a pattern, and what says the list matched
+
+`Context::set_neuter` took one pattern; `set_neuter_many` takes a list, and
+the encoder drops a dispatch when any of them matches. Twenty lines. One more
+was needed: **`Context::prof_dropped` counts the dispatches a list actually
+removed**, because a list that matches nothing is a measurement of nothing and
+it reads as a boundary of zero. Every run opens with a census, one line a
+pattern, checked against Phase 31's inventory; every cell prints what it took
+out.
+
+Its zero is Phase 31's zero: a pattern matching no kernel, **-0.023, -0.014,
+-0.003 ms** mean-of-pairs in three separate processes.
+
+One threat had to be ruled out rather than assumed. Garbage output is the
+point of a ceiling, but garbage that reaches an *index* is not a ceiling, it
+is a different step -- Phase 31 lost 0.58 ms dropping the router's argsort,
+because the expert gather then read eight experts at random. Here the
+selection is `block_softmax_precise` into `router_top_k`, and neither is on
+the list, so the gather still reads eight distinct experts of 256 and the same
+bytes with them. **The partition is the check**: three disjoint buckets whose
+union is the chain, summing to 92%, 96% and 99% of the whole in three runs. A
+drop that had changed what the step reads would not add up.
+
+### The boundary: 1.35 ms, and 20% of the trunk
+
+    q6k-full, trunk (model_call), 8 interleaved pairs a cell, mean of pairs,
+    three processes; the trunk was 6.70-6.76 ms in all three
+
+    dropped                        disp   ms a token             us/disp
+    the whole elementwise chain     811   -1.368 -1.335 -1.343      1.66
+      the gated-delta chain         200   -0.287 -0.307 -0.327      1.52
+      the MoE tail                  210   -0.310 -0.341 -0.362      1.65
+      norms, activations, adds      401   -0.657 -0.630 -0.648      1.60
+    nothing matches this              0   -0.023 -0.014 -0.003        --
+
+**811 of 1505 dispatches -- 54% of the stream, moving 7.4 MB between them --
+are worth 1.35 ms of a 6.70 ms trunk, i.e. 20%.** That is the ceiling on every
+fusion this project could write, and it lands at the top of the 1-1.8 ms that
+summing the one-at-a-time removals had suggested.
+
+### But a dispatch is not worth a dispatch, and that decided what to build
+
+The same instrument, asked instead about the set of dispatches **one kernel
+could absorb**:
+
+    one MoE combine kernel          250   -0.413 -0.387             1.60
+    one gated-delta kernel          200   -0.326 -0.326             1.63
+    swiglu, into its consumer       110   -0.085 -0.055             0.64
+    the norms alone, rms + add_rms  191   -0.474                    2.48
+    left for a deferred layer       361   -0.604                    1.67
+
+`swiglu` is 110 dispatches and worth **0.6 us each**: it sits in the epochs
+the expert gathers hold and is already hidden, so the classic fusion -- the
+activation into its consumer matvec -- is the worst-paid one in the step.
+`rms` and `add_rms` are worth **2.5 us each**, four times as much, because
+they are the serial spine every block hangs off. Fusing "the elementwise
+chain" as a *category* would have spent most of its generality on the cheap
+half; the category is not the object, the call site is.
+
+### What was built: the MoE block's tail, six dispatches into one
+
+Six kernels ran in sequence at the end of every MoE block, none of them doing
+any work worth its launch: `row_reduce_small` over the k router scores,
+`div_by_row`, `mul_by_row` over the k expert outputs, `col_reduce_small` over
+the same, `sigmoid_gate` on the shared expert, `add_elem` to join the two.
+240 dispatches a token in a 40-layer model. `moe_combine` in
+`kernels/moe.metal` is all six, and `ORNITH_FUSE_MOE_TAIL=0` is the control.
+
+**Bit-exact by construction, and for a reduction that means its accumulator
+and its order, not just its arithmetic.** mlx instantiates `Sum` over
+bfloat16 with `U = bfloat16_t`, so both sums accumulate *in bfloat16*,
+rounding at every step, and both run in ascending index order:
+`row_reduce_small` folds the score row as `total = vals[j] + total` in blocks
+of `N_READS = 4`; `col_reduce_small` gives each of the k rows to one thread of
+`lid.y`, each folding `total = val + init`, and thread 0 then folds the k
+partials out of threadgroup memory as `total = shared[j] + total`, j
+ascending. Every value the six wrote to memory is a `T` local in the fused
+kernel, so it rounds at the same point it used to.
+
+**And the kernel is at the floor, which is what says there is nothing left in
+it**: 40 dispatches, 200.5 us of isolated time against a 204.3 us clamped
+floor -- no measurable work at all, 5.0 us each with its own command buffer.
+The six it replaced were ~1.1 ms of isolated time.
+
+### What it came to
+
+    the trunk, one process, 8 interleaved pairs, twice
+
+                          six dispatches    one      mean of pairs
+      GPU ms                7.076          6.852     -0.175, 8 of 8 down
+      GPU ms, again         7.182          6.973     -0.208, 8 of 8 down
+
+    200 greedy tokens, three interleaved pairs, a loaded machine
+
+                          control                 fused
+      GPU busy ms/token   8.03 7.68 7.96          7.51 7.51 7.50
+      wall ms/token       8.52 8.17 8.54          7.99 7.99 8.00
+      tok/s               117.4 122.5 117.1       125.2 125.1 125.0
+      dispatches          1509                    1309
+      barriers            908                     787
+      epochs              920                     798
+      command buffers     12                      11
+      distinct kernels    37                      33
+
+The counters are exact and the levels are not: **-200 dispatches, -121
+barriers, -122 epochs**, and between -0.19 and -0.38 GPU ms depending on which
+object is measured. The paired trunk measurement is the controlled one --
+same process, same restored cache state, alternating arms -- and it says
+**-0.21 ms, 3%**. The end-to-end run says more, and the reason to distrust the
+difference rather than take it is that GPU busy over a 200-token run includes
+the GPU waiting *inside* a command buffer for the CPU to encode the next
+dispatch, and the control arm has 15% more dispatches to encode on a machine
+that had a VM at 367% on it. Both agree on sign, 16 of 16 pairs and 3 of 3.
+
+**The fusion returned 56% of its ceiling** (0.21 of the 0.375 the removal
+promised, after the 40 dispatches it issues back are paid for). Phase 31's
+add+rms returned 47%. Two points, the same coefficient: **plan a fusion at
+half of what removing its dispatches measures.**
+
+Exactness is checked the same way as always: `tests/model` at
+`max_abs == 0.0`, `tests/generate`, `tests/moe` (nine, including
+`whole_block_matches_mlx` against mlx at every token count), `tests/mtp`, a
+200-token `--greedy` run byte-identical to the same run under
+`ORNITH_FUSE_MOE_TAIL=0`, `ORNITH_MOE_EARLY_GATE=1` and
+`ORNITH_MOE_GATE_POS=2`, and `--mtp --mtp-depth 1 --frspec` byte-identical
+again.
+
+### And the reorder it invalidated, which is the other half of the phase
+
+`tools/epoch_slack.py`, re-run on the new trace as its own documentation
+orders, found **0.235 ms** in one place: the shared expert's gate, 38 of 40
+of them, the slowest thing in its own epoch again and free to move one epoch
+on into the 14-16 us the last expert gather holds. Phase 31 had moved that
+same dispatch once already, for 3.3%.
+
+It was built as a third position and measured against the second:
+
+    the shared expert's gate, 8 interleaved draws, paired against position 1
+
+      0  beside the router         6.830    -0.007 ms    5 of 8 down
+      1  beside the gathers        6.844     --
+      2  after the gathers         6.927    +0.104 ms    0 of 8 down
+
+**Position 2 costs 0.104 ms, 0 of 8 pairs down.** What hides a one-row `qmv`'s
+chain of dependent loads is not the epoch it shares but the two barriers of
+gather between it and the tail that reads it, and moving it later takes those
+away. The model ranks; it does not predict -- Phase 31 said so and checked it
+against the move that had an answer, and this is the check failing. The
+default stays at 1 and position 2 is kept as the control that says why.
+
+**And positions 0 and 1 now measure the same** (-0.007 ms, 5 of 8 pairs).
+Phase 31's reorder was worth 3.3% then and is worth nothing now: fusing the
+tail took what it was buying. A positive result expires with its artifact
+exactly as a negative one does.
+
+### What is left, and what the boundary says about the deferred op layer
+
+The chain re-measured after the fusion, same instrument, 8 pairs:
+
+    the whole elementwise chain     611   -1.138
+      the gated-delta chain         200   -0.285
+      left for a deferred layer     361   -0.634
+        of which the norms          191   -0.517
+      what is left of the MoE tail   50   -0.168
+
+1. **The gated-delta chain, 200 dispatches, -0.29 ms.** The next kernel, and
+   it is not a fusion: `concat_time`, `slice_inner`, `depthwise_conv_1d`,
+   `silu`, `gdn_beta` and `compute_g` are six different shapes with a conv and
+   a cache write among them, so it is a rewrite of the capture's front end,
+   not a pair of ops glued together. At the coefficient above, ~0.15 ms.
+2. **The deferred op layer's own prize is 0.63 ms of ceiling, and half of
+   that realized: ~0.3 ms, 4.5% of the trunk.** That is what is left once the
+   two block-shaped kernels are written, and 0.52 of the 0.63 is `rms` and
+   `add_rms` -- the two that are already half-fused. It is a real number and
+   it is not a large one for an architectural change; the case for the layer
+   has to be made on something other than this step.
+3. **Reordering, re-run and spent again**: 0.295 ms by the model, 0.235 of it
+   the move this phase measured at -0.104. Re-run `epoch_slack.py` after the
+   gated-delta kernel, and believe it only after an A/B.
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
