@@ -48,7 +48,7 @@ use ornith_rs::ops::kquant::{
     set_mm_rows_id,
 };
 use ornith_rs::ops::elementwise::{set_wide_elem, sigmoid_gate, swiglu};
-use ornith_rs::ops::layout::slice_inner;
+use ornith_rs::ops::layout::{slice_inner, transpose_hl, transpose_lh, transpose_would_widen};
 use ornith_rs::ops::matmul::matmul;
 use ornith_rs::ops::quantized::{QuantMatrix, QuantMode, quantized_matmul};
 
@@ -491,6 +491,46 @@ fn unpack_cost(ctx: &Context, ceiling: f64) {
             "  {:<30} {:>6} {:>9.3} {t:>9.2} {:>6.0}%",
             "mlx affine qmm, 4-bit g32", "-", secs * 1e3, 100.0 * t / ceiling
         );
+
+        // **And the same kernel with float operands, which is the term a
+        // port of steel's tiling onto the k-quants could not take.**
+        //
+        // mlx's quantized gemm dequantizes into a threadgroup tile of `T`,
+        // and `T` is the activation type -- so on this model every weight
+        // reaches the multiplier rounded to **bfloat16**, eight significand
+        // bits. `kquant_mm.h` declined `half`'s eleven for exactly this
+        // reason (a 5e-4 perturbation where reassociation is 2e-6), and
+        // eight is 8x worse again. So "carry the k-quants onto steel's
+        // tiling" means either giving that contract up or instantiating the
+        // tile at `float`, and this row is what the second one costs on
+        // steel's own tiling rather than on ggml's.
+        //
+        // **It is an upper bound, not the term itself**: `T` widens the
+        // activation tile and the output as well as the weight tile, where
+        // a k-quant port would widen only the weights. The lower bound is
+        // the other end of the same question, measured on the tile we have
+        // -- `ORNITH_KQUANT_TILE_HALF`, at the bottom of this bin.
+        let xf = Array::from_f32(ctx, &vec![0.01f32; M * K], &[M, K]);
+        let qwf = QuantMatrix {
+            w: Array::from_slice(ctx, &packed, &[N, K / 8], Dtype::U32),
+            scales: Array::from_f32(ctx, &sc, &[N, groups]),
+            biases: Some(Array::from_f32(ctx, &bi, &[N, groups])),
+            mode: QuantMode::Affine,
+            group_size: 32,
+            bits: 4,
+        };
+        let secs_f = best_of(ctx, 5, || {
+            let _ = quantized_matmul(ctx, &xf, &qwf);
+        });
+        let tf = tflops(flop, secs_f);
+        println!(
+            "  {:<30} {:>6} {:>9.3} {tf:>9.2} {:>6.0}%  {:+.1}% vs bf16",
+            "  ... the same, float operands",
+            "-",
+            secs_f * 1e3,
+            100.0 * tf / ceiling,
+            100.0 * (secs_f / secs - 1.0)
+        );
     }
 }
 
@@ -577,6 +617,69 @@ fn elementwise_width(ctx: &Context) {
     );
 }
 
+/// The last two kernels the inventory had under the memory ceiling: the
+/// head/sequence transposes, at 67.5 and 54.2 GB/s over 12.4 ms a chunk.
+///
+/// **They were priced as a tiled kernel and they are not one.** A transpose
+/// whose innermost axis is contiguous on both sides is a permutation of
+/// runs, not a strided copy -- 512 bytes a run at this model's head shape --
+/// so the 32x32 threadgroup tile a transpose usually wants would stage a
+/// coalesced read through shared memory for nothing. What these were losing
+/// is what `swiglu`, `sigmoid_gate` and `slice_inner` were losing one phase
+/// earlier, and it comes back the same way: one vector a thread.
+///
+/// Same instrument as `elementwise_width`, and for the same reason -- the
+/// effect is under 1% of a chunk and the chunk cell's noise floor is larger
+/// than that.
+fn transpose_width(ctx: &Context) {
+    println!("\nthe transposes, sixteen bytes a thread and one element\n");
+    println!(
+        "  {:<28} {:>10} {:>10} {:>9} {:>8}",
+        "kernel / shape", "narrow ms", "wide ms", "GB/s", "saved"
+    );
+    // A full-attention layer's own four: q, k, v in, the output out. Ten
+    // layers of them in a 2048-token chunk, which is the inventory's 30 and
+    // 10 dispatches.
+    let seq = 2048usize;
+    let hd = 256usize;
+    let cases: [(&str, bool, usize); 4] = [
+        ("transpose_lh, 16 q heads", true, 16),
+        ("transpose_lh, 2 k heads", true, 2),
+        ("transpose_lh, 2 v heads", true, 2),
+        ("transpose_hl, 16 heads out", false, 16),
+    ];
+    let mut total_saved = 0.0f64;
+    for (name, lh, heads) in cases {
+        let n = seq * heads * hd;
+        let shape = if lh { [1, seq, heads, hd] } else { [1, heads, seq, hd] };
+        let x = Array::from_f32_as_bf16(ctx, &vec![0.3f32; n], &shape);
+        assert!(transpose_would_widen(&x), "{name}: the wide arm is not live");
+        let mut t = [0.0f64; 2];
+        for (i, on) in [false, true].into_iter().enumerate() {
+            set_wide_elem(on);
+            t[i] = best_of(ctx, 5, || {
+                let _ = if lh { transpose_lh(ctx, &x) } else { transpose_hl(ctx, &x) };
+            });
+        }
+        set_wide_elem(true);
+        // Read and write, once each.
+        let bytes = 2.0 * n as f64 * 2.0;
+        let saved = (t[0] - t[1]) * 1e3 * 10.0;
+        total_saved += saved;
+        println!(
+            "  {name:<28} {:>10.3} {:>10.3} {:>9.0} {:>7.1} ms",
+            t[0] * 1e3,
+            t[1] * 1e3,
+            bytes / t[1] / 1e9,
+            saved
+        );
+    }
+    println!(
+        "  {:<28} {:>32} {:>7.1} ms a chunk, isolated",
+        "so, over ten full-attention layers", "", total_saved
+    );
+}
+
 fn main() {
     let ctx = Context::new().unwrap();
     println!("{}", ctx.device_name());
@@ -587,6 +690,7 @@ fn main() {
     decompose_routed(&ctx, mma);
     unpack_cost(&ctx, mma);
     elementwise_width(&ctx);
+    transpose_width(&ctx);
 
     // The flag the tile carries, on the real kernel, beside the synthetic
     // ratio above. If the matrix unit prefers half and the kernel does not,
