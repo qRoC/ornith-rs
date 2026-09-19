@@ -21,6 +21,7 @@
 #include <metal_simdgroup>
 
 #include "mlx/backend/metal/kernels/utils.h"
+#include "ornith_sigmoid.h"
 
 using namespace metal;
 
@@ -104,8 +105,91 @@ template <typename T, int N_READS = RMS_N_READS>
   }
 }
 
+// `Qwen3NextRMSNormGated`: the norm and the gate that reads it, in one
+// dispatch.
+//
+// The gated-delta layer ends with `precise_swiglu(z, rms_norm(y, w, eps))`,
+// two dispatches over 128 elements a head that between them do no work at
+// all. This is `rms_single_row` with `precise_swiglu`'s three lines in place
+// of its write-back, so the normalised value is a `T` local where it used to
+// be a round trip to memory -- and it rounds to bfloat16 at the same point,
+// since the store it replaces was the rounding.
+//
+// `ORNITH_FUSE_GDN_NORM=0` issues the two separately, as the control.
+template <typename T, int N_READS = RMS_N_READS>
+[[kernel]] void rms_gated_single_row(
+    const device T* x [[buffer(0)]],
+    const device T* w [[buffer(1)]],
+    const device T* gate [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    constant uint& axis_size [[buffer(5)]],
+    constant uint& w_stride [[buffer(6)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+  constexpr int SIMD_SIZE = 32;
+
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[SIMD_SIZE];
+
+  float acc = 0;
+  float thread_x[N_READS];
+  size_t offset = gid * size_t(axis_size) + lid * N_READS;
+  x += offset;
+  w += w_stride * lid * N_READS;
+  if (lid * N_READS + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      thread_x[i] = x[i];
+      acc += thread_x[i] * thread_x[i];
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      thread_x[i] = (lid * N_READS + i < axis_size) ? (float)x[i] : 0;
+      acc += thread_x[i] * thread_x[i];
+    }
+  }
+  acc = simd_sum(acc);
+  if (simd_group_id == 0) {
+    local_sums[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (simd_lane_id == 0) {
+    local_sums[simd_group_id] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (simd_group_id == 0) {
+    acc = simd_sum(local_sums[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  gate += offset;
+  out += offset;
+  for (int i = 0; i < N_READS; i++) {
+    if (lid * N_READS + i < axis_size) {
+      T normed =
+          w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+      float g = static_cast<float>(gate[i]);
+      g = g * mlx_sigmoid(g);
+      out[i] = static_cast<T>(g * static_cast<float>(normed));
+    }
+  }
+}
+
 #define instantiate_add_rms(tname, type) \
   instantiate_kernel("add_rms_" #tname, add_rms_single_row, type)
 
 instantiate_add_rms(bfloat16, bfloat16_t)
 instantiate_add_rms(float32, float)
+
+#define instantiate_rms_gated(tname, type) \
+  instantiate_kernel("rms_gated_" #tname, rms_gated_single_row, type)
+
+instantiate_rms_gated(bfloat16, bfloat16_t)
+instantiate_rms_gated(float32, float)

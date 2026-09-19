@@ -16,15 +16,15 @@
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
-use crate::ops::elementwise::{add, precise_swiglu, scalar_mul, sigmoid_gate, silu};
+use crate::ops::elementwise::{add, scalar_mul, sigmoid_gate, silu};
 use crate::ops::embedding::embedding;
 use crate::ops::gdn::{
-    beta, compute_g, concat_time, depthwise_conv1d, gated_delta_kernel_into,
-    gated_delta_update,
+    beta, compute_g, concat_time, depthwise_conv1d, gated_delta_kernel, gated_delta_kernel_into,
+    gated_delta_update, gdn_front,
 };
 use crate::ops::layout::{slice_inner, transpose_hl, transpose_lh};
 use crate::ops::moe::sparse_moe_block;
-use crate::ops::norm::{add_rms_norm, rms_norm};
+use crate::ops::norm::{add_rms_norm, rms_norm, rms_norm_gated};
 use crate::ops::quantized::{QuantMatrix, quantized_matmul};
 use crate::ops::rope::rope;
 use crate::weights::WeightStore;
@@ -500,31 +500,58 @@ impl GatedDeltaNet {
 
         // The causal conv sees the cached window ahead of this step's tokens.
         let conv_state = cache.conv_or_zeros(ctx, cfg, b, qkv.dtype);
-        let conv_input = concat_time(ctx, &conv_state, &qkv);
         let n_keep = kernel - 1;
-        cache.conv = Some(keep_tail(ctx, &conv_input, n_keep));
-        let conv_out = silu(ctx, &depthwise_conv1d(ctx, &conv_input, &self.conv1d));
-
-        let q = slice_inner(ctx, &conv_out, 0, key_dim).reshape(&[b, s, hk, dk]);
-        let k = slice_inner(ctx, &conv_out, key_dim, key_dim).reshape(&[b, s, hk, dk]);
-        let v = slice_inner(ctx, &conv_out, 2 * key_dim, cfg.value_dim()).reshape(&[b, s, hv, dv]);
-
         // The Dk**-0.5 readout scale, folded into q and k as mlx-lm's
         // gated_delta contract requires.
         let inv_scale = (dk as f32).powf(-0.5);
-        let q = scalar_mul(ctx, &rms_norm(ctx, &q, None, 1e-6), inv_scale * inv_scale);
-        let k = scalar_mul(ctx, &rms_norm(ctx, &k, None, 1e-6), inv_scale);
-
         let state = cache.state_or_zeros(ctx, cfg, b);
-        let (out, new_state) = gated_delta_update(
-            ctx, &q, &k, &v, &aa, &bb, &self.a_log, &self.dt_bias, &state, None,
-        );
+
+        // Everything between the projections and the recurrence, in one
+        // dispatch where the shapes allow it and ten where they do not.
+        let (out, new_state) = match gdn_front(
+            ctx,
+            &conv_state,
+            &qkv,
+            &self.conv1d,
+            &aa,
+            &bb,
+            &self.a_log,
+            &self.dt_bias,
+            hk,
+            dk,
+            hv,
+            dv,
+            inv_scale * inv_scale,
+            inv_scale,
+            1e-6,
+            false,
+        ) {
+            Some(f) => {
+                cache.conv = Some(f.conv_next);
+                gated_delta_kernel(ctx, &f.q, &f.k, &f.v, &f.g, &f.beta, &state, None)
+            }
+            None => {
+                let conv_input = concat_time(ctx, &conv_state, &qkv);
+                cache.conv = Some(keep_tail(ctx, &conv_input, n_keep));
+                let conv_out = silu(ctx, &depthwise_conv1d(ctx, &conv_input, &self.conv1d));
+
+                let q = slice_inner(ctx, &conv_out, 0, key_dim).reshape(&[b, s, hk, dk]);
+                let k = slice_inner(ctx, &conv_out, key_dim, key_dim).reshape(&[b, s, hk, dk]);
+                let v = slice_inner(ctx, &conv_out, 2 * key_dim, cfg.value_dim())
+                    .reshape(&[b, s, hv, dv]);
+
+                let q = scalar_mul(ctx, &rms_norm(ctx, &q, None, 1e-6), inv_scale * inv_scale);
+                let k = scalar_mul(ctx, &rms_norm(ctx, &k, None, 1e-6), inv_scale);
+                gated_delta_update(
+                    ctx, &q, &k, &v, &aa, &bb, &self.a_log, &self.dt_bias, &state, None,
+                )
+            }
+        };
         cache.state = Some(new_state);
         cache.offset += s;
 
         // RMSNormGated: normalise, then gate with z in float32.
-        let normed = rms_norm(ctx, &out, Some(&self.norm), cfg.rms_norm_eps);
-        let gated = precise_swiglu(ctx, &z, &normed);
+        let gated = rms_norm_gated(ctx, &out, Some(&self.norm), &z, cfg.rms_norm_eps);
         self.out_proj.matmul(ctx, &gated.reshape(&[b, s, hv * dv]))
     }
 }
@@ -562,26 +589,54 @@ impl GatedDeltaNet {
             .reshape(&[b, s, hv]);
 
         let conv_state = cache.conv_or_zeros(ctx, cfg, b, qkv.dtype);
-        let conv_input = concat_time(ctx, &conv_state, &qkv);
         let n_keep = kernel - 1;
-        let conv_out = silu(ctx, &depthwise_conv1d(ctx, &conv_input, &self.conv1d));
-
-        let q = slice_inner(ctx, &conv_out, 0, key_dim).reshape(&[b, s, hk, dk]);
-        let k = slice_inner(ctx, &conv_out, key_dim, key_dim).reshape(&[b, s, hk, dk]);
-        let v = slice_inner(ctx, &conv_out, 2 * key_dim, cfg.value_dim()).reshape(&[b, s, hv, dv]);
-
         let inv_scale = (dk as f32).powf(-0.5);
-        let q = scalar_mul(ctx, &rms_norm(ctx, &q, None, 1e-6), inv_scale * inv_scale);
-        let k = scalar_mul(ctx, &rms_norm(ctx, &k, None, 1e-6), inv_scale);
 
-        // The gate and the decay, once for the window rather than once per
-        // token. Both are elementwise over `[B, T, Hv]` -- `sigmoid` and
-        // `compute_g`'s exp -- so a thread computes the same element from the
-        // same inputs whichever shape it is handed, and slicing the results
-        // per token is free where recomputing them was two dispatches a
-        // token a layer.
-        let beta_all = beta(ctx, &bb);
-        let g_all = compute_g(ctx, &self.a_log, &aa, &self.dt_bias);
+        // The same one dispatch the decode path takes, over the window
+        // rather than one token -- and it keeps the concatenation, which
+        // `rewind` slices a cached conv state out of.
+        //
+        // The gate and the decay come out of it for the whole window rather
+        // than once per token. Both are elementwise over `[B, T, Hv]` --
+        // `sigmoid` and `compute_g`'s exp -- so a thread computes the same
+        // element from the same inputs whichever shape it is handed, and
+        // slicing the results per token is free where recomputing them was
+        // two dispatches a token a layer.
+        let (conv_input, q, k, v, beta_all, g_all) = match gdn_front(
+            ctx,
+            &conv_state,
+            &qkv,
+            &self.conv1d,
+            &aa,
+            &bb,
+            &self.a_log,
+            &self.dt_bias,
+            hk,
+            dk,
+            hv,
+            dv,
+            inv_scale * inv_scale,
+            inv_scale,
+            1e-6,
+            true,
+        ) {
+            Some(f) => (f.conv_input.unwrap(), f.q, f.k, f.v, f.beta, f.g),
+            None => {
+                let conv_input = concat_time(ctx, &conv_state, &qkv);
+                let conv_out = silu(ctx, &depthwise_conv1d(ctx, &conv_input, &self.conv1d));
+
+                let q = slice_inner(ctx, &conv_out, 0, key_dim).reshape(&[b, s, hk, dk]);
+                let k = slice_inner(ctx, &conv_out, key_dim, key_dim).reshape(&[b, s, hk, dk]);
+                let v = slice_inner(ctx, &conv_out, 2 * key_dim, cfg.value_dim())
+                    .reshape(&[b, s, hv, dv]);
+
+                let q = scalar_mul(ctx, &rms_norm(ctx, &q, None, 1e-6), inv_scale * inv_scale);
+                let k = scalar_mul(ctx, &rms_norm(ctx, &k, None, 1e-6), inv_scale);
+                let beta_all = beta(ctx, &bb);
+                let g_all = compute_g(ctx, &self.a_log, &aa, &self.dt_bias);
+                (conv_input, q, k, v, beta_all, g_all)
+            }
+        };
 
         let mut state = cache.state_or_zeros(ctx, cfg, b);
         let mut states: Vec<Array> = Vec::with_capacity(s);
@@ -612,8 +667,7 @@ impl GatedDeltaNet {
         cache.state = Some(state);
         cache.offset += s;
 
-        let normed = rms_norm(ctx, &out, Some(&self.norm), cfg.rms_norm_eps);
-        let gated = precise_swiglu(ctx, &z, &normed);
+        let gated = rms_norm_gated(ctx, &out, Some(&self.norm), &z, cfg.rms_norm_eps);
         let y = self.out_proj.matmul(ctx, &gated.reshape(&[b, s, hv * dv]));
         (y, GdnSnaps { conv_input, states })
     }

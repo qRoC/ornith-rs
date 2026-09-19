@@ -155,6 +155,90 @@ pub fn set_fuse_add_rms(on: bool) -> bool {
     was
 }
 
+/// `precise_swiglu(gate, rms_norm(x, w, eps))` -- `Qwen3NextRMSNormGated`, in
+/// one dispatch.
+///
+/// The two are the tail of every gated-delta layer, 60 dispatches a token
+/// over 128 elements a row, and neither does any work: `REBUILD.md` Phase 32
+/// priced the whole elementwise chain they belong to at 1.6 us a dispatch
+/// against the memory it moves. This removes one of the two launches and the
+/// barrier between them.
+///
+/// Bit-exact by construction: the kernel is `rms_single_row` with
+/// `precise_swiglu`'s three lines in place of its write-back, so the
+/// normalised value rounds to the array's dtype at the point the store used
+/// to. `ORNITH_FUSE_GDN_NORM=0` runs the two separately, as the control.
+pub fn rms_norm_gated(
+    ctx: &Context,
+    x: &Array,
+    w: Option<&Array>,
+    gate: &Array,
+    eps: f32,
+) -> Array {
+    let axis_size = x.dim(-1);
+    if !fuse_gdn_norm() || axis_size > RMS_LOOPED_LIMIT {
+        let normed = rms_norm(ctx, x, w, eps);
+        return crate::ops::elementwise::precise_swiglu(ctx, gate, &normed);
+    }
+    assert_eq!(gate.shape, x.shape, "the gate and the normed value must have one shape");
+    let n_rows = x.numel() / axis_size;
+    let out = Array::empty(ctx, &x.shape, x.dtype);
+
+    let name = format!(
+        "rms_gated_{}",
+        match x.dtype {
+            Dtype::BF16 => "bfloat16",
+            Dtype::F32 => "float32",
+            d => panic!("no rms_gated kernel for {}", d.name()),
+        }
+    );
+
+    let ones;
+    let (w_arr, w_stride) = match w {
+        Some(w) => {
+            assert_eq!(w.numel(), axis_size, "rms_norm weight must match the last axis");
+            (w, w.strides()[0] as u32)
+        }
+        None => {
+            ones = scalar_one(ctx, x.dtype);
+            (&ones, 0u32)
+        }
+    };
+
+    let d = ctx.kernel(&name);
+    let threadgroup_size = 32 * axis_size.div_ceil(RMS_N_READS).div_ceil(32);
+    assert!(threadgroup_size <= d.max_threads_per_threadgroup());
+    d.arr(x)
+        .arr(w_arr)
+        .arr(gate)
+        .out(&out)
+        .bytes(&eps)
+        .bytes(&(axis_size as u32))
+        .bytes(&w_stride)
+        .threads((n_rows * threadgroup_size, 1, 1), (threadgroup_size, 1, 1));
+    out
+}
+
+/// Whether `RMSNormGated` is one dispatch or two. See [`rms_norm_gated`].
+static FUSE_GDN_NORM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static FUSE_GDN_NORM_ENV: std::sync::Once = std::sync::Once::new();
+
+fn fuse_gdn_norm() -> bool {
+    FUSE_GDN_NORM_ENV.call_once(|| {
+        if std::env::var("ORNITH_FUSE_GDN_NORM").as_deref() == Ok("0") {
+            FUSE_GDN_NORM.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    FUSE_GDN_NORM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the fusion on or off at runtime; returns what it was.
+pub fn set_fuse_gdn_norm(on: bool) -> bool {
+    let was = fuse_gdn_norm();
+    FUSE_GDN_NORM.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
+}
+
 const LN_LOOPED_LIMIT: usize = 6656;
 
 /// `layer_norm(x, w, b, eps)`, normalising over the last axis.

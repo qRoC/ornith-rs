@@ -17,21 +17,7 @@
 //     kernel's `const device float* g` expects.
 
 #include "mlx/backend/metal/kernels/utils.h"
-
-// mlx's LogAddExp, verbatim from
-// kernels/mlx/mlx/backend/metal/kernels/binary_ops.h.
-template <typename T>
-inline T mlx_logaddexp(T x, T y) {
-  if (metal::isnan(x) || metal::isnan(y)) {
-    return metal::numeric_limits<T>::quiet_NaN();
-  }
-  constexpr T inf = metal::numeric_limits<T>::infinity();
-  T maxval = metal::max(x, y);
-  T minval = metal::min(x, y);
-  return (minval == -inf || maxval == inf)
-      ? maxval
-      : (maxval + log1p(metal::exp(minval - maxval)));
-}
+#include "ornith_logaddexp.h"
 
 // a, out: [B, T, Hv]; A_log, dt_bias: [Hv]
 template <typename T>

@@ -277,3 +277,157 @@ fn tname(d: Dtype) -> &'static str {
         d => panic!("no gated-delta kernel for {}", d.name()),
     }
 }
+
+// --- the front end of the layer, in one dispatch -----------------------------
+
+/// What [`gdn_front`] produces: everything between the input projections and
+/// the recurrence.
+pub struct GdnFront {
+    pub q: Array,
+    pub k: Array,
+    pub v: Array,
+    pub beta: Array,
+    pub g: Array,
+    /// The next cached conv window -- `keep_tail` of the concatenation.
+    pub conv_next: Array,
+    /// The concatenation itself, only when the caller asked for it: `rewind`
+    /// slices a cached conv state out of it, and plain decode does not.
+    pub conv_input: Option<Array>,
+}
+
+/// Geometry the fused kernel needs, matching `GdnFrontParams` in
+/// `kernels/gdn_front.metal`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FrontParams {
+    t_len: u32,
+    n_state: u32,
+    ksize: u32,
+    dim: u32,
+    head_dim: u32,
+    qk_slots: u32,
+    n_heads: u32,
+    simds: u32,
+    q_scale: f32,
+    k_scale: f32,
+    eps: f32,
+}
+
+/// mlx's `rms_single_row` gives each thread this many contiguous elements.
+const RMS_N_READS: usize = 4;
+
+/// `concat_time`, `keep_tail`, `depthwise_conv1d`, `silu`, the q and k norms
+/// and scales, `beta` and `compute_g` -- ten dispatches in one.
+///
+/// Returns `None` when the shapes are not the ones the kernel is written for,
+/// and the caller then issues the ten. The condition is one head per
+/// simdgroup at `RMS_N_READS` elements a lane, i.e. `Dk == Dv == 128`, which
+/// is what makes the two norms the same reduction mlx does; `Dk == 128` is
+/// already what `gated_delta_packed` requires of the same layer.
+///
+/// See `kernels/gdn_front.metal` for what had to be reproduced to keep it
+/// bit-exact. `ORNITH_FUSE_GDN_FRONT=0` issues the ten separately.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_front(
+    ctx: &Context,
+    conv_state: &Array,
+    qkv: &Array,
+    conv_w: &Array,
+    a: &Array,
+    b: &Array,
+    a_log: &Array,
+    dt_bias: &Array,
+    hk: usize,
+    dk: usize,
+    hv: usize,
+    dv: usize,
+    q_scale: f32,
+    k_scale: f32,
+    eps: f32,
+    keep_conv_input: bool,
+) -> Option<GdnFront> {
+    if !fuse_gdn_front() {
+        return None;
+    }
+    let (bs, t, dim) = (qkv.shape[0], qkv.shape[1], qkv.shape[2]);
+    let (key_dim, value_dim) = (hk * dk, hv * dv);
+    let k_size = conv_w.shape[1];
+    let n_state = conv_state.shape[1];
+    let head_dim = dk;
+    // One head per simdgroup, one lane's `RMS_N_READS` elements at a time.
+    if dk != dv || head_dim != 32 * RMS_N_READS || dim != 2 * key_dim + value_dim {
+        return None;
+    }
+    if qkv.dtype != Dtype::BF16 && qkv.dtype != Dtype::F32 {
+        return None;
+    }
+    let n_slots = dim / head_dim;
+    // 8 head slots a threadgroup where they divide, one where they do not.
+    let simds = if n_slots % 8 == 0 { 8 } else { 1 };
+
+    let conv_next = Array::empty(ctx, &[bs, n_state, dim], qkv.dtype);
+    let q = Array::empty(ctx, &[bs, t, hk, dk], qkv.dtype);
+    let k = Array::empty(ctx, &[bs, t, hk, dk], qkv.dtype);
+    let v = Array::empty(ctx, &[bs, t, hv, dv], qkv.dtype);
+    let beta = Array::empty(ctx, &[bs, t, hv], qkv.dtype);
+    let g = Array::empty(ctx, &[bs, t, hv], Dtype::F32);
+    let conv_input =
+        keep_conv_input.then(|| Array::empty(ctx, &[bs, n_state + t, dim], qkv.dtype));
+
+    let p = FrontParams {
+        t_len: t as u32,
+        n_state: n_state as u32,
+        ksize: k_size as u32,
+        dim: dim as u32,
+        head_dim: head_dim as u32,
+        qk_slots: (2 * hk) as u32,
+        n_heads: hv as u32,
+        simds: simds as u32,
+        q_scale,
+        k_scale,
+        eps,
+    };
+    let tg = 32 * simds;
+    let d = ctx
+        .kernel_with(&format!("gdn_front_{}", tname(qkv.dtype)), &[(10, keep_conv_input)])
+        .arr(conv_state)
+        .arr(qkv)
+        .arr(conv_w)
+        .arr(a)
+        .arr(b)
+        .arr(a_log)
+        .arr(dt_bias)
+        .out(&conv_next)
+        .out(&q)
+        .out(&k)
+        .out(&v)
+        .out(&beta)
+        .out(&g)
+        .bytes(&p);
+    let d = match &conv_input {
+        Some(ci) => d.out(ci),
+        None => d,
+    };
+    d.threads((tg, n_slots / simds, bs * t), (tg, 1, 1));
+    Some(GdnFront { q, k, v, beta, g, conv_next, conv_input })
+}
+
+/// Whether the layer's front end is one dispatch or ten. See [`gdn_front`].
+static FUSE_GDN_FRONT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static FUSE_GDN_FRONT_ENV: std::sync::Once = std::sync::Once::new();
+
+fn fuse_gdn_front() -> bool {
+    FUSE_GDN_FRONT_ENV.call_once(|| {
+        if std::env::var("ORNITH_FUSE_GDN_FRONT").as_deref() == Ok("0") {
+            FUSE_GDN_FRONT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    FUSE_GDN_FRONT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the fusion on or off at runtime; returns what it was.
+pub fn set_fuse_gdn_front(on: bool) -> bool {
+    let was = fuse_gdn_front();
+    FUSE_GDN_FRONT.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
+}
