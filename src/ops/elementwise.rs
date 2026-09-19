@@ -39,9 +39,69 @@ pub fn copy_cast(ctx: &Context, a: &Array, dtype: Dtype) -> Array {
 pub fn swiglu(ctx: &Context, gate: &Array, x: &Array) -> Array {
     assert_eq!(gate.shape, x.shape);
     let out = Array::empty(ctx, &x.shape, x.dtype);
-    let (grid, tg) = flat(x.numel());
-    ctx.kernel(&format!("swiglu_{}", tname(x.dtype))).arr(gate).arr(x).out(&out).threads(grid, tg);
+    let lanes = lanes(x.dtype);
+    let wide = wide_elem() && vec16(gate, x.numel()) && vec16(x, x.numel()) && vec16(&out, x.numel());
+    let (grid, tg) = flat(if wide { x.numel() / lanes } else { x.numel() });
+    let name = if wide { "swiglu_wide" } else { "swiglu" };
+    ctx.kernel(&format!("{name}_{}", tname(x.dtype)))
+        .arr(gate)
+        .arr(x)
+        .out(&out)
+        .threads(grid, tg);
     out
+}
+
+/// Elements in a 16-byte access, which is the width the machine is built
+/// for. See [`vec16`].
+fn lanes(d: Dtype) -> usize {
+    16 / d.size()
+}
+
+/// Whether a 16-byte vector access is legal on this array over `n` elements.
+///
+/// Two conditions, and the second is the one a first attempt forgets: the
+/// count must divide, **and the base must be 16-byte aligned**. An [`Array`]
+/// may be a view -- `slice_leading`, `slice_inner` and every expert view set
+/// a byte `offset`, and `setBuffer:offset:` hands it to the kernel -- so a
+/// bf16 view starting at an odd element is 2-byte aligned, and reading a
+/// 16-byte vector from it is undefined rather than slow. See the same guard
+/// in `ops::moe`, which is where the mistake was made first.
+fn vec16(a: &Array, n: usize) -> bool {
+    let l = lanes(a.dtype);
+    l > 0 && n % l == 0 && a.offset % 16 == 0
+}
+
+/// Whether the elementwise kernels move sixteen bytes a thread.
+///
+/// Phase 37's re-taken inventory reads `swiglu` at 106 GB/s and
+/// `sigmoid_gate` at 105 on a machine that does 465, where `add_rms` reads
+/// 425 and `block_softmax` 404. The difference is the access width and
+/// nothing else, which `REBUILD.md` Phase 36 established on the MoE copies.
+/// `ORNITH_WIDE_ELEM=0` is the control.
+static WIDE_ELEM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static WIDE_ELEM_ENV: std::sync::Once = std::sync::Once::new();
+
+pub(crate) fn wide_elem() -> bool {
+    WIDE_ELEM_ENV.call_once(|| {
+        if std::env::var("ORNITH_WIDE_ELEM").as_deref() == Ok("0") {
+            WIDE_ELEM.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    WIDE_ELEM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the wide elementwise kernels on or off at runtime; returns what it
+/// was.
+pub fn set_wide_elem(on: bool) -> bool {
+    let was = wide_elem();
+    WIDE_ELEM.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
+}
+
+/// Whether [`swiglu`] would take its wide path, so a test can say which one
+/// it covered rather than leaving a green pair to mean nothing.
+pub fn would_widen(a: &Array, n: usize) -> bool {
+    wide_elem() && vec16(a, n)
 }
 
 /// mlx_lm's `precise_swiglu`: silu and the product in float32, result cast
@@ -63,8 +123,15 @@ pub fn sigmoid_gate(ctx: &Context, gate: &Array, x: &Array) -> Array {
     let inner = x.numel() / gate.numel();
     assert_eq!(gate.numel() * inner, x.numel(), "gate does not divide x");
     let out = Array::empty(ctx, &x.shape, x.dtype);
-    let (grid, tg) = flat(x.numel());
-    ctx.kernel(&format!("sigmoid_gate_{}", tname(x.dtype)))
+    let lanes = lanes(x.dtype);
+    // `inner` too: a thread's sixteen bytes must not straddle two gates.
+    let wide = wide_elem()
+        && inner % lanes == 0
+        && vec16(x, x.numel())
+        && vec16(&out, x.numel());
+    let (grid, tg) = flat(if wide { x.numel() / lanes } else { x.numel() });
+    let name = if wide { "sigmoid_gate_wide" } else { "sigmoid_gate" };
+    ctx.kernel(&format!("{name}_{}", tname(x.dtype)))
         .arr(gate)
         .arr(x)
         .out(&out)

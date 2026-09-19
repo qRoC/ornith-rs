@@ -387,6 +387,45 @@ fn main() {
     // of a run*, before the machine has drifted. So this mode skips the
     // cell below, puts `add_rms` first, and stops after it.
     let addrms = std::env::args().any(|a| a == "addrms");
+    // The third single-cell mode, same reason as the other two: the
+    // elementwise kernels' access width, which Phase 37's inventory reads
+    // at 106 GB/s for `swiglu` and 105 for `sigmoid_gate` where `add_rms`
+    // reads 425. The expected size is ~1% of a chunk, which is under what
+    // three pairs of a whole prompt resolve, so it needs the eight-pair
+    // cell and its control-against-itself row.
+    let elem = std::env::args().any(|a| a == "elem");
+    if elem {
+        println!("\nthe elementwise kernels, sixteen bytes a thread and one element\n");
+        println!("  {:<24} {:>9} {:>11} {:>10}", "", "GPU ms", "dispatches", "draws");
+        for (name, on) in [("the control, twice", false), ("wide", true)] {
+            let (mut narrow, mut wide) = (Vec::new(), Vec::new());
+            let (mut dn, mut dw) = (0.0, 0.0);
+            for _ in 0..8 {
+                ornith_rs::ops::elementwise::set_wide_elem(false);
+                let (ms, d) = step(&ctx, &mut caches, false);
+                narrow.push(ms);
+                dn = d;
+                ornith_rs::ops::elementwise::set_wide_elem(on);
+                let (ms, d) = step(&ctx, &mut caches, false);
+                wide.push(ms);
+                dw = d;
+            }
+            let pairs: Vec<f64> = wide.iter().zip(&narrow).map(|(a, b)| a - b).collect();
+            let (a, b) = (median(&mut narrow.clone()), median(&mut wide.clone()));
+            println!(
+                "  {name:<24} {:>9.3} {:>11.0}  mean of pairs {:+.3} ms, {} of {} down, {:+.2}%",
+                b - a,
+                dw - dn,
+                pairs.iter().sum::<f64>() / pairs.len() as f64,
+                pairs.iter().filter(|d| **d < 0.0).count(),
+                pairs.len(),
+                100.0 * (b - a) / a,
+            );
+            println!("  {:<24} narrow {narrow:.3?}\n  {:<24} wide   {wide:.3?}", "", "");
+        }
+        ornith_rs::ops::elementwise::set_wide_elem(true);
+        return;
+    }
     let moe_draws = if ab_only || only { 8 } else { DRAWS + 1 };
     if !addrms {
     println!("\nthe expert gather and its inverse, indexed and copied\n");

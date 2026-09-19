@@ -25,6 +25,35 @@ template <typename T>
   dst[i] = src[r * src_row + start + c];
 }
 
+// The same slice, sixteen bytes a thread.
+//
+// A pure copy, so bit-exact by construction. The caller takes this only
+// when `start`, `dst_row` and `src_row` are all whole numbers of vectors
+// and both bases are 16-byte aligned -- see `layout::vec16`. The narrow
+// form stays for every other shape, and `ORNITH_WIDE_ELEM=0` is the
+// control for both.
+template <typename T>
+struct alignas(16) Slice16 {
+  uint8_t b[16];
+};
+
+template <typename T>
+[[kernel]] void slice_inner_wide(
+    const device T* src [[buffer(0)]],
+    device T* dst [[buffer(1)]],
+    const constant uint& src_row [[buffer(2)]],
+    const constant uint& dst_row [[buffer(3)]],
+    const constant uint& start [[buffer(4)]],
+    uint i [[thread_position_in_grid]]) {
+  constexpr uint L = 16 / sizeof(T);
+  const uint r = i / (dst_row / L);
+  const uint c = i - r * (dst_row / L);
+  const device Slice16<T>* s16 =
+      (const device Slice16<T>*)(src + r * src_row + start);
+  device Slice16<T>* d16 = (device Slice16<T>*)(dst + (size_t)r * dst_row);
+  d16[c] = s16[c];
+}
+
 // [B, L, H, D] -> [B, H, L, D]
 template <typename T>
 [[kernel]] void transpose_lh(
@@ -78,7 +107,8 @@ template <typename T>
 }
 
 #define instantiate_layout(tname, type)                          \
-  instantiate_kernel("slice_inner_" #tname, slice_inner, type)   \
+  instantiate_kernel("slice_inner_" #tname, slice_inner, type)                \
+  instantiate_kernel("slice_inner_wide_" #tname, slice_inner_wide, type)   \
   instantiate_kernel("concat_inner_" #tname, concat_inner, type) \
   instantiate_kernel("transpose_lh_" #tname, transpose_lh, type) \
   instantiate_kernel("transpose_hl_" #tname, transpose_hl, type)

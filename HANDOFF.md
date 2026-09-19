@@ -2748,6 +2748,19 @@ reads much more invitingly than it should.
   addrms` does the same for the residual-add fusion, which needed exactly
   that protocol after three readings of it straddled zero (it is **zero**;
   `REBUILD.md` Phase 35).
+- **`ORNITH_WIDE_ELEM=0` narrows the elementwise kernels** the way
+  `ORNITH_MOE_GATHER_WIDE=0` narrows the MoE copies: `swiglu`,
+  `sigmoid_gate` and `slice_inner` go back to one element a thread. Wide
+  they are 2.7-5.5x faster and sit at the memory ceiling (430-504 GB/s
+  against 465), worth ~17.8 ms a chunk isolated. `step_inventory prefill
+  elem` is the third single-cell mode and it **cannot resolve that** --
+  its control-against-itself row reads +12 ms on a ~1200 ms chunk -- so
+  the numbers come from `bin/arithmetic`, which times the kernels alone.
+  **A guard on all of these checks the base is 16-byte aligned and not
+  only that the row divides**, because an `Array` may be a view with a
+  byte offset; `moe::gather_would_widen` and
+  `elementwise::would_widen` exist so a test can assert the wide path is
+  live rather than leaving a green pair to mean nothing.
 - **Two stand-ins produce wrong answers on purpose**, and both exist
   because a removal cannot price what they price. `ORNITH_FAKE_SORT=1` is
   the older one. `Q4KBareFmt` / `kquant::qmm_t_bare` is the newer: the

@@ -42,8 +42,21 @@ pub fn slice_inner(ctx: &Context, x: &Array, start: usize, len: usize) -> Array 
     let n = shape.len();
     shape[n - 1] = len;
     let out = Array::empty(ctx, &shape, x.dtype);
-    let (grid, tg) = flat(out.numel());
-    ctx.kernel(&format!("slice_inner_{}", tname(x.dtype)))
+    // Sixteen bytes a thread when every stride in the copy is a whole
+    // number of vectors and both bases are aligned; see the same guard in
+    // `ops::elementwise`, and `REBUILD.md` Phase 36 for why the width is
+    // worth checking at all.
+    let lanes = 16 / x.dtype.size();
+    let wide = crate::ops::elementwise::wide_elem()
+        && lanes > 0
+        && row % lanes == 0
+        && len % lanes == 0
+        && start % lanes == 0
+        && x.offset % 16 == 0
+        && out.offset % 16 == 0;
+    let (grid, tg) = flat(if wide { out.numel() / lanes } else { out.numel() });
+    let name = if wide { "slice_inner_wide" } else { "slice_inner" };
+    ctx.kernel(&format!("{name}_{}", tname(x.dtype)))
         .arr(x)
         .out(&out)
         .bytes(&(row as u32))

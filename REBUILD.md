@@ -6352,6 +6352,67 @@ the 1.18. **The k-quants buy memory and pay for it in prefill
 arithmetic**, and the payment is mostly ggml's tiling rather than ggml's
 format. That belongs beside every other entry in the quantization ledger.
 
+### The width lesson, applied to what the inventory still had under the ceiling
+
+Phase 36 found a copy at 37 GB/s on a 465 GB/s machine and a 16-byte access
+worth four times what removing it was. The re-taken inventory says which
+kernels are still in that state, and it is four of them. They are now wide,
+by the same fifteen lines each and behind one control
+(`ORNITH_WIDE_ELEM=0`):
+
+    timed on their own, best of five, at a chunk's own shapes
+
+      kernel                       narrow    wide     GB/s   x 40/10/20
+      swiglu, experts             0.266 ms  0.100      504      6.6 ms
+      swiglu, shared expert       0.041     0.023      274      0.7
+      sigmoid_gate, output gate   0.426     0.078      430      3.5
+      slice_inner, q/gate split   0.426     0.078      431      7.0
+                                                              17.8 ms a chunk
+
+**2.7x to 5.5x each, and all four now sit at the memory ceiling** -- 430-504
+GB/s against the 465 `bin/bandwidth` measures, with the shared expert's
+2 MB array the one exception and launch-bound rather than width-bound.
+
+**And they were timed on their own because the chunk cell refused them.**
+`step_inventory prefill elem` runs the pair at the chunk, eight interleaved
+draws, and its **control-against-itself row read +12 ms of noise on a
+~1200 ms chunk** while the base drifted from 1.1 s to 2.0 s inside the
+cell. The effect is ~17 ms. An instrument whose noise floor is its own
+answer is an instrument saying no, and the right move is a different one:
+these are kernels with no reduction and nothing else competing for DRAM, so
+a best-of on the kernel alone resolves them to a few percent where the
+paired chunk cannot resolve them at all. The chunk-level claim is then the
+isolated saving times the coefficient -- a pass over memory returns most of
+itself -- so **~1.4% of a chunk**, and it is stated as an inference rather
+than measured as one.
+
+Bit-exactness is not inferred, though. Every output element is the same
+expression of the same inputs, so `the_wide_activations_are_the_narrow_ones`
+holds the wide `swiglu` to mlx's own reference over **6656 bfloat16 values**
+and the broadcast `sigmoid_gate` to the narrow kernel the golden case
+covers; and 200 tokens greedy and `--mtp --frspec` are byte-identical on
+both artifacts under both arms -- and against the hashes from before any of
+this phase's changes.
+
+**A trap the copies had hidden, found here.** A 16-byte load needs a
+16-byte *base*, and an `Array` may be a view: `slice_leading`,
+`slice_inner` and every expert view set a byte `offset` that
+`setBuffer:offset:` passes to the kernel. The first guard checked only that
+a row divides. Nothing in the model reaches these kernels through a
+misaligned view -- which is why nothing failed -- and the guard now checks
+the base too, in all three places. **And the guard needs its own check**:
+one that answers "narrow" to both arms makes a wide/narrow pair green and
+empty, so `gather_would_widen` and `elementwise::would_widen` let the tests
+*assert* the wide path is live and print the offset they saw. The first
+version of the activations test asserted it and failed, because the golden
+case is 6660 values and a 16-byte access wants a multiple of eight -- which
+is the guard working and the assertion earning its place on its first run.
+
+**What is left in the bucket after this**: the two transposes, 12.4 ms at
+54-68 GB/s. They are not a width change -- one side of a transpose is
+strided, so it wants a tiled kernel through threadgroup memory -- and at
+~0.8% of a chunk that is priced and not built.
+
 ### What it says about where to go, which is mostly "not far"
 
 Prefill is **89.4% gemm**, and the gemm's distance from the ceiling is now

@@ -28,6 +28,70 @@ template <typename T, typename U>
   out[i] = static_cast<U>(in[i]);
 }
 
+// --- the same kernels, sixteen bytes a thread ------------------------------
+//
+// Phase 36 found a bf16 copy dispatched one element per thread running at 37
+// GB/s on a 465 GB/s machine, and a 16-byte access worth four times what
+// removing the copy outright was. Phase 37's re-taken inventory says which
+// of these are still in that state: `swiglu` at 106 GB/s over 21.4 ms a
+// chunk and `sigmoid_gate` at 105 over 4.8 ms, against `add_rms` at 425 and
+// `block_softmax` at 404, which are done.
+//
+// **Bit-exact by construction, and for a stronger reason than the copies
+// were.** Every output element is the same expression of the same inputs; a
+// thread doing eight of them evaluates eight independent scalars, in the
+// same precision, with no reduction and no reassociation anywhere. What
+// moves is which thread does which element.
+//
+// Two conditions the caller checks, and the second is the one that is easy
+// to miss: the element count must divide, **and the base must be 16-byte
+// aligned**, because an `Array` may be a view with a byte offset
+// (`elementwise::vec16`).
+template <typename T>
+struct alignas(16) Lane16 {
+  T v[16 / sizeof(T)];
+};
+
+template <typename T>
+[[kernel]] void swiglu_wide(
+    const device T* gate [[buffer(0)]],
+    const device T* x [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    uint i [[thread_position_in_grid]]) {
+  constexpr short L = 16 / sizeof(T);
+  Lane16<T> g = ((const device Lane16<T>*)gate)[i];
+  Lane16<T> xv = ((const device Lane16<T>*)x)[i];
+  Lane16<T> o;
+#pragma clang loop unroll(full)
+  for (short j = 0; j < L; ++j) {
+    T gj = g.v[j];
+    o.v[j] = (gj * mlx_sigmoid_f32(gj)) * xv.v[j];
+  }
+  ((device Lane16<T>*)out)[i] = o;
+}
+
+// `inner` is the broadcast width, and the caller only takes this path when
+// it is a whole number of lanes -- so a thread's sixteen bytes never straddle
+// two gate values and `mlx_sigmoid` is evaluated once for all of them, which
+// is the same number it would have got eight times over.
+template <typename T>
+[[kernel]] void sigmoid_gate_wide(
+    const device T* gate [[buffer(0)]],
+    const device T* x [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    const constant uint& inner [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+  constexpr short L = 16 / sizeof(T);
+  const T g = mlx_sigmoid(gate[(i * L) / inner]);
+  Lane16<T> xv = ((const device Lane16<T>*)x)[i];
+  Lane16<T> o;
+#pragma clang loop unroll(full)
+  for (short j = 0; j < L; ++j) {
+    o.v[j] = g * xv.v[j];
+  }
+  ((device Lane16<T>*)out)[i] = o;
+}
+
 // mlx_lm/models/activations.py: swiglu(gate, x) = nn.silu(gate) * x.
 // nn.silu is `x * sigmoid(x)` evaluated in the array's own dtype.
 template <typename T>
@@ -130,8 +194,10 @@ template <typename T>
 
 #define instantiate_elementwise(tname, type)                                  \
   instantiate_kernel("swiglu_" #tname, swiglu, type)                          \
+  instantiate_kernel("swiglu_wide_" #tname, swiglu_wide, type)                \
   instantiate_kernel("precise_swiglu_" #tname, precise_swiglu, type)          \
   instantiate_kernel("sigmoid_gate_" #tname, sigmoid_gate, type)              \
+  instantiate_kernel("sigmoid_gate_wide_" #tname, sigmoid_gate_wide, type)    \
   instantiate_kernel("silu_" #tname, silu, type)                               \
   instantiate_kernel("scalar_mul_" #tname, scalar_mul, type)                   \
   instantiate_kernel("causal_mask_" #tname, causal_mask_, type)                               \

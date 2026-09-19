@@ -37,6 +37,8 @@ use ornith_rs::ops::kquant::{
     KMatrix, KQuant, QK_K, gather_qmm_t, qmm_t, qmm_t_bare, set_mm_half, set_mm_rows,
     set_mm_rows_id,
 };
+use ornith_rs::ops::elementwise::{set_wide_elem, sigmoid_gate, swiglu};
+use ornith_rs::ops::layout::slice_inner;
 use ornith_rs::ops::matmul::matmul;
 use ornith_rs::ops::quantized::{QuantMatrix, QuantMode, quantized_matmul};
 
@@ -482,6 +484,89 @@ fn unpack_cost(ctx: &Context, ceiling: f64) {
     }
 }
 
+// --- 6. the elementwise kernels' access width -------------------------------
+
+/// The two elementwise kernels Phase 37's inventory still reads far from the
+/// memory ceiling -- `swiglu` at 106 GB/s over 21.4 ms a chunk,
+/// `sigmoid_gate` at 105 over 4.8 -- against `add_rms` at 425 and
+/// `block_softmax` at 404, which are done.
+///
+/// **Measured here and not in the chunk cell, and that is the finding about
+/// the instrument.** The effect is ~1% of a chunk; `step_inventory prefill
+/// elem`'s own control-against-itself row reads +12 ms of noise on a
+/// ~1200 ms chunk and the base drifted from 1.1 s to 2.0 s inside the cell,
+/// so it cannot resolve this and said so. A kernel timed on its own with a
+/// best-of can: nothing here competes for DRAM with anything else, and the
+/// minimum of five draws is robust to a busy machine in a way a paired
+/// chunk is not.
+fn elementwise_width(ctx: &Context) {
+    println!("\nthe elementwise kernels, sixteen bytes a thread and one element\n");
+    println!("  {:<28} {:>10} {:>10} {:>9} {:>8}", "kernel / shape", "narrow ms", "wide ms", "GB/s", "saved");
+    // The shapes a prefill chunk actually dispatches them at: the experts'
+    // activation, the shared expert's, and the attention output gate.
+    let cases: [(&str, usize, usize, bool); 3] = [
+        ("swiglu, experts", 16384, 512, false),
+        ("swiglu, shared expert", 2048, 512, false),
+        ("sigmoid_gate, output gate", 2048, 4096, true),
+    ];
+    let mut total_saved = 0.0f64;
+    for (name, rows, dim, gated) in cases {
+        let n = rows * dim;
+        let a = Array::from_f32_as_bf16(ctx, &vec![0.3f32; n], &[rows, dim]);
+        let b = Array::from_f32_as_bf16(ctx, &vec![0.7f32; n], &[rows, dim]);
+        let g = Array::from_f32_as_bf16(ctx, &vec![0.2f32; rows], &[rows]);
+        let mut t = [0.0f64; 2];
+        for (i, on) in [false, true].into_iter().enumerate() {
+            set_wide_elem(on);
+            t[i] = best_of(ctx, 5, || {
+                let _ = if gated { sigmoid_gate(ctx, &g, &b) } else { swiglu(ctx, &a, &b) };
+            });
+        }
+        set_wide_elem(true);
+        // Three arrays of `n` bf16 for swiglu, two and a row for the gate.
+        let bytes = if gated { 2.0 * n as f64 * 2.0 } else { 3.0 * n as f64 * 2.0 };
+        let count = if gated { 10.0 } else if rows == 16384 { 40.0 } else { 40.0 };
+        let saved = (t[0] - t[1]) * 1e3 * count;
+        total_saved += saved;
+        println!(
+            "  {name:<28} {:>10.3} {:>10.3} {:>9.0} {:>7.1} ms",
+            t[0] * 1e3,
+            t[1] * 1e3,
+            bytes / t[1] / 1e9,
+            saved
+        );
+    }
+    // And the slice, which is the same copy with a stride. Its shape is the
+    // gated-delta layers' q/gate split: 4096 of a 8192-wide row.
+    {
+        let (rows, src_row, len) = (2048usize, 8192usize, 4096usize);
+        let x = Array::from_f32_as_bf16(ctx, &vec![0.3f32; rows * src_row], &[rows, src_row]);
+        let mut t = [0.0f64; 2];
+        for (i, on) in [false, true].into_iter().enumerate() {
+            set_wide_elem(on);
+            t[i] = best_of(ctx, 5, || {
+                let _ = slice_inner(ctx, &x, 0, len);
+            });
+        }
+        set_wide_elem(true);
+        let bytes = 2.0 * (rows * len) as f64 * 2.0;
+        let saved = (t[0] - t[1]) * 1e3 * 20.0;
+        total_saved += saved;
+        println!(
+            "  {:<28} {:>10.3} {:>10.3} {:>9.0} {:>7.1} ms",
+            "slice_inner, q/gate split",
+            t[0] * 1e3,
+            t[1] * 1e3,
+            bytes / t[1] / 1e9,
+            saved
+        );
+    }
+    println!(
+        "  {:<28} {:>32} {:>7.1} ms a chunk, isolated",
+        "so, at a chunk's dispatch counts", "", total_saved
+    );
+}
+
 fn main() {
     let ctx = Context::new().unwrap();
     println!("{}", ctx.device_name());
@@ -491,6 +576,7 @@ fn main() {
     real(&ctx, mma);
     decompose_routed(&ctx, mma);
     unpack_cost(&ctx, mma);
+    elementwise_width(&ctx);
 
     // The flag the tile carries, on the real kernel, beside the synthetic
     // ratio above. If the matrix unit prefers half and the kernel does not,
