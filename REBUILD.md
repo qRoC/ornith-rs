@@ -5691,21 +5691,27 @@ floor on what is left rather than a ceiling.
 
 ### The first elementwise number at this width, and what is not measured yet
 
-The bin's A/B cells run at a prefill chunk too, and the one that got a
-reading before this phase went after the sort says the same thing the
-launch arithmetic does, from the fusion's own side:
+The bin's A/B cells run at a prefill chunk too. `add_rms` has been read
+twice and **the two readings disagree**, which is worth recording as a
+disagreement rather than resolving by preference:
 
-    the residual add and the norm that reads it, a 2048-token chunk
-    (4 draws, from the run this phase then abandoned -- a weak reading)
+    the residual add and the norm that reads it, a 2048-token chunk,
+    4 draws each, two runs on two artifacts of the sort
 
-      separate   1645.2 ms   1505 dispatches
-      fused      1640.1      1425
-      so           -5.1 ms, -0.31%
+      before the sort was parallelised   1645.2 -> 1640.1   -5.1 ms, -0.31%
+      after                              1483.5 -> 1448.8  -34.8 ms, -2.34%
 
-80 dispatches removed for 5 ms, i.e. **63 ns a dispatch** where the same
-fusion is worth 1.1 us a dispatch at a decode step. The launch is not what
-it buys here; what it buys is one intermediate not written and read back,
-and at this width that is 0.3% rather than 1.3%.
+Seven times apart, and neither is strong: four draws, and in the second the
+arms' ranges overlap (separate 1444-1498, fused 1409-1464). **So what this
+fusion is worth at a prefill chunk is not established**, and any sentence
+about 63 ns or 435 ns a dispatch would be a sentence about one of two
+readings. Eight interleaved pairs near the top of a run would settle it;
+this phase did not spend them.
+
+What *is* established, and does not rest on this cell: launches are 0.22%
+of a chunk, so nothing here is bought by removing one -- and the two
+block-shaped kernels read -5.3% and -4.7% below. The mechanism is
+intermediates. The size of this particular one is open.
 
 **And the measurement this instrument was built for does not transfer.**
 `step_inventory prefill border` -- the census and the chain's boundary at a
