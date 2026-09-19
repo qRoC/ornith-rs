@@ -8,6 +8,7 @@
 // intermediate dtype had to be matched exactly.
 
 #include "mlx/backend/metal/kernels/utils.h"
+#include "ornith_sigmoid.h"
 
 // `a[..., n - k:]`: the top-k slice of an ascending argsort.
 template <typename T>
@@ -94,6 +95,67 @@ template <typename T>
   out[i] = x[i] * scale[i / dim];
 }
 
+// The whole tail of the MoE block, in one dispatch.
+//
+// Six kernels used to do this, one after another, none of them doing any work
+// worth its launch: `row_reduce_small` over the k router scores,
+// `div_by_row`, `mul_by_row` over the k expert outputs, `col_reduce_small`
+// over the same, `sigmoid_gate` on the shared expert and `add_elem` to join
+// the two. That is 240 dispatches a token in a 40-layer model, and
+// `REBUILD.md` Phase 32 measured them at 0.40 ms of a 6.70 ms trunk.
+//
+// Bit-exact by construction, which for a reduction means reproducing its
+// accumulator and its order as well as its arithmetic. mlx instantiates `Sum`
+// over bfloat16 with `U = bfloat16_t`, so both sums accumulate **in
+// bfloat16**, rounding at every step, and both run in ascending index order:
+//
+//   * `row_reduce_small` folds the score row as `total = vals[j] + total`,
+//     reading it in blocks of `N_READS = 4` -- for k = 8 that is v0 .. v7 in
+//     sequence;
+//   * `col_reduce_small` hands each of the k rows to one thread of `lid.y`,
+//     each folding `total = val + init`, and thread 0 then folds the k
+//     partials out of threadgroup memory as `total = shared[j] + total` with
+//     j ascending -- the same sequence again.
+//
+// Every value the six kernels wrote to memory is a `T` local here, so it
+// rounds to bfloat16 at the same point it used to: the score sum, the
+// normalised score, each weighted expert row, the mixture, and the gated
+// shared expert.
+template <typename T>
+[[kernel]] void moe_combine(
+    const device T* scores [[buffer(0)]],  // [tokens, k]
+    const device T* y [[buffer(1)]],       // [tokens, k, dim]
+    const device T* gate [[buffer(2)]],    // [tokens, 1]
+    const device T* shared [[buffer(3)]],  // [tokens, dim]
+    device T* out [[buffer(4)]],           // [tokens, dim]
+    const constant uint& k [[buffer(5)]],
+    const constant uint& dim [[buffer(6)]],
+    const constant uint& normalize [[buffer(7)]],
+    uint i [[thread_position_in_grid]]) {
+  uint token = i / dim;
+  uint col = i - token * dim;
+
+  const device T* s = scores + token * k;
+  T denom = 0;
+  if (normalize) {
+    for (uint j = 0; j < k; ++j) {
+      denom = s[j] + denom;
+    }
+  }
+
+  const device T* row = y + (token * k) * dim + col;
+  T acc = 0;
+  for (uint j = 0; j < k; ++j) {
+    T w = normalize ? T(s[j] / denom) : s[j];
+    T weighted = row[j * dim] * w;
+    acc = weighted + acc;
+  }
+
+  T g = mlx_sigmoid(gate[token]);
+  T gated = g * shared[i];
+  out[i] = acc + gated;
+}
+
 // A stable counting sort of the expert indices, producing the same permutation
 // mlx's `mx.argsort` does.
 //
@@ -141,7 +203,8 @@ template <typename T>
   instantiate_kernel("div_by_row_" #tname, div_by_row, type)           \
   instantiate_kernel("gather_rows_div_" #tname, gather_rows_div, type) \
   instantiate_kernel("unsort_rows_" #tname, unsort_rows, type)         \
-  instantiate_kernel("mul_by_row_" #tname, mul_by_row, type)
+  instantiate_kernel("mul_by_row_" #tname, mul_by_row, type)           \
+  instantiate_kernel("moe_combine_" #tname, moe_combine, type)
 
 instantiate_moe(bfloat16, bfloat16_t)
 instantiate_moe(float32, float)

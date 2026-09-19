@@ -317,6 +317,73 @@ fn counting_sort(ctx: &Context, inds: &Array, n_experts: usize) -> (Array, Array
     (order, inv_order)
 }
 
+/// The whole tail of the block in one dispatch: the top-k scores normalised,
+/// the expert outputs weighted and mixed, the shared expert gated, and the
+/// two added.
+///
+/// `scores` is the router's top-k as [`top_k`] returns it -- not normalised,
+/// since the normalising is the first thing this does. The six kernels it
+/// replaces did no work at all: 240 dispatches a token, 0.40 ms of a 6.70 ms
+/// trunk, all of it launch (`REBUILD.md` Phase 32). `kernels/moe.metal` says
+/// what had to be reproduced to keep it bit-exact -- both sums accumulate in
+/// bfloat16, in ascending order, because that is what mlx's `Sum` does.
+///
+/// `ORNITH_FUSE_MOE_TAIL=0` issues the six separately, as the control.
+pub fn combine(
+    ctx: &Context,
+    scores: &Array,
+    y: &Array,
+    gate: &Array,
+    shared: &Array,
+    normalize: bool,
+) -> Array {
+    assert_eq!(y.ndim(), 3, "expert outputs are [tokens, k, dim]");
+    let (tokens, k, dim) = (y.shape[0], y.shape[1], y.shape[2]);
+    assert_eq!(shared.numel(), tokens * dim, "the shared expert is one row a token");
+    assert_eq!(gate.numel(), tokens, "the shared expert's gate is one number a token");
+
+    if !fuse_moe_tail() {
+        let scores = if normalize { normalize_scores(ctx, scores) } else { scores.clone() };
+        let mixed = mix_experts(ctx, y, &scores);
+        let gated = super::elementwise::sigmoid_gate(ctx, gate, shared);
+        return super::elementwise::add(ctx, &mixed, &gated);
+    }
+
+    let out = Array::empty(ctx, &[tokens, dim], y.dtype);
+    let (grid, tg) = flat(tokens * dim);
+    ctx.kernel(&format!("moe_combine_{}", tname(y.dtype)))
+        .arr(scores)
+        .arr(y)
+        .arr(gate)
+        .arr(shared)
+        .out(&out)
+        .bytes(&(k as u32))
+        .bytes(&(dim as u32))
+        .bytes(&(normalize as u32))
+        .threads(grid, tg);
+    out
+}
+
+/// Whether the block's tail is one dispatch or six. See [`combine`].
+static FUSE_MOE_TAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static FUSE_MOE_TAIL_ENV: std::sync::Once = std::sync::Once::new();
+
+fn fuse_moe_tail() -> bool {
+    FUSE_MOE_TAIL_ENV.call_once(|| {
+        if std::env::var("ORNITH_FUSE_MOE_TAIL").as_deref() == Ok("0") {
+            FUSE_MOE_TAIL.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    FUSE_MOE_TAIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the fusion on or off at runtime; returns what it was.
+pub fn set_fuse_moe_tail(on: bool) -> bool {
+    let was = fuse_moe_tail();
+    FUSE_MOE_TAIL.store(on, std::sync::atomic::Ordering::Relaxed);
+    was
+}
+
 /// The whole `Qwen3NextSparseMoeBlock`, given the layer's weights.
 #[allow(clippy::too_many_arguments)]
 pub fn sparse_moe_block(
@@ -348,8 +415,8 @@ pub fn sparse_moe_block(
     let gates = gate.matmul(ctx, &x2);
     let sg = shared_gate.matmul(ctx, &x2);
     let su = shared_up.matmul(ctx, &x2);
-    let early_gate = !late_shared_gate();
-    let mut gate_scalar = early_gate.then(|| shared_expert_gate.matmul(ctx, &x2));
+    let gate_pos = shared_gate_pos();
+    let mut gate_scalar = (gate_pos == 0).then(|| shared_expert_gate.matmul(ctx, &x2));
 
     let gates = super::softmax::softmax(ctx, &gates, true);
     let sact = super::elementwise::swiglu(ctx, &sg, &su);
@@ -357,31 +424,39 @@ pub fn sparse_moe_block(
     let (inds, scores) = top_k(ctx, &gates, top_k_n);
     let shared_y = shared_down.matmul(ctx, &sact);
 
-    let scores = if norm_topk_prob { normalize_scores(ctx, &scores) } else { scores };
-
     // `shared_expert_gate` is one row of 2048 -- 6 KB, one output number --
-    // and it is the most expensive small dispatch in the step: 13 us, because
-    // a one-row `qmv` is 32 threads walking K in a chain of dependent loads
-    // and there is nothing else in it to hide them behind. Its own epoch is
-    // where that shows. It depends on `x2` alone and is not read until
-    // `sigmoid_gate`, so it is issued here instead, next to the routed
-    // experts' gathers -- which are 14-16 us of memory each and have the
-    // latency slack to absorb it. Same dispatch, same inputs, same output;
-    // only where it sits in the queue moves. `ORNITH_MOE_EARLY_GATE=1` puts
-    // it back beside the router, as the control. Moving the shared expert's
-    // *down* projection along with it measured the same to within a
-    // thousandth of a millisecond, so it stays where it is.
-    if !early_gate {
+    // and it is the most expensive small dispatch in the step: 12.4 us,
+    // because a one-row `qmv` is 32 threads walking K in a chain of dependent
+    // loads and there is nothing else in it to hide them behind. Its own
+    // epoch is where that shows. It depends on `x2` alone and nothing reads
+    // it until the block's tail, so it may be issued into any epoch in
+    // between, and which one is worth ~3% of a decode step. See
+    // [`shared_gate_pos`] for the three, and `ORNITH_MOE_GATE_POS` to pick
+    // one. Same dispatch, same inputs, same output; only where it sits in
+    // the queue moves. Moving the shared expert's *down* projection along
+    // with it measured the same to within a thousandth of a millisecond, so
+    // that stays where it is.
+    if gate_pos == 1 {
         gate_scalar = Some(shared_expert_gate.matmul(ctx, &x2));
     }
 
     let y = switch_glu(ctx, &x2, &inds, switch_gate, switch_up, switch_down);
 
-    let shared_y =
-        super::elementwise::sigmoid_gate(ctx, gate_scalar.as_ref().unwrap(), &shared_y);
-    let mixed = mix_experts(ctx, &y, &scores);
+    // Position 2, measured and rejected. Fusing the tail (Phase 32) took
+    // `sigmoid_gate` out of the epoch that used to cover position 1, and
+    // `tools/epoch_slack.py` then found the gate alone at the head of its
+    // own epoch again -- 38 of 40 of them, 6.2 us each, 0.235 ms a token if
+    // each moved one epoch on, into the last gather's 14-16 us of memory.
+    // Issued here it **costs 0.104 ms, 0 of 8 pairs down**: at position 1
+    // there are two barriers of gather between the gate and the tail that
+    // reads it, and that is what hides its dependent-load chain, not the
+    // epoch it shares. The model ranks; it does not predict.
+    if gate_pos == 2 {
+        gate_scalar = Some(shared_expert_gate.matmul(ctx, &x2));
+    }
 
-    let out = super::elementwise::add(ctx, &mixed, &shared_y);
+    let out =
+        combine(ctx, &scores, &y, gate_scalar.as_ref().unwrap(), &shared_y, norm_topk_prob);
     out.reshape(&x.shape)
 }
 
@@ -426,24 +501,43 @@ pub fn set_fake_sort(on: bool) -> bool {
     was
 }
 
-/// Where the shared expert's gate goes. See [`sparse_moe_block`].
-static LATE_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static LATE_GATE_ENV: std::sync::Once = std::sync::Once::new();
+/// Which epoch the shared expert's gate is issued into, in
+/// [`sparse_moe_block`]:
+///
+///   0. beside the router, where the Python has it;
+///   1. beside the routed experts' gathers -- Phase 31, worth 3.3% then,
+///      and the default;
+///   2. after them, in the epoch the down gather holds -- what
+///      `tools/epoch_slack.py` asked for after Phase 32 moved the epochs,
+///      and worth -0.104 ms when it was measured. Kept as the control that
+///      says so.
+///
+/// Since the tail was fused, 0 and 1 measure the same (-0.007 ms, 5 of 8
+/// pairs down): the fusion took what the reorder was buying.
+///
+/// `ORNITH_MOE_GATE_POS` picks one; `ORNITH_MOE_EARLY_GATE=1` is the older
+/// spelling of 0 and still works, since it is the control the record quotes.
+static GATE_POS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+static GATE_POS_ENV: std::sync::Once = std::sync::Once::new();
 
-fn late_shared_gate() -> bool {
-    LATE_GATE_ENV.call_once(|| {
-        if std::env::var("ORNITH_MOE_EARLY_GATE").as_deref() == Ok("1") {
-            LATE_GATE.store(false, std::sync::atomic::Ordering::Relaxed);
-        }
+fn shared_gate_pos() -> u8 {
+    GATE_POS_ENV.call_once(|| {
+        let p = match std::env::var("ORNITH_MOE_GATE_POS").as_deref() {
+            Ok(v) => v.parse().expect("ORNITH_MOE_GATE_POS is 0, 1 or 2"),
+            Err(_) if std::env::var("ORNITH_MOE_EARLY_GATE").as_deref() == Ok("1") => 0,
+            Err(_) => return,
+        };
+        assert!(p <= 2, "ORNITH_MOE_GATE_POS is 0, 1 or 2");
+        GATE_POS.store(p, std::sync::atomic::Ordering::Relaxed);
     });
-    LATE_GATE.load(std::sync::atomic::Ordering::Relaxed)
+    GATE_POS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Move it at runtime, so one process can measure both orders. Returns what
-/// it was.
-pub fn set_late_shared_gate(on: bool) -> bool {
-    let was = late_shared_gate();
-    LATE_GATE.store(on, std::sync::atomic::Ordering::Relaxed);
+/// Move it at runtime, so one process can measure all three. Returns what it
+/// was.
+pub fn set_shared_gate_pos(p: u8) -> u8 {
+    let was = shared_gate_pos();
+    GATE_POS.store(p, std::sync::atomic::Ordering::Relaxed);
     was
 }
 
@@ -549,18 +643,15 @@ pub fn sparse_moe_block_dense(
     let gates = super::softmax::softmax(ctx, &gates, true);
 
     let (inds, scores) = top_k(ctx, &gates, top_k_n);
-    let scores = if norm_topk_prob { normalize_scores(ctx, &scores) } else { scores };
 
     let y = switch_glu_dense(ctx, &x2, &inds, switch_gate, switch_up, switch_down);
-    let mixed = mix_experts(ctx, &y, &scores);
 
     let sg = matmul(ctx, &x2, shared_gate, true);
     let su = matmul(ctx, &x2, shared_up, true);
     let sact = super::elementwise::swiglu(ctx, &sg, &su);
     let shared_y = matmul(ctx, &sact, shared_down, true);
     let gate_scalar = matmul(ctx, &x2, shared_expert_gate, true);
-    let shared_y = super::elementwise::sigmoid_gate(ctx, &gate_scalar, &shared_y);
 
-    let out = super::elementwise::add(ctx, &mixed, &shared_y);
+    let out = combine(ctx, &scores, &y, &gate_scalar, &shared_y, norm_topk_prob);
     out.reshape(&x.shape)
 }
