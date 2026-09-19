@@ -1264,13 +1264,13 @@ router's top-k selected rather than sorted.
 And the speculative pairing does 14% less GPU work a token than plain decoding
 while only tying on the wall, for the reason in "It does not pay off here".
 
-| a decode step, now | affine artifact | `q6k-full`, after Phase 31 |
+| a decode step, now | affine artifact | `q6k-full`, after Phase 33 |
 |---|---|---|
-| GPU busy | 10.3-10.5 ms of a 10.85-11.34 ms wall -- 95-96% | **7.42-7.45** ms of a 7.88-7.94 ms wall, 126 tok/s |
-| idle between command buffers | 0.47-0.56 ms a token, essentially one round trip | 0.47 ms |
-| dispatches | 1669 per token, in 14 command buffers (1759 before single-row slices became views) | **1509** in 12 |
-| barriers | 1064 per token (1216 at the 1:1 commit, 1669 before the barrier work) | **908** |
-| epochs | 1078 per token, 1.55 dispatches each | 922, 1.63 each |
+| GPU busy | 10.3-10.5 ms of a 10.85-11.34 ms wall -- 95-96% | **7.19-7.21** ms of a 7.65-7.68 ms wall, 130 tok/s |
+| idle between command buffers | 0.47-0.56 ms a token, essentially one round trip | 0.49 ms |
+| dispatches | 1669 per token, in 14 command buffers (1759 before single-row slices became views) | **1009** in 8 (1509 in 12 after Phase 31, 1309 in 11 after Phase 32) |
+| barriers | 1064 per token (1216 at the 1:1 commit, 1669 before the barrier work) | **609** (908, then 787) |
+| epochs | 1078 per token, 1.55 dispatches each | 617, 1.64 each (922, then 798) |
 | host round trips | 1.00 per token | 1.00 |
 | weights read | ~2.83 GB per token, i.e. **272 GB/s** against a measured ceiling of 465 and a sticker of 546 | **1.81 GB** |
 
@@ -1280,8 +1280,11 @@ grid clamped to a single threadgroup -- same barriers, same command buffers,
 no work -- costs **3.4 ms of a 7.5 ms trunk, 46%**, and what is left moves
 1.62 GB at ~400-440 GB/s, which is this machine's ceiling. Three changes came
 out of that inventory and took **-8.9% a token** between them; the share of
-the step that is launches is 46% before and after. The section "What the
-dispatches cost" below is the whole of it.
+the step that is launches was 46% before and after. Phases 32 and 33 then
+took the launches themselves -- two block-shaped kernels, **-500 dispatches,
+-299 barriers, -305 epochs, -4 command buffers** and 117 tok/s to 130 -- and
+the share is now **38%**. The section "What the dispatches cost" below is the
+whole of it.
 
 | the prompt, at chunk 2048 | |
 |---|---|
@@ -1387,6 +1390,46 @@ of which the gated-delta chain is 200 and 0.29, and everything a general
 deferred op layer would be for is 361 and 0.63 -- so ~0.3 ms realized, 4.5%
 of the trunk. That is the number the layer has to be worth.
 
+**Phase 33 then wrote the gated-delta one and re-measured the rest.** Ten
+dispatches a layer into one (`gdn_front`: the conv window's concatenation and
+its tail, the depthwise conv, the silu, q and k's norms and scales, beta and
+the decay gate), 300 a token into 30, **-0.330 and -0.346 ms on the trunk in
+two processes, 16 of 16 pairs**. What is left is **311 dispatches and 0.89 ms
+of ceiling**, of which a deferred op layer's own share is **211 and 0.49 --
+~0.25 ms realized, 3.8% of a 6.5 ms trunk.** Phase 32 forecast ~0.3 and 4.5%
+and was right.
+
+**Two warnings came out of that kernel and both are about the set, not the
+coefficient.** The bucket said 200 dispatches and -0.32, the half rule said
+~0.15 ms, and the kernel returned 0.34 -- because `slice_inner` also names
+the attention layers' q/gate split (20 dispatches that are not this kernel's)
+while the 120 dispatches of `rms` and `scalar_mul` that *are* its own sit in
+a different bucket. **A pattern serves a call site; a kernel serves a block;
+for a rewrite those are different sets**, and nothing in this instrument can
+name the second. Against the object that can -- isolated time in the
+inventory -- it is ordinary: 861.7 us for the ten, 227.0 for the one, and
+0.34 realized of the 0.635 saved is 53%.
+
+And the second kernel of that phase, `rms_gated` (`RMSNormGated`, 60
+dispatches into 30), **measures zero**: +0.012 (3 of 8) and -0.021 (5 of 8)
+in two processes, against a zero-control band of -0.023 .. +0.054. It is kept
+-- exact, at its floor, 30 fewer dispatches and barriers, never worse -- but
+it did not pay. What the same run shows is that the 0.145 ms sitting on those
+two dispatches (**4.8 us each, three times the chain's average**, because
+they are the serial spine between the recurrence and `out_proj`) is not
+reachable by gluing two elementwise ops together at all. Only folding the
+norm into the matvec that reads it reaches it, which is what a deferred op
+layer is for.
+
+**And the fusion pays outside the decode step, which nothing had measured.**
+A 6406-token prompt: **5.47 -> 5.17 GPU seconds, -5.7%, 3 of 3 interleaved
+pairs** -- and not because of launches. At the 2048-token chunk the ten
+kernels move ~250 MB a layer between them where the one moves ~67, since
+eight of the ten exist only to write an intermediate the next one reads.
+Every remaining elementwise op has that shape at prefill. The MTP window pays
+too: `--mtp --mtp-depth 1 --frspec` goes 965 dispatches a token to 753, 561
+barriers to 455, 3 of 3 pairs down on GPU busy.
+
 **And `tools/epoch_slack.py` asks the reordering question of every dispatch
 at once**, since the one reorder that paid was found by eye: which dispatches
 are the slowest thing in their own epoch, how far they may legally move, and
@@ -1394,6 +1437,14 @@ what the cheapest reachable epoch would cost with them. It reproduces the
 move that has an answer (0.225 ms priced against 0.252 measured) and says
 what is left after it: **0.196 ms in total, nothing over 0.085**. Reordering
 is spent; re-run it after anything that moves the epoch structure.
+
+**It has now proposed the same losing move three times.** Phase 32 priced the
+shared expert's gate one epoch later at 0.235 and measured +0.104; Phase 33
+re-ran it on a 613-epoch trace, where the whole 0.256 ms it finds is that one
+move again, and measured **+0.145, 0 of 8 pairs down**. The model ranks; it
+does not predict. Positions 0 and 1 have also separated again (+0.046, 2 of
+8) after Phase 32 had measured them level -- a null result expires with its
+artifact exactly as a positive one does.
 
 ### The barrier between dispatches
 
@@ -1917,19 +1968,33 @@ In order:
      question is not "how many epochs" but "which dispatch is the longest
      thing in its own epoch, and does anything nearby have room for it" --
      which `step_inventory` answers directly and the model cannot.
-   - **The launch floor, which is half the step, and now priced whole.**
+   - **The launch floor, which was half the step, and is now 38% of it.**
      Phase 31: the same dispatch stream with its work clamped away is 46% of
      a decode step, and what is left runs at the machine's ceiling.
      **Phase 32 measured the ceiling on taking it back**: the entire
-     elementwise chain gone is 1.35 ms, 20% of the trunk, and one kernel --
-     the MoE block's tail, six dispatches into one -- took 0.21 of it
-     (-200 dispatches, -121 barriers, 126 tok/s). What is left is the
-     gated-delta chain (0.29 ms of ceiling, a rewrite rather than a fusion)
-     and 0.63 ms over `rms`, `add_rms`, `swiglu` and `scalar_mul`, which is
-     what a deferred op layer would be for and comes to ~0.3 ms realized.
-     A fusion returns ~half of what its removal measures, twice measured.
-     Past that the ratio only moves with a decomposition into fewer, longer
-     kernels.
+     elementwise chain gone is 1.35 ms, 20% of the trunk. Two block-shaped
+     kernels have since taken 0.55 of it -- the MoE block's tail, six
+     dispatches into one (0.21), and the gated-delta layer's front end, ten
+     into one (0.34) -- for **-500 dispatches, -299 barriers, -305 epochs,
+     -4 command buffers and 117 tok/s to 130** between them.
+
+     **What is left for a deferred op layer is 211 dispatches and 0.49 ms of
+     ceiling: ~0.25 ms realized, 3.8% of a 6.5 ms trunk.** That is the whole
+     of its case on a decode step and it is not a large one. Two things
+     sharpen it. Half of that 0.49 is 30 dispatches worth 4.8 us each -- the
+     norm and gate that close every gated-delta layer, on the serial spine
+     with nothing to overlap into -- and a pairwise fusion of the two
+     measures exactly zero; only folding the norm into the matvec that reads
+     it reaches that. And the layer's prize **outside** the decode step has
+     never been measured: one block-shaped kernel took **5.7% off a
+     6406-token prefill**, by not writing intermediates rather than by not
+     launching, and every remaining elementwise op has that shape there.
+
+     Price a fusion at ~half of what removing its dispatches measures (twice
+     measured), and a rewrite at ~half of the isolated time it removes (once)
+     -- but only over **the kernel's own set**: Phase 33's bucket named 20
+     dispatches that were not its and missed 120 that were, and the forecast
+     came out 2.3x low.
    - **The bytes are spent, but the *rounding* was not, and it paid.**
      `REBUILD.md` Phase 7: GPTQ over the same 91 modules, same bits, same
      coverage, same kernels, **same 2.0761 GB a token and the same 1078-epoch
@@ -2435,7 +2500,9 @@ reads much more invitingly than it should.
   is ranked against the code it replaced**: `ORNITH_FUSE_ADD_RMS=0` issues
   the residual add and the norm that reads it separately,
   `ORNITH_FUSE_MOE_TAIL=0` issues the MoE block's tail as the six dispatches
-  it was, `ORNITH_MOE_GATE_POS=0|1|2` puts the shared expert's gate beside
+  it was, `ORNITH_FUSE_GDN_FRONT=0` issues the gated-delta layer's front end
+  as the ten it was, `ORNITH_FUSE_GDN_NORM=0` issues `RMSNormGated` as two,
+  `ORNITH_MOE_GATE_POS=0|1|2` puts the shared expert's gate beside
   the router, beside the gathers (the default) or after them,
   `ORNITH_ROUTER_SORT=1` puts mlx's argsort back in place of the selection
   kernel, and `ORNITH_FAKE_SORT=1` swaps the argsort for a stand-in that

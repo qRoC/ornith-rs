@@ -5056,6 +5056,278 @@ The chain re-measured after the fusion, same instrument, 8 pairs:
    gated-delta kernel, and believe it only after an A/B.
 
 
+## Phase 33 -- the gated-delta layer's front end, ten dispatches into one -- **DONE**
+
+Phase 32 priced the whole elementwise chain at 1.35 ms of a 6.70 ms trunk and
+named the piece worth a kernel next: the gated-delta chain, a rewrite of the
+layer's front end rather than a fusion of two ops. This is that kernel, the
+second one the same rewrite made obvious, and the answer to the question the
+boundary was measured to settle.
+
+### The level and the counters, re-taken first
+
+Both reproduced. The trunk came back at 6.70-6.76 ms over 1305 dispatches and
+a decode step at 7.40 over 1309, against Phase 32's 1309/787/798/11; the
+boundary's rows came back within the instrument's own noise -- the whole
+chain **-1.135** against -1.138, what is left for a deferred layer **-0.610**
+against -0.634, the gated-delta chain **-0.324** against -0.285, the norms
+alone -0.445 against -0.517 -- and the pattern that matches nothing read
+**+0.004, 3 of 8**. The three disjoint buckets summed to 101% of the whole.
+
+### The bucket was not the kernel's set, in both directions
+
+The census is what says so. `slice_inner` took out **50** dispatches, not the
+30 the gated-delta chain has: 20 of them are the *attention* layers' q/gate
+split, a different call site the same pattern happens to name. And the two
+norms and two scales the front end applies to q and k -- 120 dispatches --
+are not in that bucket at all; `rmsbfloat16` and `scalar_mul` are in
+"norms, activations, adds" with nine other call sites.
+
+So the 200-dispatch bucket priced at -0.32 was 180 of this kernel's
+dispatches plus 20 of somebody else's, and missed 120 of its own. **A
+pattern serves a call site and a kernel serves a block, and for a rewrite
+those are different sets.** Nothing here can name the kernel's own set, so
+this phase has no ceiling for it -- only a before and an after, measured
+twice.
+
+### What was built: `gdn_front`
+
+Ten kernels ran in sequence between the input projections and the recurrence,
+in each of the 30 gated-delta layers:
+
+    concat_time         the cached conv window ahead of this step's tokens
+    slice_inner         the tail of that, which is the next cached window
+    depthwise_conv_1d   the causal conv
+    silu
+    rms, scalar_mul     q normalised and scaled by Dk**-1
+    rms, scalar_mul     k normalised and scaled by Dk**-0.5
+    gdn_beta            sigmoid over [B, T, Hv]
+    compute_g           the decay gate over the same
+
+`gdn_front` in `kernels/gdn_front.metal` is all ten: **300 dispatches a token
+become 30.** Every one of them is a function of the same 128-channel block,
+so one simdgroup holds a head's channels in registers from the convolution
+through the normalisation, and the concatenation and the slice stop being
+buffers and become the addresses it reads and writes.
+
+**Bit-exact by construction, and for a norm that means its reduction.** mlx's
+`rms_single_row` gives each of 32 threads `RMS_N_READS = 4` contiguous
+elements, sums the squares in float in ascending order within a thread and
+folds the threads with `simd_sum`. At `Dk = 128` that is exactly one
+simdgroup -- so one simdgroup per head is the same arithmetic in the same
+order, and the kernel asks for `Dk == Dv == 128` and hands the ten back
+otherwise. (`Dk == 128` is already what `gated_delta_packed` requires of the
+same layer.) The convolution accumulates in float over ascending taps and
+rounds once, as `depthwise_conv_1d` does; the silu is the elementwise
+kernel's, on the rounded conv output; `beta` and `compute_g` are
+`gdn_ops.metal`'s, unchanged. The one line that is not a copy is
+`rms_norm(q, None, eps)`'s multiply by a weight of bfloat16 1, which the
+fused form leaves out: `1 * x` is exact and `x` is already a bfloat16 value.
+
+The capture path takes the same kernel over the window instead of one token,
+with a function constant that keeps the concatenation, because `rewind`
+slices a cached conv state out of it.
+
+**And it is at its floor, which is what says there is nothing left in it**:
+30 dispatches, 227.0 us of isolated time against a 216.2 us clamped floor.
+The ten it replaced were **861.7 us** isolated in the same run.
+
+### And `rms_gated`, the two dispatches that close the layer
+
+`Qwen3NextRMSNormGated` is `precise_swiglu(z, rms_norm(y, w, eps))`, 60
+dispatches a token. `rms_gated` in `kernels/ornith_norm.metal` is
+`rms_single_row` with `precise_swiglu`'s three lines in place of its
+write-back -- the same construction as Phase 31's `add_rms`, and exact for
+the same reason: the normalised value rounds to bfloat16 where the store it
+replaces used to.
+
+### What it came to
+
+    the trunk, 8 interleaved pairs, two processes
+
+      the gated-delta front end   ten dispatches    one     mean of pairs
+        process 1                     6.821        6.525    -0.330, 8 of 8 down
+        process 2                     6.714        6.363    -0.346, 8 of 8 down
+
+      RMSNormGated                two dispatches    one
+        process 1                     6.518        6.544    +0.012, 3 of 8 down
+        process 2                     6.405        6.342    -0.021, 5 of 8 down
+
+    200 greedy tokens, three interleaved pairs, both controls off against both on
+
+                          control                 fused
+      GPU busy ms/token   7.65 7.54 7.54          7.19 7.19 7.21
+      wall ms/token       8.14 8.03 8.02          7.65 7.66 7.68
+      tok/s               122.9 124.5 124.7       130.7 130.5 130.3
+      dispatches          1309                    1009
+      barriers            787                     609
+      epochs              798                     617
+      command buffers     11                      8
+      distinct kernels    33                      28
+
+**-300 dispatches, -178 barriers, -181 epochs, -3 command buffers, and
+-0.35 GPU ms a token, 3 of 3 pairs and 16 of 16 pairs.** 125 tok/s to 130.
+All of it is the front-end kernel: the trunk A/B puts it at -0.330 and
+-0.346, and what is left over for `rms_gated` is zero.
+
+### The forecast, and why it was wrong by more than two
+
+Phase 32's coefficient -- plan a fusion at half of what removing its
+dispatches measures -- predicted ~0.15 ms from the 200-dispatch bucket. The
+kernel returned 0.34. The coefficient is not what failed; **the set was**,
+for the two reasons the census gives above. Against the other object the
+inventory measures, the one that does name the call site, it is ordinary:
+861.7 us of isolated time became 227.0, and 0.34 ms of the 0.635 saved is
+**53%**.
+
+So there are now two ratios and they are not the same number: a fusion
+returns ~half of its *removal* (0.068/0.145, 0.21/0.375), and this rewrite
+returned ~half of its *isolated time*. Whichever is quoted, the set it is
+quoted over has to be the kernel's own, and only the second kind of set can
+be read off the inventory.
+
+### `rms_gated` measures zero, and the reason is worth more than the kernel
+
+Two processes, 8 pairs each: **+0.012 (3 of 8) and -0.021 (5 of 8)**, against
+a zero-control band of -0.023 .. +0.054. That is zero. Its isolated time is
+159.2 us for the two against **132.2** for the one, and it sits at its floor
+(123.8 of 132.2), so it is not a kernel missing its own budget -- the 27 us
+it saves is simply under what 8 pairs resolve.
+
+It is kept: exact, at its floor, 30 fewer dispatches and 30 fewer barriers,
+and never worse in either process. But **"it pays" is not what was measured**
+and the record says so.
+
+What the same run *did* measure is where that 0.145 ms actually is:
+
+    one RMSNormGated kernel         30   -0.145 ms   8 of 8    4.83 us/disp
+
+Removing the pair outright is worth three times the chain's average per
+dispatch, because it is the serial spine between the recurrence and
+`out_proj` with nothing to overlap into. **A pairwise fusion cannot reach
+it.** Only folding the norm into the matvec that reads it can -- which is
+exactly what a deferred op layer is for, and it is the sharpest argument for
+one that this project has measured.
+
+### The boundary, re-measured after both kernels
+
+    q6k-full, trunk 6.37-6.58 ms, 8 interleaved pairs, mean of pairs
+
+    dropped                        disp   ms a token   us/disp
+    the whole elementwise chain     311     -0.893      2.87
+      the gated-delta chain          50     -0.273
+      the MoE tail                   50     -0.206
+      norms, activations, adds      211     -0.434
+    nothing matches this              0     +0.052        --
+    left for a deferred layer       211     -0.493      2.34
+      the norms alone               101     -0.308
+      one RMSNormGated kernel        30     -0.145      4.83
+    swiglu, into its consumer        80     -0.062      0.78
+
+The three buckets sum to 102% of the whole. The census is exact against the
+arithmetic: `rmsbfloat16` 111 -> **21** (60 absorbed into `gdn_front`, 30 into
+`rms_gated`), `scalar_mul` 60 -> **0**, `swiglu` 110 -> **80**, `slice_inner`
+50 -> **20**, and `concat_time`, `depthwise_conv_1d`, `silu_`, `gdn_beta`,
+`compute_g` all -> **0**.
+
+`swiglu` is now 0.78 us a dispatch, which is Phase 32's 0.64 again: the
+textbook fusion is still the worst-paid one in the step.
+
+### The decision this phase was to make: the deferred op layer
+
+**Its prize on a decode step is 211 dispatches and 0.49 ms of ceiling on a
+6.5 ms trunk -- ~0.25 ms realized at the half coefficient, 3.8%.** Phase 32
+forecast ~0.3 ms and 4.5% from the other side of two kernels and was right.
+That is the number, and it is not a large one for an architectural change:
+**the case for the layer is not this step**, which is what Phase 32 said it
+would be.
+
+The phase did find where the case may be, and it was not on the list.
+
+    a 6406-token prompt, three interleaved pairs
+
+      prompt GPU s    control 5.51 5.47 5.47   fused 5.19 5.17 5.16
+                      -0.31 s, -5.7%, 3 of 3 down
+
+**One block-shaped kernel took 5.7% off prefill**, and not by launching less:
+at the 2048-token chunk the ten kernels move ~250 MB a layer between them
+where the one moves ~67, because eight of the ten exist only to write an
+intermediate the next one reads. Every remaining elementwise op in the trunk
+has that same shape at prefill. The deferred layer's decode prize is 3.8% and
+its prefill prize has never been measured; it is a different number and the
+mechanism says it is a larger one.
+
+The MTP window pays too, and there the fusion is the same kernel over `T`
+tokens:
+
+    200 tokens, --mtp --mtp-depth 1 --frspec, three interleaved pairs
+
+      GPU busy ms/token   control 7.13 7.05 6.95   fused 6.80 6.67 6.56
+      dispatches          965 -> 753, barriers 561 -> 455
+
+3 of 3 down, and conservative: the fused arm's runs landed on a loaded
+machine at 23-74% GPU-busy share, which inflates GPU busy on that arm and
+shrinks the gap rather than opening it.
+
+### Reordering, re-run and spent again, and the model proposing the move it already lost
+
+`tools/epoch_slack.py` on the new trace: **1005 dispatches in 613 epochs**,
+0.256 ms available in total, and **every microsecond of it is the shared
+expert's one-row `affine_qmv` moving one epoch on**. That is position 2, and
+this phase measured it again:
+
+    the shared expert's gate, 8 interleaved draws, paired against position 1
+
+      0  beside the router         6.610    +0.046 ms    2 of 8 down
+      1  beside the gathers        6.540     --
+      2  after the gathers         6.708    +0.145 ms    0 of 8 down
+
+Phase 32 measured position 2 at +0.104 and the model had promised 0.235; it
+now promises 0.256 and costs 0.145. **Third time: the model ranks, it does
+not predict.** Position 1 stays the default.
+
+And positions 0 and 1 have separated again -- Phase 32 measured them level
+(-0.007, 5 of 8) after the MoE tail fusion took what the reorder was buying,
+and the front-end kernel has moved the epoch structure back the other way.
+A positive result expires with its artifact, and so does a null one.
+
+### The issue floor moved, and not proportionally
+
+The same stream clamped to one threadgroup went **2.765 ms over 1305
+dispatches to 2.564 over 1005**: 300 dispatches out for 0.201 ms, 0.67 us
+each, where the block price of the stream is 2.12 us and is now 2.55. The
+warning is Phase 31's, unchanged: the block price describes a decomposition
+and does not price a removal, and it is now the third number in this document
+that has to be read over the right set.
+
+### Exactness
+
+`tests/gdn` gained three tests and `tools/dump_gdn.py` the references behind
+them: the whole front end against mlx's `GatedDeltaNet.__call__` at
+`max_abs == 0.0` for T = 1, 7 and 512 (q, k, v, the cached window, the
+concatenation, beta and g), the fused kernel against the ten it replaces, and
+`RMSNormGated` against mlx and against its own two dispatches. Regenerating
+the case left every reference that existed byte-identical.
+
+Then the usual: the whole suite with `--include-ignored --test-threads=1`,
+`tests/model` at `max_abs == 0.0`, `tests/moe` (nine), `tests/mtp` (four,
+including `capture_matches_the_packed_forward` and
+`window_and_steps_both_match_mlx`, which are where the capture path's `T > 1`
+call is checked), `tests/generate`; a 200-token `--greedy` run byte-identical
+to the same run under `ORNITH_FUSE_GDN_FRONT=0`, under
+`ORNITH_FUSE_GDN_NORM=0`, under both, and under all five controls at once
+(1589 dispatches against 1009); `--mtp --mtp-depth 1 --frspec` byte-identical
+with the controls on; and a 6406-token prompt -- three prefill chunks --
+byte-identical too.
+
+One control had to be caught by its own census rather than by its output: the
+first MTP pair came back "byte-identical" with **the same 753 dispatches in
+both arms**, because zsh does not word-split an unquoted `$VAR` and the two
+environment variables reached the process as one. Counting what a control
+actually removed is the check that fails loudly, and it is the same check
+Phase 32 added `prof_dropped` for.
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
