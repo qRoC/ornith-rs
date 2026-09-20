@@ -189,6 +189,62 @@ pub fn model_dir() -> PathBuf {
     }))
 }
 
+/// What produced a capture, beyond the weights.
+///
+/// Phase 19 measured that a capture moves with the kernel that prefilled it
+/// (`max_abs` 3.1 between two choices on one artifact) and Phase 21 closed
+/// that at the root with `ORNITH_INVARIANT=all`. Neither wrote the setting
+/// into the capture, so `refs/artifact/` held 31 directories that could not
+/// say which instrument made them -- and pinning the instrument reorders
+/// four of eight variants in the ledger, first and second place included
+/// (`REBUILD.md` Phase 44).
+///
+/// So every capture records it. The resolved invariant mode is spelled out
+/// because it is the one that has been *measured* to matter, and **only
+/// `all` pins a capture**: the window mode is suspended for the whole
+/// prefill (`generate::prefill` runs inside `invariant::without_window`),
+/// which is exactly why an ordinary capture is not the invariant one. Every
+/// `ORNITH_*` variable actually set is recorded beside it, so a knob nobody
+/// thought of here still lands in the file.
+///
+/// Shared by `bin/probes` and `bin/ppl` so the two instruments describe
+/// themselves the same way.
+pub fn instrument_json() -> String {
+    let mode = if crate::ops::invariant::all() {
+        "all".to_string()
+    } else if crate::ops::invariant::for_rows(2) {
+        format!("window({})", crate::ops::invariant::EXACT_WINDOW)
+    } else {
+        "off".to_string()
+    };
+    let mut env: Vec<(String, String)> =
+        std::env::vars().filter(|(k, _)| k.starts_with("ORNITH_")).collect();
+    env.sort();
+    let env = env
+        .iter()
+        .map(|(k, v)| format!("\"{}\": \"{}\"", json_esc(k), json_esc(v)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{\"invariant\": \"{mode}\", \"env\": {{{env}}}}}")
+}
+
+/// Minimal JSON string escaping, for the metadata these bins write by hand.
+pub fn json_esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 // --- comparison --------------------------------------------------------------
 
 pub struct Diff {

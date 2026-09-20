@@ -3678,6 +3678,15 @@ artifact.**
 > honest state is a lead rather than a win -- p = 0.063 settles nothing at
 > 0.05 -- so "q6k-full remains the artifact" stands as a decision, not as a
 > measurement. Phase 44 has the tables.
+>
+> **A second instrument was then built to settle it and declined (Phase 45).**
+> Perplexity could not judge either artifact before, because it went through
+> mlx and mlx cannot load a k-quant; `bin/ppl` can, and is bit-exact against
+> mlx where both run. Over 6620 scored tokens the pair differs by 5.05e-4 of
+> mean NLL while the instrument's own knob moves one unchanged artifact by
+> 1.42e-3 -- **2.8x the effect** -- and the paired sign test reads p = 0.35.
+> So: a lead on the probes, silence on perplexity, and the sentence at the
+> top of this box keeps its conclusion while losing its original evidence.
 
 ---
 
@@ -7920,6 +7929,117 @@ than a number that looks pinned and is not.
   than eyeballed**: the first capture written with it, `q6k-full` under
   `all`, is bit-identical to Phase 21's two, so the flag it claims is the
   flag that was set.
+
+
+## Phase 45 -- a second instrument, and it declines to overturn the first -- **DONE**
+
+Phase 44 left `q6k-full` against `q6k-perexpert` at 36 of 57 live probes,
+p = 0.063 -- a lead and not a win -- and the obvious way to settle it was
+the instrument this project has had since Phase 0 and could not use:
+**perplexity, which goes through `mlx_lm.load`, and mlx cannot load a
+k-quant.** Both artifacts are k-quants. So the instrument had to be built.
+
+### `bin/ppl`, and the oracle that licenses it
+
+The definition is copied rather than invented, from
+`tools/dump_artifact_baseline.py`: chunks of 256 tokens through one cache,
+logits cast to float32 **before** the reduction, `logsumexp` over the last
+axis, the next token scored at every position that has one, the corpus's
+last token unscored. `ops::sample::logsumexp_last_axis` is already a port of
+mlx's own `logsumexp.cpp`, so the reduction order is mlx's rather than a
+second one invented here -- the same care `bin/probes` takes by refusing to
+reimplement that step at all.
+
+**What makes a port-side instrument usable is not an argument.**
+`tools/dump_ppl.py` runs mlx's side on an **affine** artifact, where both
+can run, and writes the *per-token* NLL in the same layout, so the two are
+compared over 6620 numbers rather than as two means that agree to a few
+digits:
+
+    affine parent, ORNITH_INVARIANT=0 (what mlx dispatches)
+      6620 of 6620 bit-identical, max_abs 0.000000e0
+      mean nll  port 1.845725011   mlx 1.845725011   ppl 6.332689 both
+
+**And the first run of that check failed, which is why it exists.** Compared
+in the *pinned* mode the two disagree at max_abs 3.45 per token and 6.3415
+against 6.3327 on the mean -- not a port bug but the instrument difference
+Phase 21 measured on probe logits, showing up again at the same magnitude on
+a different statistic. The port matches mlx when it dispatches what mlx
+dispatches; `ORNITH_INVARIANT=0` is that mode and always was.
+
+Like a probe capture, a perplexity capture now records what made it:
+`ppl.json` carries the `instrument` block (shared with `bin/probes` through
+`refs::instrument_json`) and the chunk width, because the chunk is this
+instrument's free parameter in exactly the way the prefill kernel was a
+probe capture's.
+
+### What it says about the contested pair
+
+Four runs, two artifacts by two modes, plus the control that matters:
+
+    6621-token corpus, 6620 scored          mean nll        ppl
+      affine parent (mlx's mode)            1.845725      6.3327
+      q6k-full, pinned                      1.857753      6.4093
+      q6k-perexpert, pinned                 1.857248      6.4061
+      q6k-full, unpinned                    1.856335      6.4002
+      q6k-perexpert, unpinned               1.856966      6.4043
+
+    paired sign test over the scored tokens
+      pinned     per-expert lower on 3345 of 6614, z = +0.93, p = 0.35
+      unpinned   per-expert lower on 3395 of 6615, z = +2.15, p = 0.031
+      control: q6k-full pinned against q6k-full unpinned -- the same
+               weights -- differ on 3347 of 6616, mean nll +1.42e-3
+
+**The cell declines to answer, and it says so with its own control.** The
+two artifacts differ by 5.05e-4 of mean NLL; the instrument's own knob, on
+one unchanged artifact, moves it by **1.42e-3 -- 2.8x the effect**. Nothing
+here separates them.
+
+**And the unpinned arm's two statistics point opposite ways**: per-expert is
+lower on *more tokens* (p = 0.031) while its *mean* is worse (+6.31e-4). It
+wins often and loses big. That is Phase 24's own sentence -- "not a
+reduction of damage, a redistribution of it" -- confirmed on 6620 tokens
+instead of 56 probes, and arrived at from the other side.
+
+### Where that leaves the verdict
+
+- **`q6k-full` remains the artifact, and now as a decision with two
+  instruments behind it rather than one measurement.** The probe set on the
+  pinned instrument gives per-expert a lead at p = 0.063; perplexity gives
+  nothing at p = 0.35 with a control 2.8x the effect. A lead on one
+  instrument and silence on a second, more powerful one is not a case for
+  changing the shipped artifact.
+- **Phase 44's finding is untouched by this.** That the probe ledger
+  reorders when the instrument is pinned remains true and remains the reason
+  captures now record themselves; what Phase 45 adds is that the specific
+  pair it left open does not separate on a second instrument either.
+- **The instrument is the durable part.** `bin/ppl` is bit-exact against mlx
+  where both can run and works where mlx cannot, which is every artifact
+  this project has shipped since Phase 16. Any future variant can now be
+  judged on two independent instruments -- 64 contexts and 6620 tokens --
+  and the second one has no live-set composition trap
+  (`REBUILD.md` Phase 44) because it has no probe set.
+
+### One number worth keeping beside the others
+
+The affine parent reads **6.3327** and both k-quants read **6.40**, so the
+whole k-quant step costs ~1.2% of perplexity on this corpus. The Phase 0
+baseline's 6.5022 is a different artifact and not comparable to these;
+per Phase 44's rule, a number is only comparable within the run that
+produced it.
+
+### What was checked
+
+- The suite green: **128 tests, 0 failed, 0 ignored**, `--include-ignored`
+  with `--test-threads=1`.
+- Byte-identity, six rows on two artifacts with the byte count printed:
+  `q6k-full` 786 `6b9e2a34…` greedy and under `--mtp --mtp-depth 1 --frspec`,
+  the long prompt 40 `0c904f93…`; parent 1033 `1eadd981…` twice and 26
+  `bae75e6f…`. Unchanged from Phases 43 and 44 -- this phase adds a bin and
+  moves a helper into the library, and touches no model path.
+- **The new instrument against its oracle, which is the check that matters
+  and the one that failed first**: 6620 of 6620 per-token values
+  bit-identical at `max_abs = 0`, on the artifact where both sides can run.
 
 
 ## Disk

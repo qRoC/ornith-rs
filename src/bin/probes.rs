@@ -94,44 +94,6 @@ fn esc(s: &str) -> String {
     out
 }
 
-/// What produced this capture, beyond the weights.
-///
-/// Phase 19 measured that a capture moves with the kernel that prefilled it
-/// (`max_abs` 3.1 between two choices on one artifact) and Phase 21 closed
-/// that at the root with `ORNITH_INVARIANT=all`. Neither wrote the setting
-/// into the capture, so `refs/artifact/` holds 31 directories that cannot
-/// say which instrument made them -- and `q6k-full` against
-/// `q6k-full-invariant-1`, the same weights under the two modes, splits the
-/// rank test 31/26 of 57 live probes and differs by up to 5.5x on the very
-/// probes the ledger ranks variants with (`REBUILD.md` Phase 44).
-///
-/// So the capture records it. The resolved invariant mode is spelled out
-/// because it is the one that has been *measured* to matter, and **only
-/// `all` pins a capture**: the window mode is suspended for the whole
-/// prefill (`generate::prefill` runs inside `invariant::without_window`),
-/// which is exactly why an ordinary capture is not the invariant one. Every
-/// `ORNITH_*` variable actually set is recorded beside it, so a knob nobody
-/// thought of here still lands in the file.
-fn instrument_json() -> String {
-    let mode = if ornith_rs::ops::invariant::all() {
-        "all".to_string()
-    } else if ornith_rs::ops::invariant::for_rows(2) {
-        format!("window({})", ornith_rs::ops::invariant::EXACT_WINDOW)
-    } else {
-        "off".to_string()
-    };
-    let mut env: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("ORNITH_"))
-        .collect();
-    env.sort();
-    let env = env
-        .iter()
-        .map(|(k, v)| format!("\"{}\": \"{}\"", esc(k), esc(v)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{\"invariant\": \"{mode}\", \"env\": {{{env}}}}}")
-}
-
 fn main() {
     let dir = model_dir();
     assert!(dir.exists(), "no model at {}", dir.display());
@@ -238,7 +200,7 @@ fn main() {
              \"logits\": {{\"file\": \"logits.bin\", \"dtype\": \"float32\", \
              \"shape\": [{}, {}], \"chunk\": {}}},\n \"set\": [\n{}\n ]\n}}\n",
             esc(&dir.to_string_lossy()),
-            instrument_json(),
+            ornith_rs::refs::instrument_json(),
             probes.len(),
             vocab,
             CHUNK,

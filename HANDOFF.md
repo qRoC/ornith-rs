@@ -416,6 +416,28 @@ inputs, and it is not available for a 40-layer forward over arbitrary text.
 Between the two sits a band -- six probes in 64, a thousandth of a nat -- that
 is a property of bfloat16 and the toolchain rather than of this port.
 
+### Perplexity from the port, and why it had to exist
+
+```
+ORNITH_MODEL=<artifact> ORNITH_INVARIANT=all ORNITH_PPL_OUT=refs/artifact/<capture> \
+  cargo run --release --bin ppl                   # nll.bin + ppl.json
+cd tools && PYTHONPATH=../../vendor/mlx-lm python3 dump_ppl.py <artifact> \
+  ../refs/artifact/<capture>                      # mlx's side, and the check
+```
+
+`tools/dump_artifact_baseline.py` has computed perplexity since Phase 0
+through `mlx_lm.load`, so it stops at exactly the artifacts this project
+ships: **mlx cannot load a k-quant**. `bin/ppl` is the same definition --
+chunks of 256 through one cache, float32 before the reduction, mlx's own
+`logsumexp` kernel as ported -- and it is licensed by `dump_ppl.py`, which
+writes mlx's **per-token** NLL in the same layout: on the affine parent the
+two agree **6620 of 6620, `max_abs` 0.000e0**, under `ORNITH_INVARIANT=0`,
+which is the mode that dispatches what mlx dispatches. Compared in the
+pinned mode they differ at `max_abs` 3.45 a token, which is the instrument
+difference and not a port bug -- the first run of the check caught exactly
+that. `ppl.json` records the instrument and the chunk width for the reason
+`logits.json` now records the instrument (`REBUILD.md` Phases 44 and 45).
+
 ### Capturing the probe set from the port
 
 ```
