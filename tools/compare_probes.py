@@ -7,6 +7,17 @@ eight contexts; this asks "how far did the distribution move, and does that
 order the variants" of 64 -- the question Phase 4 answered with one context
 out of eight.
 
+**A median printed here is a property of the run, not of the variant**, and
+two medians from two runs may not be compared. A probe is *live* when some
+variant **in this run** pays >= 0.001 nats, and each median is taken over the
+live set -- so adding a variant changes every other variant's number. One
+unchanged capture read in three compositions (`REBUILD.md` Phase 44):
+8 variants -> 59 live -> 0.0334, 2 variants -> 56 live -> 0.0362, alone ->
+55 live -> 0.0371. **11% of spread on a file that did not change**, which is
+more than most of the gaps this file exists to rank. Compare within one run,
+put every arm you mean to rank into it, and re-run the whole table rather
+than quoting a row from an older one.
+
 **What makes a probe worth having, measured rather than assumed.** The first
 version of this file gated probes on control entropy, on the theory that a
 confident prediction is where quantization damage shows. The old eight say

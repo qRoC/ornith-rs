@@ -7844,6 +7844,30 @@ not a win; what it is not is "a coin flip, p = 0.69". Phase 24's own sentence
 instrument whose free parameter is worth more than the difference it was
 judging.
 
+### A trap found while doing it: the median is a property of the comparison
+
+Every table here was read twice before this was noticed. `compare_probes.py`
+calls a probe **live** when *some variant in the run* pays >= 0.001 nats, and
+reports each variant's median over the live set -- so **adding a variant to a
+run changes every other variant's reported median**. One unchanged capture,
+`q6k-full` unpinned, read in three differently-composed runs:
+
+    variants in the run   live probes   its reported median
+      8                        59              0.0334
+      2 (against per-expert)   56              0.0362
+      1 (alone)                55              0.0371
+
+**11% of spread on a file that did not change**, which is larger than most
+of the gaps this ledger ranks. So a median from one table may never be
+compared with a median from another -- including Phase 24's against this
+phase's eight-variant column. Every comparison above is *within* one
+composition, both columns of it, which is why the ranking claim survives
+this; the head-to-head is a second, separately composed run for the same
+reason. `tools/compare_probes.py` now says so in its docstring.
+
+It is the same failure as the rest of this file's family: the number is a
+property of the comparison, not of the thing being compared.
+
 ### What this does and does not overturn
 
 - **It does not overturn Phase 21's statement, it outgrows it.** Phase 21
@@ -7863,7 +7887,19 @@ judging.
 ### What can and cannot be re-captured
 
 Eight variants have artifacts on disk and are now captured pinned, in
-`refs/artifact/<variant>-pinned`. The rest of the ledger --
+`refs/artifact/<variant>-pinned` -- the suffix is `-pinned` and not `-all`
+because `q4k-all` and `q6k-all` are *variant* names and the collision
+nests a directory rather than failing. As with everything under `refs/`,
+they are local and not in git.
+
+The tables above come from
+
+    ORNITH_MODEL=~/.mtplx/models/ornith-1.5-35b-a3b-<v> ORNITH_INVARIANT=all \
+      ORNITH_PROBES_OUT=refs/artifact/<v>-pinned cargo run --release --bin probes
+    python3 tools/probes_from_logits.py refs/artifact/<v>-pinned
+    python3 tools/compare_probes.py refs/artifact/parent refs/artifact/<v>-pinned ...
+
+and the sign test is two-sided binomial, the same one Phase 24 quotes. The rest of the ledger --
 `awq-linattn`, `awq-ml`, `nvfp4-head-linattn`, `fp8scale-twin`,
 `q4k-twin`, `int4-except-gates`, the mlx-side captures -- would need the
 artifact re-forged at ~26 GB each against 287 GB free. **Their verdicts stay
