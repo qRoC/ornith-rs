@@ -7470,6 +7470,13 @@ partly because `--frspec` drafts from MTPLX's **code** corpus
 (`qwen38_code_ranked_64k`), so Cyrillic is a place its 65536 rows might not
 reach. Both arms are in the cell for exactly that reason.
 
+The prompt, written out for the same reason Phase 42 wrote out its two --
+and it is 44 tokens through the chat template:
+
+    Объясни подробно, чем спекулятивное декодирование отличается от обычного
+    авторегрессивного, откуда берётся выигрыш и почему увеличение глубины
+    черновика не бесплатно.
+
     русская проза, q6k-full, best of 3 draws, control 0.5%
 
       arm                       wall tok/s   GPU ms/tok   acceptance
@@ -7483,7 +7490,18 @@ reach. Both arms are in the cell for exactly that reason.
 
 `--mtp-depth 1` was measured in two separate cells here and reproduced to
 **0.6%** across them (152.2 / 152.4 / 152.3 and 152.5 / 151.8 / 152.7),
-which is the cross-cell control this table gets for free.
+which is the cross-cell control this table gets for free. It took two cells
+because the FR-Spec arms came first and the plain depths had to be added
+once FR-Spec turned out to be confounding the depth question.
+
+Every draw, wall tok/s in the order taken:
+
+    cell one   auto   131.9 132.2 132.7   auto again 131.8 132.3 132.0
+               d1     152.2 152.4 152.3   d1+fr      135.0 135.2 135.3
+               d2+fr  119.1 119.2 119.1   d3+fr      100.3 100.4 100.2
+    cell two   auto   132.5 132.0 132.2
+               d1     152.5 151.8 152.7   d2 140.0 140.1 140.0
+               d3     123.7 123.8 124.3
 
 **The knee is 1.** Four cells now: depth 1 wins three (+15.3%, +25.9%,
 +15.1%) and depth 2 takes the code prompt by 2%; **depth 3 is the worst
@@ -7506,6 +7524,18 @@ fraction of the tokens a text actually emits fall inside those 65536 rows
       english prose             100.0%               0.65 -> 0.65
       code                       99.0%                 --  -> 0.88
       russian prose              65.0%               0.75 -> 0.48
+
+The recipe, because it is three lines and nobody should have to rediscover
+it: `refs/frspec/ids_64k.bin` is a little-endian `u32` count followed by that
+many `u32` ids (262148 bytes = 4 + 65536 x 4), and the tokenizer is
+`AutoTokenizer.from_pretrained(<artifact>)`, which **is** this port's default
+dialect -- `transformers` substitutes its own older regex for the one in
+`tokenizer.json`, which is why `Dialect::Transformers` is the default and
+`--tokenizer-json` is the opt-in. **One caveat, stated rather than hidden:**
+this counts a re-tokenization of the emitted *text*, not the ids the model
+actually emitted, and a detokenize-retokenize round trip is not guaranteed to
+be the identity. It is worth a token or two, not a third of them, and the
+100% and 65% cells are not close to each other.
 
 A token outside the list cannot be drafted at all, so the ceiling on
 acceptance is the full head's acceptance times the coverage:
@@ -7620,6 +7650,9 @@ object in `HANDOFF.md`'s list. `tools/epoch_slack.py` on a fresh trace:
       cache_copy     2     0.10      0.000       4
       all of them                    0.265
 
+Taken with `ORNITH_INV_DUMP=<path> ORNITH_PROF=1 cargo run --release --bin
+step_inventory`, then `python3 tools/epoch_slack.py <path>.trace <path>.tsv`.
+
 0.265 ms is 3.8% of a decode step and **96% of it is one kernel**. The census
 identifies it without ambiguity: `affine_qmv_bfloat16_t_gs_64_b_8_batch_0`,
 **grid 1**, 6272 bytes read, 12.8-13.6 us -- 4096 bytes of a 2048-wide input
@@ -7632,10 +7665,17 @@ not.
 here rather than cited.** `ORNITH_MOE_GATE_POS`, three positions and the
 default twice, interleaved, GPU ms a token by minima of three draws:
 
-      1  beside the gathers (default)   7.00     --
-      1  the same again, the control    7.03   +0.43%
-      0  beside the router              7.08   +1.14%   3 of 3 worse
-      2  after the gathers              7.05   +0.71%   3 of 3 worse
+      1  beside the gathers (default)   7.00     --      7.00 7.01 7.02
+      1  the same again, the control    7.03   +0.43%    7.04 7.03 7.04
+      0  beside the router              7.08   +1.14%    7.08 7.09 7.17
+      2  after the gathers              7.05   +0.71%    7.11 7.12 7.05
+
+The right-hand column is every draw in the order taken. Position 2's third
+draw (7.05 against the default's 7.02) sits inside the control, so the
+honest reading is "0.7% by minima, sign consistent, and one draw of three
+declines to answer" -- which is still the same sign Phase 33 measured at
++0.104 ms, at about half the size. Dispatch counts were 1009 in every arm,
+which is the check that the knob applied at all.
 
 **Both alternatives still lose, on a machine that is not swapping**, and the
 mechanism Phase 33 named survives with them: what hides a one-row `qmv`'s
