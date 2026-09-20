@@ -420,10 +420,19 @@ is a property of bfloat16 and the toolchain rather than of this port.
 
 ```
 cd tools && python3 export_probes.py              # probe_set.py -> refs/probe_set.json
-ORNITH_MODEL=<artifact> ORNITH_PROBES_OUT=refs/artifact/<capture> \
+ORNITH_MODEL=<artifact> ORNITH_INVARIANT=all \
+  ORNITH_PROBES_OUT=refs/artifact/<capture> \
   cargo run --release --bin probes                # logits.bin + logits.json
 python3 tools/probes_from_logits.py refs/artifact/<capture> [<mlx capture>]
 ```
+
+**`ORNITH_INVARIANT=all` is part of the recipe as of Phase 44 and was not
+before**, which is why the 31 captures in `refs/artifact/` are not all on one
+instrument and none of them says which. Only `all` reaches a capture -- the
+window mode is suspended for the whole prefill -- and it costs ~31 s over the
+64 probes. Every capture taken from here on records its own mode and every
+`ORNITH_*` variable set, in an `instrument` block in `logits.json` that
+`probes_from_logits.py` carries into `probes.json`.
 
 `Q4K.md` needs this: an artifact in a mode mlx has no quantization mode for
 cannot be loaded by `mlx_lm.load`, so `dump_probes.py` stops working exactly

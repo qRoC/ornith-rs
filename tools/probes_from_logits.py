@@ -15,6 +15,11 @@ Writes `probes.bin` + `probes.json` into the port capture, in exactly
 which instrument produced it. With a second argument it also reports
 `max_abs` between the two, which is the number that says whether the port may
 stand in for mlx on an artifact mlx cannot load.
+
+The `instrument` block `probes.rs` writes is carried into `probes.json`,
+because that is the file a verdict is read from. Captures taken before
+Phase 44 have no such block, and that absence is information too: they were
+taken with the prefill kernel as a free parameter of the instrument.
 """
 
 import json
@@ -60,9 +65,18 @@ def main():
 
     dist = mx.stack(rows)
     (d / "probes.bin").write_bytes(np.array(dist.astype(mx.float32), copy=False).tobytes())
-    (d / "probes.json").write_text(json.dumps({
+    # Carry the instrument through. A verdict is read from `probes.json`, so
+    # that is where the capture has to say which instrument produced it --
+    # `logits.json` alone is a file nobody downstream opens. Absent for every
+    # capture taken before Phase 44, and absent is itself the information.
+    carried = {
         "model_dir": meta["model_dir"],
         "source": meta.get("source", "port"),
+    }
+    if "instrument" in meta:
+        carried["instrument"] = meta["instrument"]
+    (d / "probes.json").write_text(json.dumps({
+        **carried,
         "probes": {
             "file": "probes.bin",
             "dtype": "float32",

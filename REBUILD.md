@@ -3667,6 +3667,18 @@ not a verdict.
 `refs/artifact/q6k-perexpert` is its capture. **`q6k-full` remains the
 artifact.**
 
+> **THE EVIDENCE FOR THAT LAST SENTENCE DID NOT SURVIVE ITS INSTRUMENT
+> (2026-09-20, Phase 44).** Both captures above were taken with the prefill
+> kernel as a free parameter -- `ORNITH_INVARIANT=all` existed since Phase 21
+> and was not in the recipe. Re-captured pinned, on one binary, the coin flip
+> is gone: **36 of 57 instead of 30 of 56, p = 0.063 instead of 0.69, median
+> ratio 1.13x instead of 1.04x, and the per-expert artifact goes from fifth to
+> first in an eight-variant table.** Today's *unpinned* re-capture reproduces
+> the table above to the digit, which is what makes the comparison fair. The
+> honest state is a lead rather than a win -- p = 0.063 settles nothing at
+> 0.05 -- so "q6k-full remains the artifact" stands as a decision, not as a
+> measurement. Phase 44 has the tables.
+
 ---
 
 ## Phase 25 -- the tile told its own shape, and it changes nothing -- **DONE**
@@ -7731,6 +7743,147 @@ instead of it. `--mtp-depth 1` is one flag away.
   the hashes without the token count, and it had to be found by trying (`-m 1`
   gives 2 bytes, `-m 16` gives 49). Same lesson as Phase 42's prompts: a hash
   whose recipe is not beside it is a number nobody can re-enter.
+
+
+## Phase 44 -- the probe captures did not say which instrument made them, and it reorders the ledger -- **DONE**
+
+Phase 19 measured that a probe capture moves with the kernel that prefilled
+it. Phase 21 closed that at the root with `ORNITH_INVARIANT=all` and checked
+it with `cmp`: two kernel choices, byte-identical captures. **Neither phase
+put the flag into the capture recipe, and no capture records whether it was
+used** -- `logits.json` carries `model_dir`, `source` and the probe set, and
+nothing about the instrument. `refs/artifact/` holds 31 directories and not
+one of them can say what made it.
+
+This phase closes that, and then finds out what it was worth.
+
+### The change, which is small
+
+`src/bin/probes.rs` writes an `instrument` block: the **resolved** invariant
+mode (`off` / `window(4)` / `all`) and **every `ORNITH_*` variable that was
+set**, so a knob nobody thought of still lands in the file.
+`tools/probes_from_logits.py` carries it into `probes.json`, which is the
+file a verdict is actually read from. And `ORNITH_INVARIANT=all` is now in
+the recipe, in the bin's own doc and in `HANDOFF.md`.
+
+Only `all` reaches a capture, which is the part that is easy to get wrong:
+the window mode is suspended for the whole prefill (`generate::prefill` runs
+inside `invariant::without_window`), so a default run captures on whatever
+kernel the row count picks.
+
+    "instrument": {"invariant": "all", "env": {"ORNITH_INVARIANT": "all", ...}}
+
+### What the stored captures turn out to be
+
+Every port-side capture whose artifact is still on disk was re-taken both
+ways with today's binary and compared byte for byte:
+
+    capture            stored == today-pinned?   stored == today-default?
+      q4k                      no                        no
+      q4k-all                  no                        no
+      q4k-imatrix              no                        no
+      q6k-all                  no                        no
+      q6k-perexpert            no                       yes
+      q6k-full                 no                        no
+
+**None of the ledger's captures is pinned**, and only one of six reproduces
+even under today's default. Two things follow, and the second is the
+argument for the flag:
+
+- **a pinned capture is a stable object.** `q6k-full` re-captured under
+  `all` today is **bit-identical** to `q6k-full-invariant-0` and
+  `-invariant-1` from Phase 21 -- across several days and Phases 38, 40, 42
+  and 43 of code. (That also settles what those two directories were: two
+  draws of one `all` capture, not two values of a flag.)
+- **an unpinned capture is not.** Five of six stored captures differ from
+  the same artifact captured by today's binary in the same default mode. It
+  is not wrong -- every one of those code changes is byte-identity checked
+  on generation -- it is that the *kernel a row count selects* moved with
+  them, and the capture moved with the kernel.
+
+### What it is worth: four of eight variants change rank
+
+One binary, one control, the flag the only difference. Median
+KL(parent || variant) over the live probes, eight variants at once:
+
+    variant               unpinned   rank      pinned   rank
+      q6k-perexpert         0.0338     5     **0.0237**   1
+      q4k-imatrix           0.0304     3       0.0280     2
+      q4k-all               0.0286     1       0.0289     3
+      q6k-full              0.0334     4       0.0316     4
+      gptq-head-linattn     0.0297     2       0.0324     5
+      q6k-all               0.0368     6       0.0327     6
+      q4k                   0.0502     8       0.0416     7
+      int4-head-linattn     0.0418     7       0.0458     8
+
+**The winner and the runner-up both change.** `q6k-perexpert` goes from
+fifth to first, its median falling 30%, and its "worst on" count from 4 of
+59 to **1 of 59**. `gptq-head-linattn` goes from second to fifth. This is
+not draw noise: both captures are deterministic, so each column is the
+number and not a sample of it.
+
+### And it reaches a recorded verdict
+
+Phase 24 compared `q6k-full` against `q6k-perexpert`, got a coin flip and
+concluded **"`q6k-full` remains the artifact"**. Today's unpinned capture
+reproduces that table to the digit, which is the control that says the two
+sittings are comparable at all:
+
+    q6k-full vs q6k-perexpert        median    p90      max    sign test
+      Phase 24, as recorded          0.0362/0.0347   4.52/3.38   30 of 56, p = 0.69
+      unpinned, today                0.0362/0.0347   4.52/3.38   30 of 56, p = 0.69
+      **pinned, today**              0.0349/**0.0253**  5.25/**3.39**  **36 of 57, p = 0.063**
+
+    median ratio full/per-expert   1.04x unpinned, **1.13x pinned**
+    largest single gap, per-expert's way   +1.14 nats -> **+1.87**
+
+**The verdict's evidence does not survive the instrument, and the verdict
+itself is now the other way round but not yet settled.** p = 0.063 is a lead,
+not a win; what it is not is "a coin flip, p = 0.69". Phase 24's own sentence
+-- "not a reduction of damage, a redistribution of it" -- was read off an
+instrument whose free parameter is worth more than the difference it was
+judging.
+
+### What this does and does not overturn
+
+- **It does not overturn Phase 21's statement, it outgrows it.** Phase 21
+  checked the ordering of *one pair* on the median and found it survived all
+  three modes. That was true and it is still true of that pair. Over eight
+  variants the ordering does not survive, which is the question nobody
+  asked.
+- **It does not say the pinned instrument is "right" in an absolute sense.**
+  The control is `refs/artifact/parent`, an mlx-side capture that is itself
+  unpinned and cannot be pinned -- mlx cannot load the bf16 parent here. Both
+  columns share it, so the comparison between them is fair, but the absolute
+  KLs carry the control's own instrument.
+- **It does say which instrument to use from here**: the one with no free
+  parameter in it, because it is also the only one that reproduces across a
+  code change.
+
+### What can and cannot be re-captured
+
+Eight variants have artifacts on disk and are now captured pinned, in
+`refs/artifact/<variant>-pinned`. The rest of the ledger --
+`awq-linattn`, `awq-ml`, `nvfp4-head-linattn`, `fp8scale-twin`,
+`q4k-twin`, `int4-except-gates`, the mlx-side captures -- would need the
+artifact re-forged at ~26 GB each against 287 GB free. **Their verdicts stay
+on the record with the instrument now named as unpinned**, which is better
+than a number that looks pinned and is not.
+
+### What was checked
+
+- The suite green: **128 tests, 0 failed, 0 ignored**, `--include-ignored`
+  with `--test-threads=1`.
+- Byte-identity, ten rows on two artifacts with the byte count beside every
+  hash, unchanged from Phase 43: `q6k-full` 786 `6b9e2a34…`, parent 1033
+  `1eadd981…`, both under `ORNITH_WIDE_ELEM=0` and `ORNITH_NO_REUSE=1`, and
+  the long prompt at 40 `0c904f93…` / 26 `bae75e6f…`. Nothing here touches
+  the model path; the changed files are `src/bin/probes.rs` (metadata only)
+  and `tools/probes_from_logits.py`.
+- **The instrument block itself was checked against a known answer rather
+  than eyeballed**: the first capture written with it, `q6k-full` under
+  `all`, is bit-identical to Phase 21's two, so the flag it claims is the
+  flag that was set.
 
 
 ## Disk
