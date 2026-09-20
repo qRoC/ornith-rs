@@ -1080,8 +1080,42 @@ What the flag cannot fix is a window of five or more: mlx takes the fused
 vector SDPA only while `q_len * gqa_factor <= 32`, and at 16 query heads over
 2 kv heads that is four rows. `src/bin/invariance.rs` measures it -- a window
 of 5 first disagrees at layer 3, the first full-attention layer. Depth 3 is
-therefore the deepest draft this model can verify exactly, and it is also the
-depth `mtplx_runtime.json` recommends.
+therefore the deepest draft this model can verify exactly *the way this port
+does it*, and it is also the depth `mtplx_runtime.json` recommends.
+
+**And mlx-vlm had the fix for that in the tree too, which makes this the
+second time (found 2026-09-20, not built).**
+`models/qwen3_5/speculative_verifier.py` -- 427 lines of
+`Qwen3_5BatchInvariantForward`, for *this* model and not its successor --
+never asks for a wide SDPA at all. For `length > 1` it loops the query rows
+and calls `scaled_dot_product_attention` **one row at a time with the KV
+sliced to that row's own causal prefix**, then concatenates. Every call is
+`q_len = 1`, so every call takes the same fused kernel the autoregressive
+step takes, and attention is invariant at **any** window width by
+construction. The successor is why they bothered: `qwen4_exp` is 24 query
+heads over 2 kv heads, a GQA factor of 12, so its exactly-verifiable window
+would be *two* rows rather than four.
+
+**The honest price of taking it: probably nothing, because the knee is not
+held by exactness.** Depths 4 and 5 regress on measured acceptance
+(0.46-0.58 at the deep levels) and on GPU work, so removing the exactness
+ceiling removes a constraint that is not currently binding. Worth knowing
+rather than worth building -- unless a better head ever makes depth 4 pay,
+at which point the ceiling would bind and this is how it comes off.
+
+**The more useful half of that file is its list, not its code.** It names
+every site it intervenes at -- `_linear`, `_linears`,
+`_embedding_as_linear`, `quantized_linear`, `quantized_argmax`,
+`_attention`, `_switch_glu`, `_feed_forward`, `_gated_delta`,
+`_normalize_gated_delta_qk` -- where this port found its stragglers one at a
+time by layer bisect ("three windows in sixty still moved"). **Any site it
+touches that `ops::invariant` does not is a latent exactness hole**, and
+diffing the two lists is reading rather than measurement. Two details worth
+carrying into that read: it replaces the gated-delta q/k normalisation with
+an explicit `rms_norm` plus scaling, a suspect this port's bisect never
+listed; and it runs the recurrence itself through the ordinary packed
+`gated_delta_update`, so upstream does not treat the recurrence as needing
+row-invariance -- which bears on the reuse divergence in "Smaller gaps".
 
 ---
 
