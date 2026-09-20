@@ -725,8 +725,21 @@ a snapshot is a reference rather than a copy.
 > away and the wall follows GPU work, which Phase 27's decomposition always
 > put at its minimum at depth 1. **`--mtp` still means depth 3**, which is
 > `mtplx_runtime.json`'s recommendation and is now the wrong default on this
-> machine -- left as a decision rather than taken, because it is the only
-> code question this raises.
+> machine.
+>
+> **Settled on a third text, 2026-09-20 (Phase 43): the knee is 1.** Russian
+> prose, the third genre, reads autoregression 132.7, depth 1 **152.7**,
+> depth 2 140.1, depth 3 124.3 -- so across four cells depth 1 wins three
+> and depth 2 takes the code prompt by 2%, while depth 3 is the worst
+> speculative arm in all four. **The default stays at 3**: it is the
+> artifact's own contract and this port follows it on purpose, so the
+> measurement now sits beside it in `src/main.rs` and in `--help` instead of
+> replacing it. `--mtp-depth 1` is one flag away.
+>
+> **That cell also found where FR-Spec collapses.** Its sub-vocabulary is
+> MTPLX's code corpus, so on Russian prose acceptance falls 0.75 -> 0.48 and
+> it costs 11-19% at every depth, where on English prose and code it is
+> worth +4 to +7%. Off by default, and now measured rather than cautious.
 >
 > *Speculation pays more than the overturned table said, not less*: 15-29%
 > on the wall depending on the text, against its 16-20%, two levels
@@ -923,6 +936,24 @@ sampled window back.
 `--frspec` drafts through a pruned `lm_head` -- 65536 of the 248320 rows,
 26.4% of its bytes -- while the verify pass keeps reading all of them. Port of
 MTPLX's `frspec_draft.py`, and `src/frspec.rs` says why the two agree.
+
+**Which 65536 rows is the whole story, and they are a code corpus**
+(`mtplx/data/qwen38_code_ranked_64k.npy`). Phase 43: on English prose and on
+code `--frspec` is worth +4.2 to +7.1% at every depth; on **Russian prose
+acceptance falls 0.75 -> 0.48 and it costs 11-19%** -- a pruned head cannot
+propose a row it does not have. It is off by default and that is now a
+measured default.
+
+**And it is predictable without running the model.** Acceptance under
+`--frspec` is the full head's acceptance times the fraction of emitted
+tokens that fall inside the 65536 rows: english prose 100.0% coverage and
+0.65 -> 0.65, code 99.0%, russian prose 65.0% and 0.75 -> 0.48 against an
+arithmetic ceiling of 0.75 x 0.650 = 0.4875. So before reaching for
+`--frspec` on a new kind of text, count the coverage against
+`refs/frspec/ids_64k.bin` -- seconds, no GPU -- and only then spend the
+three-minute cell. The lever it points at is a list ranked on the corpus in
+use: `tools/dump_frspec.py` writes one and `ORNITH_FRSPEC=<path>` selects
+it.
 
 **It cannot change what the model emits**, and this is the property that makes
 it worth having. Every committed token is the verify forward's own argmax: the
@@ -1841,8 +1872,10 @@ believing one.
 **And on 2026-09-20 all three faces were measured on a machine with 0.5 GB of
 swap in use, and all three went away** -- prefill at **97-98% busy** on both
 artifacts (idle 0.03-0.08 s of a 3.6-4.2 s prefill), MTP idling *less* a token
-than autoregression, FR-Spec a flat +4.2 to +7.1% at every depth with no
-collapsed run in any cell. The paragraph above is right about the mechanism
+than autoregression, FR-Spec +4.2 to +7.1% at every depth with no
+collapsed run in any of those cells -- though Phase 43 then found the text
+that does collapse it, and it is a vocabulary question rather than a swap
+one: Russian prose, acceptance 0.75 -> 0.48, -11 to -19% on the wall. The paragraph above is right about the mechanism
 and right about the reflex; what it could not know is how much of every number
 in this document was the swap file. `REBUILD.md` Phase 42.
 
@@ -2388,13 +2421,17 @@ In order:
    (proved against the very binary that recorded it: 2.02 ms a token of idle
    then, 0.25-0.28 now), **prefill's half-idle GPU was swap** (37-72% busy
    then, **97-98%** now, on both artifacts, with idle at 0.03-0.08 s of a
-   3.6-4.2 s prefill), and **FR-Spec collapses in no cell** -- it is a flat
-   +4.2 to +7.1% at every depth. The wall numbers in this document are now
+   3.6-4.2 s prefill), and **FR-Spec's swap-era collapses do not reproduce**
+   -- it is +4.2 to +7.1% at every depth on English prose and code. What it
+   *is* sensitive to is the text: Phase 43 measures -11 to -19% on Russian
+   prose, acceptance 0.75 -> 0.48, because its 64k sub-vocabulary is ranked
+   on a code corpus. The wall numbers in this document are now
    measured rather than untrusted, each with a control against itself inside
    1.1%. Two things carry forward: **read `sysctl vm.swapusage` before
    believing any wall figure** -- that reflex is what this item was for and
-   it stays -- and **the depth knee moved with the stall**, which is the one
-   open decision it leaves (see the box at the top of "It does pay off").
+   it stays -- and **the depth knee moved with the stall**, settled on a
+   third text in Phase 43 at depth 1 and documented beside the default
+   rather than replacing it (see the box at the top of "It does pay off").
 2. **Close the gap from 272 GB/s to the 465 the machine can give.** The
    kernels are already at the ceiling on a long read and nowhere near it on a
    short one. Overlap was the obvious lever and it has now been measured:
@@ -2412,6 +2449,19 @@ In order:
      question is not "how many epochs" but "which dispatch is the longest
      thing in its own epoch, and does anything nearby have room for it" --
      which `step_inventory` answers directly and the model cannot.
+
+     **CLOSED AT ZERO 2026-09-20, `REBUILD.md` Phase 43.** That question was
+     asked properly, with `tools/epoch_slack.py` on a fresh trace, and the
+     answer is that the remaining 0.265 ms a token (3.8% of a step) is
+     **96% one dispatch** -- the shared expert's gate again, identified from
+     the census without ambiguity: `affine_qmv`, grid 1, 6272 bytes, a
+     `2048 -> 1` projection once a layer. Its move is built
+     (`ORNITH_MOE_GATE_POS`), was refuted in Phase 33, and was re-run here on
+     a machine that is not swapping because that refutation was not: position
+     0 is +1.14% and position 2 is +0.71%, both 3 of 3 draws worse, against a
+     control of 0.43%. Everything that is not that dispatch is 0.01 ms. So
+     encode order is spent, and this was the last GPU-side object on this
+     list.
    - **The launch floor, which was half the step, and is now 38% of it.**
      Phase 31: the same dispatch stream with its work clamped away is 46% of
      a decode step, and what is left runs at the machine's ceiling.

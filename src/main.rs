@@ -13,6 +13,20 @@
 //! `BPEStreamingDetokenizer` in between, so the text that lands on the
 //! terminal is the text `mlx_lm.generate` would print.
 //!
+//! **`--mtp` is depth 3 because `mtplx_runtime.json` recommends 3, and on
+//! this machine the measured knee is 1.** `REBUILD.md` Phase 43, four cells
+//! on a quiet machine, wall tok/s against autoregression: depth 1 wins three
+//! of four (+15 to +26%) and depth 2 takes the fourth by 2%; depth 3 is the
+//! worst speculative arm in all four and is *slower than not speculating* on
+//! one of them. The default follows the artifact's own contract rather than
+//! this machine's measurement; `--mtp-depth 1` is the fast one here.
+//!
+//! **`--frspec` is a property of the text, not a free win.** Its ranked
+//! sub-vocabulary is MTPLX's code corpus (`qwen38_code_ranked_64k`), so on
+//! English prose and code it is worth +4 to +7% at every depth, and on
+//! Russian prose acceptance falls 0.75 -> 0.48 and it *costs* 11-19%. Off by
+//! default, and that is the right default.
+//!
 //! `--image` takes already-decoded pixels -- a binary PPM, an uncompressed
 //! BMP, or raw RGB with `--image-size WxH`. There is no image *decoder* here;
 //! macOS ships one:
@@ -219,7 +233,12 @@ fn parse_args() -> Args {
                     "ornith [--prompt TEXT] [--system TEXT] [--max-tokens N] [--seed N]\n\
                      \x20      [--raw] [--greedy] [--tokenizer-json]\n\
                      \x20      [--image PATH]... [--image-size WxH]\n\
-                     \x20      [--mtp] [--mtp-depth N] [--mtp-cycle] [--frspec]"
+                     \x20      [--mtp] [--mtp-depth N] [--mtp-cycle] [--frspec]\n\
+                     \n\
+                     \x20 --mtp is depth 3, which is mtplx_runtime.json's\n\
+                     \x20 recommendation; the measured knee on this machine is 1.\n\
+                     \x20 --frspec drafts from a code-ranked 64k sub-vocabulary and\n\
+                     \x20 loses on text outside it (Russian prose: -11 to -19%)."
                 );
                 std::process::exit(0);
             }

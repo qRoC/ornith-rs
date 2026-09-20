@@ -23,11 +23,30 @@
 //!     is not a degree of freedom: `ORNITH_KQUANT_GEMM` and `ORNITH_AFFINE_GEMM`
 //!     stop changing the capture because there is only one arithmetic left.
 //!
-//! **What it covers is the quantized linears, which is most but not all of a
-//! forward.** Both families, dense and routed. It does not touch SDPA, the
-//! gated-delta recurrence or the bf16 gemms, each of which also picks a kernel
-//! by row count; `src/bin/invariance.rs` measures what is left after this flag
-//! and says which op it is.
+//! **What it covers is every dense product, quantized or not**: both
+//! quantized families (`ops::quantized`, `ops::kquant`) and the bf16 gemm
+//! (`ops::matmul`), which was added after this paragraph first said it was
+//! not -- `in_proj_a` and `in_proj_b` are bf16, so the quantized flag alone
+//! left a gated-delta layer batch-dependent and `src/bin/invariance.rs` found
+//! it there. The routed products need no guard at a window's width and get
+//! one only in `all` mode: mlx's own threshold for the tile is
+//! `rows / experts >= 4`, which at 256 experts is 1024 rows, where a depth-3
+//! window has 32.
+//!
+//! What it does not cover is SDPA and the gated-delta recurrence, and neither
+//! needs covering *inside the window*: the recurrence is a strict `t` loop
+//! carrying float32 state, bit-identical stepped or not, and attention stays
+//! in mlx's fused vector kernel up to [`EXACT_WINDOW`]. Past that width SDPA
+//! is where exactness ends, and `src/bin/invariance.rs` says so by pointing
+//! at the first full-attention layer.
+//!
+//! **Measured rather than argued, 2026-09-20** (`REBUILD.md` Phase 43):
+//! `bin/invariance --steps 64 --window 2,3,4,5`, four modes each, every row
+//! of windows 2, 3 and 4 bit-identical to that row computed alone with no
+//! argmax moved -- 12 cells of 12 -- and window 5 identical in none. That is
+//! also the checklist against `mlx_vlm`'s `Qwen3_5BatchInvariantForward`,
+//! which intervenes in ten places: a site it touches and this file misses
+//! would show up as a row that is not bit-identical, and none did.
 //!
 //! The cost is real and is the reason this is not the default: a batch of rows
 //! re-reads the whole weight matrix once per row. At a verify window of four

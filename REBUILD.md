@@ -7430,9 +7430,12 @@ what a quiet machine looks like. And nothing here needed a fourth draw.
   was `HANDOFF.md`'s item 1 and it is the item every other one was waiting
   on;
 - **MTP's four-fold swing, FR-Spec's collapsed runs, prefill's half-idle
-  GPU** -- the three faces item 1 named. FR-Spec is worth a flat
-  **+4.2 to +7.1%** at every depth in every cell here and collapses in none
-  of them;
+  GPU** -- the three faces item 1 named. FR-Spec is worth **+4.2 to +7.1%**
+  at every depth in every cell here and its swap-era collapses do not
+  reproduce. (**It does collapse, on a text this phase did not have** --
+  Phase 43 measures -11 to -19% on Russian prose, because its
+  sub-vocabulary is a code corpus. Not a swap artefact, and not a flat win
+  either: a property of the text.);
 - **the depth knee**, which moved from 3 to 1 and changes what the default
   should be.
 
@@ -7449,6 +7452,245 @@ what a quiet machine looks like. And nothing here needed a fourth draw.
 - **nothing here was re-verified for correctness**, because nothing here
   changed the code. The only code question this phase raises is the default
   depth, and it is left as a question.
+
+
+## Phase 43 -- a third text, a checklist that measured itself, and the last GPU object closes at zero -- **DONE**
+
+Three items in one sitting, all three on the quiet machine Phase 42 opened:
+settle the depth knee on a third text, run `mlx_vlm`'s invariant verifier as
+a checklist against `ops::invariant`, and price what is left of encode order.
+Two of the three closed something; the third dissolved the hypothesis it was
+written on.
+
+### 1. The knee is depth 1, and FR-Spec is a property of the text
+
+Phase 42 left one decision open on two texts. The third is Russian prose --
+a third genre and this machine's actual second language -- and it was chosen
+partly because `--frspec` drafts from MTPLX's **code** corpus
+(`qwen38_code_ranked_64k`), so Cyrillic is a place its 65536 rows might not
+reach. Both arms are in the cell for exactly that reason.
+
+    русская проза, q6k-full, best of 3 draws, control 0.5%
+
+      arm                       wall tok/s   GPU ms/tok   acceptance
+      autoregression               132.7         7.00        --
+      --mtp-depth 1              **152.7**       6.55       0.75
+      --mtp-depth 2                140.1         7.14     0.74 / 0.63
+      --mtp-depth 3                124.3         8.04   0.71 / 0.60 / 0.66
+      --mtp-depth 1 --frspec       135.3         7.39       0.48
+      --mtp-depth 2 --frspec       119.2         8.39     0.49 / 0.53
+      --mtp-depth 3 --frspec       100.2         9.96   0.47 / 0.47 / 0.54
+
+`--mtp-depth 1` was measured in two separate cells here and reproduced to
+**0.6%** across them (152.2 / 152.4 / 152.3 and 152.5 / 151.8 / 152.7),
+which is the cross-cell control this table gets for free.
+
+**The knee is 1.** Four cells now: depth 1 wins three (+15.3%, +25.9%,
++15.1%) and depth 2 takes the code prompt by 2%; **depth 3 is the worst
+speculative arm in all four** and loses to plain autoregression in two.
+
+**And FR-Spec collapses here, which Phase 42 said it did nowhere.** That
+claim was true of the three cells it had. On Russian prose acceptance falls
+**0.75 -> 0.48** and the wall falls with it: **-11.4% at depth 1, -14.9% at
+depth 2, -19.2% at depth 3**. The mechanism is not subtle -- a pruned
+`lm_head` cannot propose a row it does not have -- but nothing had measured
+it, because every text it had been measured on was English or code, which is
+what its sub-vocabulary was ranked on. `--frspec` is off by default and that
+is now a measured default rather than a cautious one.
+
+**And the mechanism is arithmetic, which makes it predictive.** Count what
+fraction of the tokens a text actually emits fall inside those 65536 rows
+(`refs/frspec/ids_64k.bin`, the artifact's own tokenizer, zero GPU):
+
+    text                  tokens in the 64k    acceptance, d1 -> d1+frspec
+      english prose             100.0%               0.65 -> 0.65
+      code                       99.0%                 --  -> 0.88
+      russian prose              65.0%               0.75 -> 0.48
+
+A token outside the list cannot be drafted at all, so the ceiling on
+acceptance is the full head's acceptance times the coverage:
+**0.75 x 0.650 = 0.4875 against a measured 0.48**, and at 100% coverage the
+acceptance does not move at all (0.65 to 0.65), which is the control on the
+other end. So **whether `--frspec` will pay on a new kind of text is a
+counting question, answerable in seconds without running the model** -- and
+the lever it suggests is a sub-vocabulary ranked on the corpus in use rather
+than on MTPLX's code one (`tools/dump_frspec.py` writes the list,
+`ORNITH_FRSPEC=<path>` points at it).
+
+The two combine into the honest statement: **speculation pays 15-29%, at
+depth 1, and FR-Spec pays exactly to the extent its corpus covers the
+text.**
+
+### 2. The invariance checklist, and it answers by measurement
+
+`ornith_next.md` item 2: `mlx_vlm/models/qwen3_5/speculative_verifier.py`
+(427 lines, `Qwen3_5BatchInvariantForward`) intervenes in ten named places,
+and any place it touches that `ops::invariant` does not is a hidden hole in
+this port's exactness. The list was to be walked one entry at a time.
+
+**It can be answered in one run instead, and the run is the stronger
+answer.** `bin/invariance` compares each row of a window against that same
+row computed alone, through all forty layers -- embedding, SDPA, the
+recurrence, the MoE, the head. A site upstream covers and this port misses
+would show up as a row that is not bit-identical.
+
+    bin/invariance --steps 64 --window 2,3,4,5, four modes each, q6k-full
+
+      window   invariant=off                 invariant=on
+        2      0/64 exact, 2 argmax moved    64/64 exact, 0 moved
+        3      0/63 exact, 1 moved           63/63 exact, 0 moved
+        4      0/64 exact, 1 moved           64/64 exact, 0 moved
+        5      0/60 exact, 1 moved            0/60 exact, 1 moved
+
+**Twelve cells of twelve bit-identical at every width a depth-3 verify
+produces**, and the `off` column is the control that says the flag is doing
+the work rather than the arithmetic being invariant anyway. Window 5's first
+disagreement is at layer 3, the first full-attention layer, which is
+`EXACT_WINDOW`'s documented reason measured again.
+
+Three things came out of the reading beside that.
+
+**The named suspect dissolved.** `ornith_next.md` flagged
+`_normalize_gated_delta_qk` as "a suspect the port's bisect never listed --
+it replaces the layer's own q/k normalization with explicit `rms_norm`". It
+does not replace anything: `speculative_verifier.py:220-224` is a verbatim
+copy of `language.py:1070-1074`, the *ordinary* path's `_normalize_qk`, down
+to the `inv_scale**2` on q, and it exists only because the verifier
+re-implements `_gated_delta` from scratch and needs that step inline. It
+takes `layer` and immediately does `del layer`. **A method list is not an
+intervention list**; each entry has to be diffed against the method it
+stands in for, and one of ten was a copy.
+
+**One real intervention was missing from the list, and the port never needed
+it.** The ordinary gated-delta forward takes a fast path at `S == 1` --
+`_causal_conv1d_decode`, a float32 transposed weight through a matmul-shaped
+kernel -- and the verifier **always** takes the general `conv1d` instead.
+Upstream therefore holds that its own two convolutions do not agree bit for
+bit, which would make any verify row differ from the autoregressive step it
+stands in for. This port has no such hole because it never dug one: MTPLX,
+its oracle, has no decode-only convolution, so there is one conv path at
+every `S` and `ops::gdn`'s fused front end is `T`-parameterised rather than
+`T`-switched.
+
+**And one of this file's own claims was stale.** `ops::invariant`'s module
+doc said it "does not touch SDPA, the gated-delta recurrence or the bf16
+gemms". The bf16 gemm has been covered since `ops::matmul:500` -- and the
+comment there says `bin/invariance` is what found it, in `in_proj_a` and
+`in_proj_b`, "three windows in sixty". Today's run confirms it from the
+other side: with the flag **off**, the first layer to disagree is layer 0,
+`linear_attention`, which is exactly those two projections. The doc is
+corrected in this phase.
+
+For the record, the rest of the checklist and why each entry is closed:
+
+    upstream site                     here
+      _linear / _linears              ops::quantized:261, ops::kquant:994,
+                                      ops::matmul:500 -- all three guarded
+      quantized_linear                same
+      _embedding_as_linear            not reachable: tie_word_embeddings is
+                                      false on both artifacts
+      quantized_argmax /              not implemented, and not a hole -- the
+        can_quantized_head /          port's argmax is a separate unfused
+        pad_token_mask                pass, which is invariant by construction
+      _attention                      EXACT_WINDOW = 4 keeps mlx's fused
+                                      vector SDPA; upstream loops query rows
+                                      because gqa 12 leaves it at 3 rows
+      _switch_glu (sorted False)      no guard needed at a window's width:
+                                      the tile wants rows/experts >= 4, i.e.
+                                      1024 rows at 256 experts, against 32
+      _feed_forward (precise softmax) block_softmax_precise, x40 a token
+      _gated_delta                    projections guarded above; the
+                                      recurrence is a strict t loop in fp32,
+                                      bit-identical stepped or not -- upstream
+                                      does not loop it either
+      _normalize_gated_delta_qk       not an intervention (above)
+
+### 3. Encode order: the model still points at one dispatch, and it still loses
+
+`ornith_next.md` item 3 was the ~3.4% left in encode order, the last GPU-side
+object in `HANDOFF.md`'s list. `tools/epoch_slack.py` on a fresh trace:
+
+    1005 dispatches in 613 epochs; charged its slowest member, 4.445 ms
+    58 dispatches are the slowest in their epoch and have somewhere to go
+
+      kernel         n   us each   ms/token   slack
+      affine_qmv    40     6.38      0.255       5
+      rope_single   10     0.72      0.007       2
+      q6k_qmv        6     0.37      0.002       5
+      cache_copy     2     0.10      0.000       4
+      all of them                    0.265
+
+0.265 ms is 3.8% of a decode step and **96% of it is one kernel**. The census
+identifies it without ambiguity: `affine_qmv_bfloat16_t_gs_64_b_8_batch_0`,
+**grid 1**, 6272 bytes read, 12.8-13.6 us -- 4096 bytes of a 2048-wide input
+plus 2176 of one 8-bit row at group 64, i.e. a `2048 -> 1` projection once
+per layer. That is the shared expert's gate, and it is the dispatch Phase 31
+moved once for 3.3% and Phase 33 tried to move again for 0.235 ms and could
+not.
+
+**Phase 33's refutation was taken on a swapping machine, so it was re-run
+here rather than cited.** `ORNITH_MOE_GATE_POS`, three positions and the
+default twice, interleaved, GPU ms a token by minima of three draws:
+
+      1  beside the gathers (default)   7.00     --
+      1  the same again, the control    7.03   +0.43%
+      0  beside the router              7.08   +1.14%   3 of 3 worse
+      2  after the gathers              7.05   +0.71%   3 of 3 worse
+
+**Both alternatives still lose, on a machine that is not swapping**, and the
+mechanism Phase 33 named survives with them: what hides a one-row `qmv`'s
+chain of dependent loads is not the epoch it shares but the two barriers of
+gather between it and the tail that reads it, and moving it later removes
+those. One thing did change -- position 0 was level with 1 in Phase 33 and is
+1.14% behind it now -- which is a *positive* result expiring, the same way
+Phase 33 watched Phase 31's expire.
+
+**So item 3 closes at zero**, and with it `HANDOFF.md`'s "What is left" item
+2. The 3.8% the schedule model still offers is one refuted move plus 0.01 ms
+of everything else.
+
+### What changed in the code
+
+Two edits, both documentation, no numerics:
+
+- `src/ops/invariant.rs`'s module doc: the coverage paragraph rewritten to
+  say what is actually guarded (both quantized families **and** the bf16
+  gemm), why the routed products need no guard at a window's width, and what
+  the twelve measured cells say;
+- `src/main.rs`'s module doc and `--help`: that `--mtp` means depth 3 because
+  `mtplx_runtime.json` recommends 3 while the measured knee here is 1, and
+  that `--frspec` is a property of the text.
+
+**The default was not changed.** Depth 3 is the artifact's own contract and
+this port follows it on purpose; the measurement belongs beside it, not
+instead of it. `--mtp-depth 1` is one flag away.
+
+### What was checked
+
+- The whole suite green: **128 tests, 0 failed, 0 ignored**, `--include-ignored`
+  with `--test-threads=1`.
+- Byte-identity, ten rows on two artifacts, **with the byte count beside
+  every hash**, against the binary from before this phase:
+
+      artifact     case                            bytes   md5
+      q6k-full     200 greedy                        786   6b9e2a343be7b2f0...
+      q6k-full     --mtp --mtp-depth 1 --frspec      786   6b9e2a343be7b2f0...
+      q6k-full     200 greedy, ORNITH_WIDE_ELEM=0    786   6b9e2a343be7b2f0...
+      q6k-full     200 greedy, ORNITH_NO_REUSE=1     786   6b9e2a343be7b2f0...
+      q6k-full     6621-token prompt, --raw -m 8      40   0c904f9373342bf7...
+      parent       200 greedy                       1033   1eadd98168d391f4...
+      parent       --mtp --mtp-depth 1 --frspec     1033   1eadd98168d391f4...
+      parent       200 greedy, ORNITH_WIDE_ELEM=0   1033   1eadd98168d391f4...
+      parent       200 greedy, ORNITH_NO_REUSE=1    1033   1eadd98168d391f4...
+      parent       6621-token prompt, --raw -m 8      26   bae75e6f3f7799ff...
+
+  **The two long-prompt rows are Phase 38's and Phase 40's, hash for hash**,
+  which makes them a control across three phases and several days.
+- **And the long-prompt recipe is written down at last**: `--raw --greedy`
+  over `baseline/ppl_corpus.txt` with **`-m 8`**. Phases 38 and 40 recorded
+  the hashes without the token count, and it had to be found by trying (`-m 1`
+  gives 2 bytes, `-m 16` gives 49). Same lesson as Phase 42's prompts: a hash
+  whose recipe is not beside it is a number nobody can re-enter.
 
 
 ## Disk
