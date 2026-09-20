@@ -2763,7 +2763,12 @@ reads much more invitingly than it should.
   `best_of` takes a minimum and nothing in it competes for DRAM). Scalar
   FMA and simdgroup 8x8x8, each swept over how many independent
   accumulators a thread carries, then the real gemms at a chunk's shapes
-  against the result. **Sweep, always:** one dependent FMA chain reads 2.6
+  against the result. It also carries the width cells (elementwise and the
+  two transposes) and, since Phase 39, **the steel spike** -- Q4_K on
+  `mlx::steel::BlockMMA`, its `max_abs` against `kquant::qmm_t`, and three
+  arms **interleaved draw by draw with the within-cell spread printed**,
+  which is the shape any A/B here should have and the one that caught a
+  sequential-block cell agreeing to 0.3% and meaning nothing. **Sweep, always:** one dependent FMA chain reads 2.6
   TFLOP/s where thirty-two independent ones read 14.1, so an unswept
   "peak" here is wrong by 5x and looks perfectly reasonable.
 - **`--bin draft_cost` and `--bin window_mv` are the speculative pair**, both
