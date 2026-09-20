@@ -7167,6 +7167,290 @@ different question.
 
 
 
+## Phase 42 -- the MTP stall was the swap file, and the depth knee moves with it -- **DONE**
+
+`ornith_next.md` opened with an instruction rather than a task: **do not fix
+the stall, re-measure it first.** Phase 39 had written "8-19%, sign
+consistent across every draw" and Phase 41 found that was the load. The MTP
+table this phase was pointed at came from the same era and the same machine,
+carrying 18.5 GB of swap. It does not survive either.
+
+The machine: `load` 1.0-2.4 for the whole sitting, printed before and after
+every single run, and `vm.swapusage` **510-535 MB used and unmoving** --
+against the 18.5 GB the table under test was taken on. Nothing else was
+running; the window was made on purpose and spent on the measurements that
+need it.
+
+### The protocol, and it is the one the discipline asks for
+
+One prompt per cell, 200 `--greedy` tokens, `ORNITH_PROF=1`, arms
+**interleaved draw by draw** rather than in blocks, three whole draws, and
+**autoregression twice in every cell** as the control against itself. Every
+cell's control came back inside 1.1%, so the instrument's floor here is
+about a percent and every effect below is many times that.
+
+**Both prompts are written out here, because the table being overturned did
+not write its own down** -- which is why its acceptance (0.78 at depth 1
+against 0.63-0.65 on these) cannot be reproduced and its arms cannot be
+matched one to one. A cell is three minutes; not being able to re-enter it is
+the expensive part.
+
+    the prose prompt, 51 tokens through the chat template
+
+      Explain, step by step, how a modern GPU driver schedules work submitted
+      from a single-threaded host program: command buffers, queues, completion
+      handlers, and where the host ends up waiting.
+
+    the code prompt, 49 tokens
+
+      Write a Rust function that parses a Metal shader's argument table from a
+      slice of bytes and returns a Vec<Binding>, where Binding has a name, an
+      index and a kind. Include the struct definitions and error handling.
+
+    one arm of one draw, and the arms are "", "--mtp-depth {1,2,3}", each
+    with and without --frspec:
+
+      ORNITH_MODEL=~/.mtplx/models/ornith-1.5-35b-a3b-q6k-full ORNITH_PROF=1 \
+        ./target/release/ornith --greedy --prompt "$P" -m 200
+
+**"The affine parent" in this document is the default `ORNITH_MODEL`** --
+`~/.mtplx/models/ornith-1.5-35b-a3b-attention8-bf16recurrence-vision-mtplx`,
+27 GB, 4-bit affine, the published artifact. It is not
+`~/.mtplx/models/ornith-ai--Ornith-1.5-35B-A3B`, which is the 67 GB bf16
+upstream the rebuild was forged *from* and which the port declines to load at
+all (`config.json has no quantization block`, `src/weights.rs:49`). Both are on
+this disk under similar names; one of them is a wasted run.
+
+### The table under test, re-measured
+
+`q6k-full`, a 51-token chat prompt, best of three draws for the wall and the
+minimum for GPU:
+
+    arm                       wall tok/s   GPU ms/tok   idle ms/tok   acceptance
+    autoregression               133.7        6.97       0.51-0.55      --
+    autoregression again         135.2        6.89       0.50-0.54      --   (control +1.1%)
+    --mtp-depth 1                147.2        6.46       0.33-0.36     0.65
+    --mtp-depth 1 --frspec       154.1        6.17       0.32-0.37     0.65
+    --mtp-depth 2                135.4        7.13       0.25-0.29     0.69 / 0.55
+    --mtp-depth 2 --frspec       141.9        6.76       0.27-0.30     0.69 / 0.55
+    --mtp-depth 3                114.0        8.53       0.25-0.26     0.64 / 0.55 / 0.53
+    --mtp-depth 3 --frspec       120.5        8.05       0.26-0.27     0.64 / 0.55 / 0.53
+
+All eight arms emitted the **same 786 bytes under one md5**, which is
+`ORNITH_INVARIANT` doing its job and a free exactness control on the cell.
+
+The premise was "idle ~2.0 ms a token under MTP against 0.9 under
+autoregression, ~10% of the wall". Measured on a quiet machine, MTP idles
+**0.25-0.37** and autoregression **0.50-0.55**: the ratio is not 2.2x, it is
+**0.6x**, and the sign of the whole claim is the other way round. Idle is 7%
+of the wall on the autoregressive arm and **3-5%** on every MTP arm.
+
+The signature the eighth explanation was to be found in is gone with it.
+`gather_rows_by_id` was 2.0 ms at ~0.7 times a token under MTP against 0.43
+at 1.0 under autoregression; it now reads **0.047-0.056 ms at x0.0 a token**
+under MTP against **0.53 ms at x1.0** under autoregression. What is left of
+MTP's idle is `slice_inner` at ~0.6 a token, which is the round trip that
+hands the sampled window back.
+
+### The control that says it was the machine and not the code
+
+Phases 38-40 landed between that table and this one, so "quiet machine" and
+"different binary" are two explanations and the cell above cannot separate
+them. So the binary that produced the table was built and run again, today,
+on the same artifact and the same prompt: `add3ee9`, 2026-09-18 10:16, the
+commit that wrote the table down. Four arms, three interleaved draws, its
+own control at +0.3%. (Two traps in that recipe: `refs/` is not in git, so
+the worktree has no `ids_64k.bin` and `--frspec` panics until
+`ORNITH_FRSPEC=<main tree>/refs/frspec/ids_64k.bin` is passed; and
+`cargo build --release` in the worktree took **12 seconds**, because the
+crate registry and most of the dependency graph were already warm -- the
+control is cheap enough that there is no excuse for skipping it.)
+
+    add3ee9, affine parent      wall tok/s   GPU ms/tok   idle ms/tok
+      as recorded, 18.5 GB swap
+        autoregression           84.6-87.1   10.54-10.80   0.81-0.93
+        --mtp-depth 3 --frspec      101.2       7.76         2.02
+      the same binary, today
+        autoregression           96.2-98.6    9.69          0.45-0.50
+        --mtp-depth 1 --frspec       125.0    7.65          0.34-0.36
+        --mtp-depth 3 --frspec       118.5    8.20          0.25-0.28
+
+**The same binary, on the same weights, idles 0.25-0.28 ms a token where it
+was recorded at 2.02.** The stall was the swap file. Seven explanations were
+measured and rejected against a machine; the eighth was never going to be in
+the code.
+
+The old arms also emit **853 bytes against autoregression's 1033** where every
+arm of today's binary emits the same 786 -- `ORNITH_INVARIANT` became the
+default on 2026-09-19, after this commit, so `add3ee9` drafts text that is
+merely good rather than identical. It is a check that the worktree really did
+build the old code, of the same kind as reading a control's dispatch count.
+
+The row also prices the three phases since: the parent's autoregressive wall
+goes 96.2-98.6 -> 106.4-106.8 tok/s and its dispatches 1669 -> 1009 a token,
+both on a quiet machine, both same-sitting.
+
+### What idle actually is, and it is one number
+
+Multiply each arm's idle a token by its tokens a cycle:
+
+    cell                     cycles   idle/token   tokens/cycle   idle/cycle
+    q6k-full, autoregression    200      0.51          1.000         0.510
+    q6k-full, depth 1           121      0.33          1.653         0.545
+    q6k-full, depth 1 frspec    121      0.32          1.653         0.529
+    q6k-full, depth 2 frspec     97      0.30          2.062         0.619
+    q6k-full, depth 3 frspec     92      0.26          2.174         0.565
+    code prompt, depth 2 frspec  78      0.23          2.564         0.590
+    code prompt, depth 3 frspec  67      0.21          2.985         0.627
+    parent, autoregression      200      0.59          1.000         0.590
+    parent, depth 1 frspec      123      0.37          1.626         0.602
+    parent, depth 3 frspec       98      0.27          2.041         0.551
+
+**0.51-0.63 ms a cycle, everywhere.** Two artifacts, two prompts, four
+depths: the GPU idles for one host round trip per cycle and for nothing
+else. MTP does not stall; it pays the same round trip autoregression pays,
+fewer times per token, which is why it idles *less*. There is no gap to
+explain and no 13 tok/s to win -- the whole remaining idle on the best arm
+is 0.32 ms of 6.49, and most of it is a round trip that has to happen.
+
+### The knee moved from 3 to 1, and the shipped default is now the worst arm
+
+The old table's recommendation was depth 3 with FR-Spec. Three cells on a
+quiet machine, each against its own autoregressive control:
+
+    cell                          auto    d1+fr    d2+fr    d3+fr
+    q6k-full, prose prompt       133.7    154.1    141.9    120.5   tok/s
+                                    --    +15.3%   +6.1%    -9.9%
+    q6k-full, code prompt        133.2    168.3    171.6    161.4
+                                    --    +26.4%   +28.8%   +21.2%
+    affine parent, prose prompt  106.6    134.2    128.8    111.4
+                                    --    +25.9%   +20.8%   +4.5%
+
+**Depth 3 is the worst MTP arm in all three cells**, and on `q6k-full`'s
+prose prompt it is 10% *slower than not speculating at all*. Depth 1 wins
+two cells and loses the third by 2%. `--mtp` still means depth 3, which is
+`mtplx_runtime.json`'s recommendation, and on this machine it is now the
+wrong default -- see the note in `HANDOFF.md`.
+
+Why it moved is the idle-per-cycle row above. Under 2 ms of stall a cycle,
+the cheapest configuration is the one with the fewest cycles a token, and
+that is the deepest one acceptance still supports. Take the stall away and
+the wall follows GPU work, which was **always** minimised at depth 1 --
+Phase 27's decomposition said 7.53 ms a token at depth 1 against 9.67 at
+depth 3 and 8.56 autoregressive, and today's cell reads -11% and +15%
+against the same baseline. The decomposition was right the whole time; the
+wall it was checked against was measuring the swap file.
+
+**And speculation pays more than the overturned table claimed**, not less:
+16-20% then, **15-29%** now depending on the text, at a depth two levels
+shallower.
+
+### Prefill's half-idle GPU was the same thing
+
+`baseline/ppl_corpus.txt`, 6621 raw tokens, `--raw -m 1`, three interleaved
+draws an artifact:
+
+    prefill, 6621 tokens      wall      GPU busy    busy share   idle
+      affine parent        3.59-3.60   3.52-3.53      98%      0.03-0.04 s
+      q6k-full             4.22-4.25   4.13-4.14     97-98%    0.05-0.08 s
+
+Recorded: **37-72% busy** on the parent, and 33-49% on Phase 35's shorter
+text. It is **98%**, and the spread across draws is 0.3%. That was the third
+face of the same problem and it closes with the other two.
+
+### mlx, in the same sitting, on both phases
+
+The comparison this document has never been able to make cleanly, because
+every previous attempt compared a wall against a wall on a machine that was
+swapping under both of them. Same sitting, same quiet machine, same artifact
+(the affine parent, the only one mlx can load), same 6621 ids:
+
+    prefill, 6621 tokens          three draws              tok/s
+      ornith                   3.59 / 3.60 / 3.59 s     1844 / 1842 / 1844
+      mlx_lm.generate          3.60 / 3.60 / 3.59 s     1837 / 1841 / 1843
+
+    decode, 200 greedy tokens
+      ornith                                            106.4 / 106.5 / 106.6
+      ornith --mtp-depth 1 --frspec                     134.0 / 134.2 / 133.8
+      mlx_lm.generate                                   100.9 / 100.9 / 101.2
+
+**Level at prefill, to a quarter of a percent.** The document's standing
+claim was "the port's GPU busy has gone from 7% above mlx's best wall to
+about 5% below it, which is not the same as being faster than mlx". It is
+now measurable directly: the two are the same speed at prefill on the wall,
+and the 22% deficit Phase 35 recorded was swap on both sides -- mlx itself
+reads 1837-1843 tok/s today against the 1541-1666 it gave in the same
+sitting as Phase 36.
+
+At decode the port is **5.3-5.5%** ahead of mlx, which is the 92-against-86 row
+in `HANDOFF.md` re-measured (both numbers ~16% higher on a quiet machine,
+the ratio unchanged), and **32-33%** ahead with one level of speculation.
+
+### Every draw, because a range is not a record
+
+Wall tok/s, in the order they were taken, arms interleaved within each draw:
+
+    q6k-full, prose        auto   133.7 132.2 131.6   auto again 135.2 132.7 132.3
+                           d1     147.2 143.8 143.7   d1+fr      154.1 149.7 149.5
+                           d2     135.4 132.4 132.0   d2+fr      141.9 140.3 140.9
+                           d3     114.0 112.2 112.4   d3+fr      120.5 120.3 120.3
+
+    q6k-full, code         auto   132.4 132.0 133.2   auto again 132.1 132.1 131.9
+                           d1+fr  168.3 168.3 168.3
+                           d2+fr  170.9 171.6 170.6
+                           d3+fr  160.8 161.4 160.9
+
+    affine parent, prose   auto   106.4 106.5 106.6   auto again 106.8 106.4 106.5
+                           d1     125.4 125.0 125.1   d1+fr      134.0 134.2 133.8
+                           d2+fr  128.4 128.8 128.8   d3+fr      111.4 111.1 111.4
+
+    add3ee9, parent, prose auto    98.6  97.9  96.2   auto again  98.9  96.2  95.8
+                           d1+fr  125.0 123.5 122.9   d3+fr      118.5 116.6 116.3
+
+    prefill, 6621 tokens   parent      3.59 3.60 3.59 s wall,  3.52 3.53 3.53 gpu
+                           q6k-full    4.22 4.25 4.23 s wall,  4.14 4.14 4.13 gpu
+                           mlx_lm      3.604 3.596 3.593 s wall (1836.9/1841.2/1842.8 tok/s)
+
+    decode, mlx_lm, parent, 200 greedy tokens         100.9 100.9 101.2 tok/s
+
+Three things to read off it. The three current cells hold their arms to
+**0.3-2.5%** across whole runs; the `add3ee9` cell is the loosest at 2.9%,
+which is still four times smaller than any effect it is used for. The
+**code prompt's `d1+fr` reproduced to 168.3 three times running**, which is
+what a quiet machine looks like. And nothing here needed a fourth draw.
+
+### What this closes
+
+- **the stall: it was the swap file**, proved by its own binary rather than
+  argued from a new one. `ornith_next.md` items 0 and 1 both close on it,
+  and the ~13 tok/s prize does not exist;
+- **"every wall number in this document is untrusted"**: the decode wall,
+  the prefill wall, the mlx comparison at both phases and the MTP table are
+  now measured on a quiet machine with a control against themselves. That
+  was `HANDOFF.md`'s item 1 and it is the item every other one was waiting
+  on;
+- **MTP's four-fold swing, FR-Spec's collapsed runs, prefill's half-idle
+  GPU** -- the three faces item 1 named. FR-Spec is worth a flat
+  **+4.2 to +7.1%** at every depth in every cell here and collapses in none
+  of them;
+- **the depth knee**, which moved from 3 to 1 and changes what the default
+  should be.
+
+### What it does not close, and the honest limits
+
+- **two prompts is two prompts.** The knee at depth 1 against depth 2 is 2%
+  on the code prompt and the ordering of those two could go either way on a
+  third text. Depth 3 losing to both is not close in any cell;
+- **the old table's prompt is not recorded**, so its acceptance (0.78 at
+  depth 1 against 0.63-0.65 here) cannot be reproduced and its arms cannot
+  be matched one to one. This is why the `add3ee9` control was run at all:
+  it compares the binary against itself on *this* prompt, and the recorded
+  numbers enter only as the thing being overturned;
+- **nothing here was re-verified for correctness**, because nothing here
+  changed the code. The only code question this phase raises is the default
+  depth, and it is left as a question.
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

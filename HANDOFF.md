@@ -689,7 +689,50 @@ a snapshot is a reference rather than a copy.
 
 ### It does pay off, and the section that said otherwise was measuring a bug
 
-> **OVERTURNED 2026-09-18.** Everything below was measured on the **published**
+> **RE-MEASURED 2026-09-20, on a machine that was not swapping, and the
+> table below is overturned in its turn.** Everything in the 2026-09-18 box
+> was taken with 18.5 GB of swap in use. With 0.5 GB in use and `load` at
+> 1.0-2.4, the same code on the same weights reads like this -- `q6k-full`,
+> a 51-token chat prompt, 200 greedy tokens, arms interleaved draw by draw,
+> three draws, **autoregression twice in the cell as its own control
+> (+1.1%)**, and all eight arms emitting the same 786 bytes under one md5:
+>
+> | | wall tok/s | GPU busy ms/token | idle ms/token | acceptance by depth |
+> |---|---:|---:|---:|---|
+> | autoregressive | 133.7 | 6.97 | 0.51 - 0.55 | -- |
+> | `--mtp-depth 1` | 147.2 | 6.46 | 0.33 - 0.36 | 0.65 |
+> | **`--mtp-depth 1 --frspec`** | **154.1** | **6.17** | 0.32 - 0.37 | 0.65 |
+> | `--mtp-depth 2` | 135.4 | 7.13 | 0.25 - 0.29 | 0.69 / 0.55 |
+> | `--mtp-depth 2 --frspec` | 141.9 | 6.76 | 0.27 - 0.30 | 0.69 / 0.55 |
+> | `--mtp-depth 3` | 114.0 | 8.53 | 0.25 - 0.26 | 0.64 / 0.55 / 0.53 |
+> | `--mtp-depth 3 --frspec` | 120.5 | 8.05 | 0.26 - 0.27 | 0.64 / 0.55 / 0.53 |
+>
+> **Three things change and one of them changes a default.**
+>
+> *The stall does not exist on a quiet machine.* MTP idles **0.25-0.37 ms a
+> token against autoregression's 0.50-0.55** -- less, not 2.2x more. Proved
+> against its own binary rather than argued from a new one: `add3ee9`, the
+> commit that wrote the old table, rebuilt and re-run today on the same
+> artifact reads **0.25-0.28 ms** at depth 3 + FR-Spec where it was recorded
+> at 2.02. `REBUILD.md` Phase 42.
+>
+> *The depth knee moved from 3 to 1.* Depth 3 is the **worst** MTP arm in
+> every cell measured, and on this prompt it is 10% slower than not
+> speculating at all. Depth 1 + FR-Spec wins here by 15.3%, on a code-shaped
+> prompt depth 2 wins by 2% over depth 1 (171.6 against 168.3, both ~+27%),
+> and on the affine parent depth 1 wins by 25.9%. Under a 2 ms stall a cycle
+> the cheapest arm is the one with the fewest cycles a token; take the stall
+> away and the wall follows GPU work, which Phase 27's decomposition always
+> put at its minimum at depth 1. **`--mtp` still means depth 3**, which is
+> `mtplx_runtime.json`'s recommendation and is now the wrong default on this
+> machine -- left as a decision rather than taken, because it is the only
+> code question this raises.
+>
+> *Speculation pays more than the overturned table said, not less*: 15-29%
+> on the wall depending on the text, against its 16-20%, two levels
+> shallower.
+
+> **OVERTURNED 2026-09-18, and superseded by the box above.** Everything below was measured on the **published**
 > MTP head, the one shipping `post_attention_layernorm` still delta-encoded
 > (`REBUILD.md` Phase 2, and the norm bug it found). That head's acceptance
 > collapses with depth -- 0.53 / 0.34 / 0.35 -- so every draft past the first
@@ -752,6 +795,20 @@ head and the loop are doing their job. And **depth 1 is already 8% less GPU
 work per generated token than autoregression** -- 1466 dispatches against
 1669, 863 barriers against 1064 -- while being no faster on the wall, because
 it leaves the GPU idle 2.58 ms a token where autoregression leaves it 0.50.
+
+**CLOSED 2026-09-20: it was the swap file, and the sixth explanation below
+was the right one all along.** Everything from here to the end of "FR-Spec"
+was measured on a machine carrying 10.7-21 GB of swap, and the one control
+that would have settled it -- a machine carrying none -- did not exist until
+this window. On 0.5 GB of swap the same binary idles 0.25-0.28 ms a token at
+depth 3 + FR-Spec against the 2.02 recorded here, and idle comes to
+**0.51-0.63 ms a cycle in every arm, every depth, both artifacts, two
+prompts**: one host round trip a cycle and nothing else. MTP idles *less* a
+token than autoregression because it runs fewer cycles a token. Read what
+follows as the record of seven explanations measured against an instrument
+that was broken in a way none of them could see -- and note that #6 was
+rejected at 10.7 GB of swap, which is not the same experiment as 0.5.
+`REBUILD.md` Phase 42.
 
 **It stalls, it does not compute too much.** Where the stall is, though, is
 not settled -- and the obvious answer turned out to be wrong, which is worth
@@ -853,6 +910,14 @@ So the stall is a wall-clock problem on the one machine whose wall clock
 cannot be trusted, and seven explanations have now been measured away. The way
 forward on MTP was what GPU busy *can* see, and that is what FR-Spec did.
 
+**And the last sentence was righter than it knew.** "A wall-clock problem on
+the one machine whose wall clock cannot be trusted" is the whole answer; what
+was missing was a sitting where that machine's wall clock *could* be trusted.
+The eighth explanation was never in the code, and the ~13 tok/s it was worth
+does not exist: on a quiet machine the entire remaining idle on the best arm
+is 0.32 ms of a 6.49 ms token, most of it the round trip that hands the
+sampled window back.
+
 ### FR-Spec, and speculative decoding finally paying
 
 `--frspec` drafts through a pruned `lm_head` -- 65536 of the 248320 rows,
@@ -894,7 +959,9 @@ adds 142 MB of gathered rows to a 27.2 GB working set, and the machine was
 back to 16.4 GB of a 17.4 GB swap file by then. Which is the whole state of
 this path: **the speculative win is real and measured on the metric that
 survives this machine, and the stall is what stands between it and the wall
-clock.**
+clock.** (2026-09-20: the stall *was* this machine. On a quiet one the wall
+follows the GPU column, and both collapsed runs above are the swap signature
+and nothing more -- `REBUILD.md` Phase 42.)
 
 Only after that is it worth making the draft cheaper, and there the number is:
 a draft step is ~2.4 ms of GPU, about half of which is the `lm_head` below.
@@ -1282,6 +1349,20 @@ what pins them token for token, on identical ids.)
 runs and still move with what else the machine is doing; GPU busy holds to 2%
 under any load and is the number to compare against.
 
+**"Under any load" is the right claim, and it is not the same as "under
+swap" (2026-09-20).** Load and swap are two variables and only the first was
+ever controlled for here. The clean demonstration is not ours, because it
+needs a pinned prompt across two sittings and `mlx_lm` has one: the same
+6621 ids, the same affine artifact, **1541-1666 tok/s while the machine was
+swapping and 1837-1843 quiet** -- 10-17%, on a program whose prefill is
+almost all GPU. Ours points the same way and is confounded: `add3ee9`
+autoregressive reads 10.54-10.80 GPU ms a token as recorded under 18.5 GB of
+swap and **9.65-9.94 today**, but the recorded row's prompt was not written
+down, and prompt length moves GPU ms a token through the prefill in the
+numerator. So: reading the GPU column instead of the wall is still right, and
+it is not immunity. `sysctl vm.swapusage` before either column.
+`REBUILD.md` Phase 42.
+
 | | wall tok/s | GPU busy ms/token |
 |---|---|---|
 | ornith, before the barrier work below | 82 | -- |
@@ -1289,6 +1370,22 @@ under any load and is the number to compare against.
 | **ornith now** | **92** | **10.3-10.5** |
 | ornith `--mtp-depth 1 --frspec` | 94 at best, and it swings | **9.0** |
 | `mlx_lm.generate`, same prompt text | 86 | -- |
+
+**Re-measured 2026-09-20 on a quiet machine, same sitting, same artifact,
+three interleaved draws each and a control against itself at +0.2%** -- the
+row above is the same comparison taken while the machine was swapping, and
+both sides of it were being taxed:
+
+| | wall tok/s | GPU busy ms/token | idle ms/token |
+|---|---|---|---|
+| **ornith** | **106.4 - 106.8** | **8.78 - 8.85** | 0.54 - 0.59 |
+| ornith `--mtp-depth 1 --frspec` | **133.8 - 134.2** | 7.09 - 7.11 | 0.37 |
+| `mlx_lm.generate`, same prompt text | 100.9 - 101.2 | -- | -- |
+
+Both numbers are ~16% higher than the row above and the ratio is unchanged:
+the port is **5.3-5.5%** ahead of mlx autoregressively and **32-33%** ahead
+with one level of speculation, which no longer "swings" -- its three draws sit
+inside 0.3%. `REBUILD.md` Phase 42.
 
 So the port is now ahead of the reference it was written against rather than
 level with it, by the changes mlx does not have: the MoE block issued
@@ -1298,6 +1395,9 @@ shared expert's one-row gate issued where a gather can hide it, and the
 router's top-k selected rather than sorted.
 And the speculative pairing does 14% less GPU work a token than plain decoding
 while only tying on the wall, for the reason in "It does not pay off here".
+(**Both halves of that sentence are 2026-09-18 numbers.** On a quiet machine
+depth 1 + FR-Spec does 19% less GPU work a token *and* is 26% faster on the
+wall, on the same affine artifact -- the tie was the swap file. Phase 42.)
 
 | a decode step, now | affine artifact | `q6k-full`, after Phase 33 |
 |---|---|---|
@@ -1308,6 +1408,11 @@ while only tying on the wall, for the reason in "It does not pay off here".
 | epochs | 1078 per token, 1.55 dispatches each | 617, 1.64 each (922, then 798) |
 | host round trips | 1.00 per token | 1.00 |
 | weights read | ~2.83 GB per token, i.e. **272 GB/s** against a measured ceiling of 465 and a sticker of 546 | **1.81 GB** |
+
+The affine column predates Phases 31-33; the same artifact on 2026-09-20 runs
+**1009 dispatches and 609 barriers a token at 8.78-8.85 GPU ms of a
+9.36-9.40 ms wall (94%)**, i.e. the left column has caught the right one on
+everything but the weight traffic, which is the format.
 
 **And half of that step is not weight traffic at all.** `REBUILD.md` Phase 31
 measured it rather than estimating it: the same dispatch stream with every
@@ -1342,6 +1447,26 @@ interleaved pairs of whole runs, and `mlx_lm` re-run in the same sitting:
 | GPU busy, Phase 35's stream | 4.22-4.27 s | 4.88-5.01 s |
 | GPU busy, after Phase 36 | **3.78-3.84 s** | **4.43-4.53 s** (its width term is still in front of it) |
 | `mlx_lm.generate`, same ids, same sitting | 3.98-4.30 s of **wall**, 1541-1666 tok/s | mlx cannot load a k-quant artifact |
+
+**And again on 2026-09-20, on a machine with 0.5 GB of swap in use, three
+interleaved draws an artifact.** This is the row that makes the wall usable,
+because prefill's wall and its GPU busy are now the same number:
+
+| the prompt, 6621 tokens | affine parent | `q6k-full` |
+|---|---|---|
+| wall | **3.59 - 3.60 s** | **4.22 - 4.25 s** |
+| GPU busy | 3.52 - 3.53 s | 4.13 - 4.14 s |
+| busy share | **98%** | **97 - 98%** |
+| idle | 0.03 - 0.04 s | 0.05 - 0.08 s |
+| `mlx_lm.generate`, same ids, same sitting | 3.59 - 3.60 s of wall, **1837 - 1843 tok/s** | mlx cannot load a k-quant artifact |
+
+The port's own three draws on the parent are 1842-1844 tok/s, so **the two
+are level at prefill to a quarter of a percent** -- and mlx itself reads
+1837-1843 today against the 1541-1666 it gave in the sitting above, which is
+the same swap tax on the other side of the comparison. The 22% deficit Phase
+35 recorded, and the "5% below mlx's best wall, which is not the same as
+being faster" the next paragraph is careful about, were both measuring the
+machine. `REBUILD.md` Phase 42.
 
 The affine figure is two interleaved pairs sharing an arm (the copies
 indexed, then widened), and the shared arm reproduced across them at 3.97
@@ -1683,6 +1808,9 @@ at it says the same thing the rest of this document has been converging on.
 2600 raw tokens, chunk 2048, three runs: **2.05-2.34 s of GPU busy against a
 wall of 4.19-7.38 s** -- 33% to 49% busy, where a decode step holds 95%. The
 GPU work alone corresponds to ~1230 tokens a second; the wall gives 380-614.
+(**That share was the swap file.** On a quiet machine prefill holds **97-98%**
+and its wall is its GPU busy; the re-measured 6621-token table is above, and
+`REBUILD.md` Phase 42 has the cell.)
 
 `mlx_lm.generate` on the same prompt and the same machine gets **809 tok/s**.
 So the port is not doing more work at prefill than mlx-lm -- by GPU busy it is
@@ -1709,6 +1837,14 @@ and in all three the GPU busy figure stayed flat while the wall moved. Memory
 pressure is the dominant error term in every wall-clock number this port
 produces on this machine, and the swap file is the first thing to read before
 believing one.
+
+**And on 2026-09-20 all three faces were measured on a machine with 0.5 GB of
+swap in use, and all three went away** -- prefill at **97-98% busy** on both
+artifacts (idle 0.03-0.08 s of a 3.6-4.2 s prefill), MTP idling *less* a token
+than autoregression, FR-Spec a flat +4.2 to +7.1% at every depth with no
+collapsed run in any cell. The paragraph above is right about the mechanism
+and right about the reflex; what it could not know is how much of every number
+in this document was the swap file. `REBUILD.md` Phase 42.
 
 ### Which kernels the time is in
 
@@ -2194,8 +2330,9 @@ In order:
    growing.** The prize is still ~6% on the secondary artifact; what
    changed is everything around it. A re-ranking of `IDEAS.md`
    (2026-09-20, and see the bullet under item 3) retired its last two
-   unbuilt entries, the MTP stall below is blocked on a machine that does
-   not swap, and Qwen4-exp does not fit in 68 GB. So this is the only open
+   unbuilt entries, the MTP stall below was blocked on a machine that does
+   not swap (it happened, and there was no stall -- `REBUILD.md` Phase 42),
+   and Qwen4-exp does not fit in 68 GB. So this is the only open
    measurable object in the port, and the argument for taking it is no
    longer the 6%: `mlx::steel::BlockMMA` is **the one thing this port
    consumes as a black box** rather than having written, and Phase 38
@@ -2244,15 +2381,20 @@ In order:
    `bin/arithmetic`. If it is not zero the task is a different task; if it
    is zero and the rate does not move, the eight points are not where they
    were counted. That is Phase 38's own lesson pointed at its successor.
-1. **A machine that is not swapping.** This is first because it is what the
-   next two are waiting on, and it is not something the code can fix. Every
-   GPU-side number in this document is now current and trustworthy -- they
-   were all re-measured, and GPU busy holds to 2% under any load. Every
-   wall-clock number is not: the same binary has come out 82% apart on the
-   wall while its GPU busy did not move, and the swing tracks the swap file,
-   not the load average. MTP's four-fold swing, FR-Spec's collapsed runs and
-   prefill's half-idle GPU are one problem with three faces. Read
-   `sysctl vm.swapusage` before believing a wall figure.
+1. **A machine that is not swapping -- SPENT 2026-09-20, and it paid.** The
+   window came, it was spent on exactly the numbers that needed it, and the
+   three faces this item named are one face: the swap file. `REBUILD.md`
+   Phase 42 has the cells; the short version is that **MTP's stall was swap**
+   (proved against the very binary that recorded it: 2.02 ms a token of idle
+   then, 0.25-0.28 now), **prefill's half-idle GPU was swap** (37-72% busy
+   then, **97-98%** now, on both artifacts, with idle at 0.03-0.08 s of a
+   3.6-4.2 s prefill), and **FR-Spec collapses in no cell** -- it is a flat
+   +4.2 to +7.1% at every depth. The wall numbers in this document are now
+   measured rather than untrusted, each with a control against itself inside
+   1.1%. Two things carry forward: **read `sysctl vm.swapusage` before
+   believing any wall figure** -- that reflex is what this item was for and
+   it stays -- and **the depth knee moved with the stall**, which is the one
+   open decision it leaves (see the box at the top of "It does pay off").
 2. **Close the gap from 272 GB/s to the 465 the machine can give.** The
    kernels are already at the ceiling on a long read and nowhere near it on a
    short one. Overlap was the obvious lever and it has now been measured:
@@ -2477,10 +2619,13 @@ In order:
      closed in Phase 4, quality in Phase 6, and four predictors of the
      distribution have now been measured and found wanting -- weight error,
      perplexity, calibration output error, and activation magnitude. What
-     remains on this list is items 1, 2 and 4 above: a machine that is not
+     remained on this list was items 1, 2 and 4 above: a machine that is not
      swapping, the ~3.4% of encode order that needs a deferred op layer, and
-     the MTP stall. All three are wall-clock questions, which is why the first
-     one gates the other two.
+     the MTP stall. All three were wall-clock questions, which is why the
+     first one gated the other two -- **and on 2026-09-20 the first one
+     happened and took the third with it**: the stall was the swap file
+     (`REBUILD.md` Phase 42). Item 2's encode-order remainder is what is left,
+     and it is a GPU-side question that never needed the quiet machine.
 
 3. **Rebuild the artifact from its parent -- DONE**, Phases 0 through 4, and
    it is what unblocked the byte lever above. `REBUILD.md` is the record. The
@@ -2493,15 +2638,19 @@ In order:
    on the same artifact, which validates the port and not the artifact, so a
    bad rebuild passes the whole suite -- and `baseline/` holds the only
    material that would catch it.
-4. **The MTP stall** -- and speculation is no longer waiting on it to be
-   worth running. Re-measured on the rebuilt head (see the box at the top of
-   "It does pay off"), `--mtp-depth 3 --frspec` already does **27-28% less
-   GPU work a token** than autoregression and runs 16-20% faster on the wall.
-   That is the largest single win in this document and it was sitting behind
-   a stale measurement, not behind the stall. The stall is still real and
-   still costs: idle ~2.0 ms a token against autoregression's 0.9, ~10% of
-   the wall, and the eighth explanation still needs a machine that is not
-   swapping. Fixing it is worth another ~13 tok/s on top, not the whole win.
+4. **The MTP stall -- CLOSED 2026-09-20: there was no stall.** It was the
+   swap file, and the proof is the binary that recorded it, rebuilt and
+   re-run on a quiet machine: 0.25-0.28 ms a token of idle at depth 3 +
+   FR-Spec where the same binary on the same weights was recorded at 2.02.
+   Idle is **0.51-0.63 ms a cycle** in every arm of every cell -- one host
+   round trip a cycle -- so MTP idles *less* a token than autoregression,
+   not 2.2x more. The ~13 tok/s prize does not exist; the whole remaining
+   idle on the best arm is 0.32 ms of a 6.49 ms token. What is left of this
+   item is the opposite of what it said: **speculation pays 15-29% on the
+   wall** depending on the text, and it pays it at **depth 1**, not 3 --
+   depth 3 is the worst MTP arm in every cell and on `q6k-full`'s prose
+   prompt it loses to plain autoregression by 10%. `REBUILD.md` Phase 42,
+   and the box at the top of "It does pay off".
 
 5. **A multi-row k-quant mat-vec -- built in Phase 28, worth an eighth of
    what this item predicted.** Everything below is what was predicted; the
