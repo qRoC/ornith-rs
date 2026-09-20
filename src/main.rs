@@ -56,6 +56,10 @@ struct Vision {
     /// the same reason: an agent resends the identical image every turn.
     rows: Vec<ornith_rs::array::Array>,
     pad_counts: Vec<usize>,
+    /// One digest per image, over the preprocessed pixels that produced its
+    /// rows -- see `VisionSplice::keys`. Session-local, so `DefaultHasher`
+    /// is enough; nothing writes it down.
+    keys: Vec<u64>,
 }
 
 impl Vision {
@@ -75,6 +79,7 @@ impl Vision {
             pre,
             rows: Vec::new(),
             pad_counts: Vec::new(),
+            keys: Vec::new(),
         };
         for path in paths {
             let image = Image::read(path, raw_size).unwrap_or_else(|e| die(&e));
@@ -99,6 +104,7 @@ impl Vision {
                 t0.elapsed().as_secs_f64()
             );
             v.pad_counts.push(v.tower.cfg.pad_token_count(patches.grid));
+            v.keys.push(image_key(&patches));
             v.rows.push(rows);
         }
         v
@@ -113,9 +119,35 @@ impl Vision {
             image_pad_token_id: self.spec.image_token_id,
             embeddings,
             pad_counts: self.pad_counts.clone(),
+            keys: self.keys.clone(),
             cursor: 0,
         }
     }
+}
+
+/// `ORNITH_NO_REUSE=1` is the control for the whole reuse path: every turn
+/// re-prefills the conversation from nothing, which is what the REPL did
+/// under an image before Phase 40 and what it has never done for text.
+/// A reused cache is not the same arithmetic as a fresh prefill of the same
+/// ids -- the tokens it grew through were computed one at a time rather than
+/// in one wide call -- and this is how that difference gets measured instead
+/// of argued about.
+fn no_reuse() -> bool {
+    std::env::var("ORNITH_NO_REUSE").as_deref() == Ok("1")
+}
+
+/// The digest behind `VisionSplice::keys`: the preprocessed pixels and the
+/// grid they were laid out on, which together decide the tower's rows.
+fn image_key(patches: &ornith_rs::vision::preprocess::Patches) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    patches.rows.hash(&mut h);
+    patches.row_len.hash(&mut h);
+    patches.grid.hash(&mut h);
+    for v in &patches.values {
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// `mtplx_runtime.json`'s `recommended_settings`.
@@ -386,7 +418,12 @@ fn user_message(text: &str, n_images: usize) -> Message {
     }
     let mut parts: Vec<Part> = (0..n_images).map(|_| Part::Image).collect();
     parts.push(Part::Text(text.to_string()));
-    Message { role: Role::User, content: Content::Parts(parts), reasoning_content: None }
+    Message {
+        role: Role::User,
+        content: Content::Parts(parts),
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+    }
 }
 
 fn main() {
@@ -455,6 +492,7 @@ fn main() {
         tokenizer: &tokenizer,
         caches: model.make_cache(),
         cached: Vec::new(),
+        cached_vision: Vec::new(),
         max_tokens: args.max_tokens,
     };
 
@@ -467,7 +505,7 @@ fn main() {
                 msgs.push(Message::text(Role::System, s));
             }
             msgs.push(user_message(p, args.images.len()));
-            tokenizer.encode(&apply_chat_template(&msgs, true, ENABLE_THINKING).unwrap())
+            tokenizer.encode(&apply_chat_template(&msgs, &[], true, ENABLE_THINKING).unwrap())
         };
         // `_expand_image_pads`: the template renders one `<|image_pad|>` per
         // image, and prefill needs one per tower row.
@@ -503,6 +541,7 @@ fn main() {
                 messages.retain(|m| m.role == Role::System);
                 session.caches = session.model.make_cache();
                 session.cached.clear();
+                session.cached_vision.clear();
                 eprintln!("(cleared)");
                 continue;
             }
@@ -514,7 +553,7 @@ fn main() {
         let first_turn = !messages.iter().any(|m| m.role == Role::User);
         let n_images = if first_turn { args.images.len() } else { 0 };
         messages.push(user_message(line, n_images));
-        let prompt = apply_chat_template(&messages, true, ENABLE_THINKING).unwrap();
+        let prompt = apply_chat_template(&messages, &[], true, ENABLE_THINKING).unwrap();
         let ids = tokenizer.encode(&prompt);
         let (ids, mut splice) = match &vision {
             Some(v) => (
@@ -542,6 +581,10 @@ struct Session<'a> {
     /// this prefix can reuse them. A gated-delta state cannot be trimmed, so
     /// anything that is not an extension starts over.
     cached: Vec<u32>,
+    /// The `VisionSplice::keys` of the images whose rows are in `caches`, in
+    /// order. An extension of `cached` is only the same conversation if its
+    /// pictures are the same ones, and the ids cannot say so.
+    cached_vision: Vec<u64>,
     max_tokens: usize,
 }
 
@@ -552,19 +595,39 @@ impl Session<'_> {
         sampler: &mut dyn Sampler,
         splice: Option<&mut VisionSplice>,
     ) -> String {
-        // A prompt carrying images always starts over. Every image expands to
-        // the same `<|image_pad|>` id, so a token-id prefix match cannot tell
-        // two different pictures apart -- MTPLX guards the same hazard from
-        // the other side, with `vision_image_spans` and a content digest.
-        let has_images = splice.is_some();
-        let reuse =
-            !has_images && self.cached.len() < ids.len() && ids.starts_with(&self.cached);
+        // Extending the cache needs two things to hold, not one. The ids
+        // have to extend it -- and where the prompt carries images, the
+        // pictures behind the pads in the reused part have to be the same
+        // pictures, because every image expands to the same
+        // `<|image_pad|>` id and the ids alone would say two different ones
+        // are a match. That is what `keys` is for; MTPLX guards the same
+        // hazard from the other side, with `vision_bank_key_ids`.
+        let mut splice = splice;
+        let reuse = !no_reuse()
+            && self.cached.len() < ids.len()
+            && ids.starts_with(&self.cached)
+            && match splice.as_deref() {
+                None => self.cached_vision.is_empty(),
+                Some(s) => match s.images_in(s.pad_rows_in(&ids[..self.cached.len()])) {
+                    Some(k) => self.cached_vision == s.keys[..k],
+                    None => false,
+                },
+            };
         if !reuse {
             self.caches = self.model.make_cache();
             self.cached.clear();
         }
         let fresh = &ids[self.cached.len()..];
-        let mut splice = splice;
+        // The rows before the cursor are already spliced into the cache, so
+        // the queue picks up where the last prefill left off. After a reset
+        // that is row zero.
+        let vision_after = match splice.as_deref_mut() {
+            Some(s) => {
+                s.cursor = s.pad_rows_in(&ids[..self.cached.len()]);
+                s.keys.clone()
+            }
+            None => Vec::new(),
+        };
 
         let mut detok = self.tokenizer.detokenizer();
         let eos = &self.tokenizer.eos_ids;
@@ -659,6 +722,9 @@ impl Session<'_> {
 
         self.cached.extend_from_slice(fresh);
         self.cached.extend_from_slice(&fed);
+        // `expand_image_pads` has already checked that the prompt names every
+        // image exactly once, so a completed prefill has cached all of them.
+        self.cached_vision = vision_after;
 
         let gen_time = t0.elapsed().as_secs_f64() - prompt_time;
         if let Some(st) = &stats {

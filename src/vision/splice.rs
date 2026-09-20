@@ -9,11 +9,14 @@
 //!
 //! Prefill consumes the prompt strictly left to right, so the splice is a
 //! sequential queue -- one cursor into the tower's rows, advanced by the
-//! number of pads each chunk held. MTPLX's cache-keying helpers
-//! (`vision_bank_key_ids`, `vision_image_spans`) belong to its session bank
-//! and have no counterpart here: this REPL only reuses a cache when the new
-//! prompt extends the old one token for token, and a turn carrying an image
-//! restarts it.
+//! number of pads each chunk held. Starting the cursor past zero is how a
+//! reused cache is continued: the rows before it are already in the cache.
+//!
+//! `keys` is MTPLX's `vision_bank_key_ids`, and the reason it has to exist
+//! is that ids cannot do its job -- every image expands to the same
+//! `<|image_pad|>`, so a token-id prefix match says two different pictures
+//! are the same prompt. MTPLX's `vision_image_spans` has no counterpart
+//! here, because a cursor over a queue already knows where the spans are.
 
 use crate::array::{Array, Dtype};
 use crate::metal::Context;
@@ -30,6 +33,10 @@ pub struct VisionSplice {
     /// out. MTPLX also carries the raw `(t, h, w)` grids here, but only to
     /// build an M-RoPE table, and this family does not take that path.
     pub pad_counts: Vec<usize>,
+    /// A content digest per image, in prompt order -- MTPLX's
+    /// `vision_bank_key_ids`. The ids alone cannot tell two pictures apart,
+    /// so this is what a cache-reuse check compares.
+    pub keys: Vec<u64>,
     pub cursor: usize,
 }
 
@@ -44,6 +51,26 @@ impl VisionSplice {
 
     pub fn reset(&mut self) {
         self.cursor = 0;
+    }
+
+    /// How many images a run of `pad_rows` pad tokens covers, or `None` if it
+    /// stops inside one. Every pad token is one tower row, so a prefix of the
+    /// prompt holds a whole number of images or it holds none usefully.
+    pub fn images_in(&self, pad_rows: usize) -> Option<usize> {
+        let mut acc = 0;
+        for (i, n) in self.pad_counts.iter().enumerate() {
+            if acc == pad_rows {
+                return Some(i);
+            }
+            acc += n;
+        }
+        (acc == pad_rows).then_some(self.pad_counts.len())
+    }
+
+    /// The pad tokens in `ids`, which is both the number of rows they consume
+    /// and the cursor a continuation starts from.
+    pub fn pad_rows_in(&self, ids: &[u32]) -> usize {
+        ids.iter().filter(|&&t| t == self.image_pad_token_id).count()
     }
 }
 

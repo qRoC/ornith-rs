@@ -6850,6 +6850,228 @@ read as levels. A quiet machine would settle the float-tile tax in one run
 of `bin/arithmetic`; nothing else here is waiting on anything.
 
 
+## Phase 40 -- the two template blocks, the writer they were waiting for, and the picture a prefix match cannot see -- **DONE**
+
+Nothing here is about speed. Phase 39 closed the last named performance
+object, and what `ornith_next.md` listed next was the holes that are about
+*completeness*: three of them, each carrying a comment where it bites. Two
+are now closed, and the third has a better reason to stay open than "not
+ported".
+
+### The tools block and the tool_calls block
+
+`chat_template.jinja` has two branches this port rendered as comments: the
+`tools` system block -- the schema list, then the calling convention, then
+the system message's own content if there is one -- and the assistant
+`tool_calls` block. Both put a value through jinja's `tojson`, which
+`transformers` replaces with `json.dumps(..., ensure_ascii=False)`, and
+that is why they waited. Matching Python there took two properties this
+port's JSON reader did not have.
+
+**An object has an order.** `json.dumps` writes a dict in insertion order.
+`Value::Obj` was a `HashMap`, so its key order came out of a hash -- not
+the source's, and not even stable between runs. `Map` is now a
+`Vec<(String, Value)>` with a linear `get`, which costs nothing here: the
+two large objects this port reads, `model.vocab` at 248044 entries and a
+safetensors header at a few thousand, are only ever *iterated*, and
+everything looked up by key has a handful of entries. The safetensors
+header now also iterates in file order rather than hash order -- which
+changes nothing, and the reason it changes nothing was worth checking
+rather than assuming: `add_file` only inserts into a `HashMap`, and device
+buffers are created on demand by name as the model is built.
+
+**An integer is not a float.** Python writes `2` for `2` and `2.0` for
+`2.0`, so a schema whose `"default"` is `1.0` renders differently from one
+whose default is `1`, and a single `f64` cannot hold that difference.
+`Value::Int(i64)` now carries the integer literals -- no `.`, no exponent,
+fits -- and every accessor reads both variants. An integer past `i64` falls
+through to the float, which Python's arbitrary-precision reader would not
+do; nothing in this artifact carries one, and the parser says so at the
+line where it happens.
+
+**And Python's `repr(float)` is not Rust's `{}`.** Both print the shortest
+string that reads back, so the *digits* agree and Rust's `{:e}` hands them
+over directly. They disagree about where the point goes: CPython's
+`format_float_short` for code `'r'` switches to exponential when the
+decimal point lands at `<= -4` or `> 16`, and writes the exponent with a
+sign and at least two digits. `1e16` is `1e+16` to Python and
+`10000000000000000` to Rust; `1e-5` is `1e-05` against `0.00001`. `py_repr`
+is that rule and nothing else -- and it is checked against Python, not
+against a reading of CPython.
+
+### The oracle, which is what makes this a port and not a rewrite
+
+`tools/dump_chat.py` went from **120 cases to 196**: the same conversations
+through the real jinja template, plus a tool schema carrying one of
+everything (nesting, an empty object and an empty list, non-ASCII that
+`ensure_ascii=False` leaves alone, an int and a float that are numerically
+equal, a bool, a null, a description with a quote and a backslash and a
+tab), an unsorted key order, two tools at once, and ten `tool_calls`
+shapes -- wrapped in `function` and bare, no `arguments` key at all and an
+empty mapping, one call and two, and the three ways the content in front of
+a call can be empty: absent, whitespace, and what a `<think>` split leaves
+behind. Every case is checked the way the old ones were: the rendered
+string character for character, **and** the ids it encodes to.
+
+A second case sits one layer below. `tojson_in` / `tojson_out` is 31
+awkward values and `json.dumps(v, ensure_ascii=False)` over each, and it
+exists because **a writer tested only through a template is tested only on
+the values that template happens to carry**. The float placement rule above
+is not reachable from any tool schema a person would write.
+
+Three things about the method are the durable part of this.
+
+- **The reference was regenerated into a temporary directory and diffed
+  before a single case was added to it.** The committed `refs/chat` came
+  back byte-identical, 120 of 120. That is what makes the new file a
+  superset rather than a new anchor: if the environment had drifted since
+  the reference was written, extending it in place would have silently
+  re-anchored the old cases on today's `transformers`, and all 120 would
+  still have passed. It cost one command. `REBUILD.md` Phase 3's "move
+  rather than overwrite" is the same rule from the other side.
+- **Then two deliberate mutations, because a green suite says nothing about
+  a path it does not reach.** Dropping one letter from the instruction
+  block failed at **case 120** -- the first tools case. Narrowing the
+  writer's `": "` to `":"` failed at **value 28** and at case 120 both.
+  Until that was done, "196 passed" was equally consistent with the 76 new
+  cases never being rendered at all.
+- **Reading a file through a terminal is not reading the file.** The first
+  patch to `dump_chat.py` failed its own anchor assertion: the line it was
+  matching holds `\xa0`, `　`, ` ` and `\x1c`, none of which `cat`
+  prints visibly, all of them deliberate -- they are the whitespace probes
+  for `|trim`. The patch asserted instead of quietly matching nothing,
+  which is the only reason it was caught.
+
+What is still not here, and is a different job: there is no *parser* for
+what the model writes back. The template asks for
+`<tool_call><function=...>` XML rather than JSON, and turning that into a
+`ToolCall` belongs to whoever runs the tools.
+
+### The picture a prefix match cannot see
+
+The REPL keeps one cache across turns and reuses it when the new prompt
+extends what the cache already holds. A prompt carrying an image never
+reused it, and the comment said exactly why: **every image expands to the
+same `<|image_pad|>` id, so a token-id prefix match cannot tell two
+pictures apart.** With `--image` fixed for a session that is conservative
+in the wrong direction -- the pictures cannot change, and every turn of an
+image chat re-prefilled the whole conversation, tower rows included. On the
+two-turn chat below that is **432 prompt tokens against 24**.
+
+The fix is the identity, not the machinery. `VisionSplice` was already a
+sequential cursor over a queue of tower rows, so *continuing* a cache is
+one assignment: start the cursor at the number of pad tokens already
+cached, because each pad token is exactly one row. What was missing is the
+answer to "are these the same pictures", and that is now
+`VisionSplice::keys` -- one digest per image over its preprocessed pixels
+and grid, which is MTPLX's `vision_bank_key_ids` and exists there for the
+same reason. A session remembers the keys whose rows are in its cache, and
+reuse asks two questions where it used to ask one. MTPLX's other half,
+`vision_image_spans`, still has no counterpart and does not need one: a
+cursor over a queue already knows where the spans are.
+
+### And then the check failed, and what it found is older than this phase
+
+The A/B is that two-turn image chat with reuse and without it, and the
+transcripts are **not** identical:
+
+    two-turn image chat, greedy, one binary, `ORNITH_NO_REUSE` the only difference
+
+      arm       bytes  md5           prompt tokens, turn 1 / turn 2
+      reuse       381  ebab3671...   362 / 24
+      fresh       364  cc920539...   362 / 432
+
+Turn one is byte-identical. Turn two diverges at one token -- "(rocks and
+snow)" against "(rocks and snow-capped mountains)" -- and both answers are
+correct and about the picture, so the splice is placing the right rows in
+the right places. The same two hashes come out of the binary from *before*
+this phase against the one after it, which is how the difference was first
+seen, so it is the reuse and not the build.
+
+**The question that matters is whether this is about images, and it is
+not.** The same shape, on text, with no image anywhere:
+
+      short conversation,  55-token fresh prefill   identical, 113 bytes, 4f1a23d0...
+      long conversation,  490-token fresh prefill   389 b 0cbe2d48... / 374 b 20dcb609...
+
+So **a reused cache has never been bit-identical to a fresh prefill of the
+same ids**, on any path. It is exact while the widths are small and
+diverges once the re-prefill is a few hundred tokens wide, and that was
+true of the text path before this phase. What Phase 40 changes is that an
+image chat now behaves the way a text chat already did.
+
+Two explanations were then ruled out rather than assumed.
+
+- **It is not the batch invariance this port already guards.**
+  `ORNITH_INVARIANT=all` covers every `M` including a prefill's, and under
+  it the two arms still differ: 399 bytes `fa617976...` against 385 bytes
+  `bc4ef234...`.
+- **It is not the prefill chunking.** One prompt, one binary, no reuse and
+  no image, at four chunk widths -- with the default width run twice as a
+  control against itself:
+
+      ORNITH_PREFILL      2048   2048    512    128     64
+      62 bytes, 8d56c5b0...   all five identical
+
+  Splitting a prefill is exact. So what a reused cache carries that a fresh
+  one does not is the positions that entered it through **decode** steps --
+  the fused vector SDPA, the single-step recurrence, the cached conv window
+  -- rather than through a prefill chunk. That is this port's oldest known
+  difference and the reason the window invariance exists at all. Naming it
+  as *the* cause is a hypothesis this phase did not test; it is the only
+  candidate the two measurements above leave standing.
+
+`ORNITH_NO_REUSE=1` stays in the tree as the control that made any of this
+measurable, and it is the way back to what the REPL did under an image
+before this phase.
+
+### Video, and the reason it stays out is better than "not ported"
+
+`chat.rs` renders `Part::Video` as `<|video_pad|>` because the template
+does, nothing expands or splices it, and `VisionTower::forward` asserts a
+single still frame. The note used to stop there. What it should say is
+that **there is nothing to port it against**: MTPLX does not implement
+video either. Its only use of `video_token_id` is `build_mrope_positions`
+returning `None` the moment a video pad appears in the ids, and nothing
+under `mtplx/vision/` expands or embeds one. mlx-lm has no vision path at
+all. So a video path here would have no `max_abs == 0.0` behind it -- it
+would be invention rather than a port, and inventing is a different
+project from this one.
+### What was checked
+
+- The suite green at **128 tests, 0 failed, 0 ignored**, `--include-ignored`
+  with `--test-threads=1`. It was 124; the four are the JSON writer's three
+  unit tests and `tojson_matches_python`.
+- `tests/chat::renders_like_jinja` over **196** conversations, each compared
+  twice -- the rendered string character for character and the ids it
+  encodes to -- against `tokenizer.apply_chat_template` through the real
+  jinja template. 76 of them are new and 120 are the old ones, unchanged.
+- `tests/chat::tojson_matches_python` over 31 values against
+  `json.dumps(v, ensure_ascii=False)`, each read back through this port's
+  own parser first, so the test covers the round trip the template takes.
+- Byte-identity, six pairs on two artifacts, **against the binary built from
+  the commit before this phase** and with the byte count printed beside
+  every hash:
+
+      artifact     case                        bytes   md5
+      parent       200 greedy                    173   775a4a1942a16e3e...
+      parent       --mtp --mtp-depth 1 --frspec  173   775a4a1942a16e3e...
+      parent       6621-token prompt, --raw       26   bae75e6f3f7799ff...
+      q6k-full     200 greedy                    209   78aa35b4e2e56370...
+      q6k-full     --mtp --mtp-depth 1 --frspec  209   78aa35b4e2e56370...
+      q6k-full     6621-token prompt, --raw       40   0c904f9373342bf7...
+
+  identical in both arms, none of them empty -- and the whole set was run
+  again after the last source change rather than argued to be unaffected.
+  **The two long-prompt rows are also Phase 38's**, hash for hash, two
+  phases and several days apart, which makes them a control across time as
+  well as across the change.
+- The reuse path against `ORNITH_NO_REUSE=1`, on text and on an image, with
+  the two findings above: exact at small widths, one token apart at a few
+  hundred, and the same on both paths.
+
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

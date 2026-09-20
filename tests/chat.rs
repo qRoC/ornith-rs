@@ -5,8 +5,13 @@
 //! Checked twice over: the rendered string character for character, and the
 //! token ids it encodes to, so a whitespace slip that happens to tokenize the
 //! same still fails.
+//!
+//! `tojson_matches_python` is the same reference one layer down: the tool
+//! blocks render their JSON through `json.dumps(..., ensure_ascii=False)`,
+//! and a writer that is only tested through a template is only tested on the
+//! values that template happens to carry.
 
-use ornith_rs::chat::{Content, Message, Part, Role, apply_chat_template};
+use ornith_rs::chat::{Content, Message, Part, Role, ToolCall, apply_chat_template};
 use ornith_rs::json::Value;
 use ornith_rs::refs::{RefCase, model_dir};
 use ornith_rs::tokenizer::Tokenizer;
@@ -32,7 +37,10 @@ fn renders_like_jinja() {
             c.get("messages").unwrap().as_arr().unwrap().iter().map(message).collect();
         let add_gen = c.get("add_generation_prompt").unwrap().as_bool().unwrap();
         let think = c.get("enable_thinking").unwrap().as_bool().unwrap();
-        let got = apply_chat_template(&messages, add_gen, think)
+        // Absent and empty are the same thing to the template: both take the
+        // `else` branch.
+        let tools = c.get("tools").and_then(|t| t.as_arr()).unwrap_or(&[]);
+        let got = apply_chat_template(&messages, tools, add_gen, think)
             .unwrap_or_else(|e| panic!("case {i}: {e}"));
         assert_eq!(got, rendered[i], "case {i}");
 
@@ -65,6 +73,24 @@ fn message(v: &Value) -> Message {
             .get("reasoning_content")
             .and_then(|r| r.as_str())
             .map(|s| s.to_string()),
+        tool_calls: v
+            .get("tool_calls")
+            .and_then(|t| t.as_arr())
+            .unwrap_or(&[])
+            .iter()
+            .map(tool_call)
+            .collect(),
+    }
+}
+
+/// `{%- if tool_call.function is defined %}{%- set tool_call =
+/// tool_call.function %}`: the wrapped shape and the bare one land in the
+/// same place.
+fn tool_call(v: &Value) -> ToolCall {
+    let v = v.get("function").unwrap_or(v);
+    ToolCall {
+        name: v.get("name").and_then(|n| n.as_str()).unwrap().to_string(),
+        arguments: v.get("arguments").and_then(|a| a.as_obj()).cloned().unwrap_or_default(),
     }
 }
 
@@ -79,5 +105,22 @@ fn part(v: &Value) -> Part {
         Part::Text(t.to_string())
     } else {
         panic!("unexpected item type in content: {v:?}")
+    }
+}
+
+/// The JSON writer against `json.dumps(v, ensure_ascii=False)` directly.
+///
+/// Each input is read back with this port's own parser, so the test covers
+/// the round trip the template takes: Python writes the case file, the port
+/// reads it, and what it writes has to be what Python would have written.
+#[test]
+fn tojson_matches_python() {
+    let Some(case) = RefCase::open_or_skip("chat") else { return };
+    let inputs = case.json("tojson_in");
+    let inputs = inputs.as_arr().unwrap();
+    let want = case.strings("tojson_out");
+    assert_eq!(inputs.len(), want.len());
+    for (i, v) in inputs.iter().enumerate() {
+        assert_eq!(v.to_json(), want[i], "value {i}: {v:?}");
     }
 }

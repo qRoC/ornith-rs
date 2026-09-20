@@ -1,21 +1,97 @@
-//! Minimal JSON reader.
+//! Minimal JSON reader, and the writer the chat template needs.
 //!
 //! Needed in three places: `config.json`, the safetensors header and
 //! `tokenizer.json` (12.8 MB, so the parser stays allocation-light and does a
-//! single pass). Numbers are kept as `f64`; every integer we read out of these
-//! files is far below 2^53 so nothing is lost.
+//! single pass).
+//!
+//! Two properties exist for `chat::apply_chat_template`, which renders tool
+//! schemas through jinja's `tojson` -- the one `transformers` replaces with
+//! `json.dumps(..., ensure_ascii=False)` -- and so has to come out byte for
+//! byte the same as Python's:
+//!
+//! - **objects keep their source order**, because a Python dict does and
+//!   `json.dumps` writes it in that order. `Map` is a vector of pairs, not a
+//!   hash map;
+//! - **integers stay integers.** Python writes `2` for `2` and `2.0` for
+//!   `2.0`, so a single `f64` would lose the difference. `Num` carries the
+//!   ones a JSON document writes with a `.` or an exponent, `Int` the rest;
+//!   every accessor reads both.
 
-use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
+    /// An integer literal: no `.`, no exponent, and it fits in an `i64`.
+    Int(i64),
     Num(f64),
     Str(String),
     Arr(Vec<Value>),
-    Obj(HashMap<String, Value>),
+    Obj(Map),
+}
+
+/// A JSON object, in source order.
+///
+/// Lookup is a linear scan. The two large objects this port reads --
+/// `model.vocab` at 248044 entries and a safetensors header at a few
+/// thousand -- are only ever iterated; everything looked up by key has a
+/// handful of entries.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Map(Vec<(String, Value)>);
+
+impl Map {
+    pub fn new() -> Map {
+        Map(Vec::new())
+    }
+
+    /// The **last** entry under `key`, which is the value Python's reader
+    /// would have kept and the value the `HashMap` this replaced did. No
+    /// file here has a duplicate key; what differs if one ever appears is
+    /// that the writer would echo both entries where Python collapses them.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.0.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, (String, Value)> {
+        self.0.iter()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
+        self.0.iter().map(|(_, v)| v)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(k, _)| k.as_str())
+    }
+
+    /// Append an entry, in `O(1)`: `model.vocab` is 248044 of them, so a
+    /// reader that checked for a duplicate on every key would be quadratic.
+    pub fn push(&mut self, key: impl Into<String>, value: Value) {
+        self.0.push((key.into(), value));
+    }
+}
+
+impl<'a> IntoIterator for &'a Map {
+    type Item = &'a (String, Value);
+    type IntoIter = std::slice::Iter<'a, (String, Value)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl FromIterator<(String, Value)> for Map {
+    fn from_iter<I: IntoIterator<Item = (String, Value)>>(it: I) -> Map {
+        Map(it.into_iter().collect())
+    }
 }
 
 #[derive(Debug)]
@@ -105,7 +181,7 @@ impl<'a> Parser<'a> {
 
     fn object(&mut self) -> Result<Value, Error> {
         self.eat(b'{')?;
-        let mut map = HashMap::new();
+        let mut map = Map::new();
         self.ws();
         if self.peek()? == b'}' {
             self.i += 1;
@@ -118,7 +194,7 @@ impl<'a> Parser<'a> {
             self.eat(b':')?;
             self.ws();
             let v = self.value()?;
-            map.insert(k, v);
+            map.push(k, v);
             self.ws();
             match self.peek()? {
                 b',' => self.i += 1,
@@ -266,6 +342,16 @@ impl<'a> Parser<'a> {
             }
         }
         let s = std::str::from_utf8(&self.b[start..self.i]).map_err(|_| self.err("bad number"))?;
+        // An integer literal stays an integer, so the writer can put it
+        // back the way Python would. One difference from Python's reader,
+        // which has no fixed width: an integer past `i64` falls through to
+        // the float and would be written back in exponential form. Nothing
+        // this port reads or writes carries one.
+        if !s.contains(['.', 'e', 'E'])
+            && let Ok(i) = s.parse::<i64>()
+        {
+            return Ok(Value::Int(i));
+        }
         s.parse::<f64>().map(Value::Num).map_err(|_| self.err("bad number"))
     }
 }
@@ -313,6 +399,7 @@ impl Value {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Num(n) => Some(*n),
+            Value::Int(i) => Some(*i as f64),
             _ => None,
         }
     }
@@ -322,11 +409,17 @@ impl Value {
     }
 
     pub fn as_usize(&self) -> Option<usize> {
-        self.as_f64().map(|v| v as usize)
+        match self {
+            Value::Int(i) => usize::try_from(*i).ok(),
+            _ => self.as_f64().map(|v| v as usize),
+        }
     }
 
     pub fn as_i64(&self) -> Option<i64> {
-        self.as_f64().map(|v| v as i64)
+        match self {
+            Value::Int(i) => Some(*i),
+            _ => self.as_f64().map(|v| v as i64),
+        }
     }
 
     pub fn as_bool(&self) -> Option<bool> {
@@ -343,7 +436,7 @@ impl Value {
         }
     }
 
-    pub fn as_obj(&self) -> Option<&HashMap<String, Value>> {
+    pub fn as_obj(&self) -> Option<&Map> {
         match self {
             Value::Obj(m) => Some(m),
             _ => None,
@@ -357,6 +450,114 @@ impl Value {
             cur = cur.get(part)?;
         }
         Some(cur)
+    }
+
+    /// `json.dumps(value, ensure_ascii=False)`, which is what `transformers`
+    /// installs as jinja's `tojson` filter -- the chat template's tool
+    /// schemas go through it and have to match character for character.
+    ///
+    /// That means Python's defaults and not JSON's freedoms: `", "` between
+    /// items and `": "` after a key, non-ASCII written as itself, and only
+    /// `"`, `\\` and the C0 controls escaped (not `/`, not U+2028). Objects
+    /// come out in source order, which is why `Map` keeps it.
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.write_json(&mut out);
+        out
+    }
+
+    fn write_json(&self, out: &mut String) {
+        match self {
+            Value::Null => out.push_str("null"),
+            Value::Bool(true) => out.push_str("true"),
+            Value::Bool(false) => out.push_str("false"),
+            Value::Int(i) => out.push_str(&i.to_string()),
+            Value::Num(v) => out.push_str(&py_repr(*v)),
+            Value::Str(s) => write_str(s, out),
+            Value::Arr(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    v.write_json(out);
+                }
+                out.push(']');
+            }
+            Value::Obj(m) => {
+                out.push('{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write_str(k, out);
+                    out.push_str(": ");
+                    v.write_json(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+}
+
+/// `py_encode_basestring`: the short escapes, C0 as `\uXXXX`, everything else
+/// verbatim.
+fn write_str(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// `repr(float)`: the shortest string that reads back, in fixed notation
+/// unless the decimal point lands outside `-4 < decpt <= 16`, and with a
+/// `.0` glued on when fixed notation would otherwise look like an integer.
+/// CPython's `format_float_short` for format code `'r'`.
+///
+/// Rust's `{:e}` already gives the shortest round-tripping digits; all that
+/// is left is Python's choice of where to put the point.
+fn py_repr(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    let e = format!("{:e}", v);
+    let (mantissa, exp) = e.split_once('e').expect("{:e} writes an exponent");
+    let exp: i32 = exp.parse().expect("{:e} writes a decimal exponent");
+    let sign = if mantissa.starts_with('-') { "-" } else { "" };
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let decpt = exp + 1;
+
+    if decpt <= -4 || decpt > 16 {
+        let mut out = format!("{sign}{}", &digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        out.push(if exp < 0 { '-' } else { '+' });
+        out.push_str(&format!("{:02}", exp.abs()));
+        out
+    } else if decpt <= 0 {
+        format!("{sign}0.{}{digits}", "0".repeat(-decpt as usize))
+    } else if decpt as usize >= digits.len() {
+        format!("{sign}{digits}{}.0", "0".repeat(decpt as usize - digits.len()))
+    } else {
+        let (a, b) = digits.split_at(decpt as usize);
+        format!("{sign}{a}.{b}")
     }
 }
 
@@ -385,6 +586,32 @@ mod tests {
             v.get("s").unwrap().as_str(),
             Some("a\"b\\c\nd\u{e9}\u{1f600}")
         );
+    }
+
+    #[test]
+    fn integers_survive_the_round_trip() {
+        // The chat template's `tojson` is the reason: Python writes `2` for
+        // an int and `2.0` for a float, and a single f64 could not tell them
+        // apart.
+        let v = parse(br#"{"a": 2, "b": 2.0, "c": -0.0, "d": 1e16, "e": 1e-5}"#).unwrap();
+        assert_eq!(v.get("a"), Some(&Value::Int(2)));
+        assert_eq!(v.get("b"), Some(&Value::Num(2.0)));
+        assert_eq!(v.to_json(), r#"{"a": 2, "b": 2.0, "c": -0.0, "d": 1e+16, "e": 1e-05}"#);
+    }
+
+    #[test]
+    fn objects_keep_their_source_order() {
+        let src = br#"{"z": 1, "a": 2, "m": {"y": [1, 2], "b": null}}"#;
+        let v = parse(src).unwrap();
+        assert_eq!(v.to_json(), std::str::from_utf8(src).unwrap());
+    }
+
+    #[test]
+    fn writing_escapes_what_python_escapes() {
+        // ensure_ascii=False: the emoji and the Cyrillic go out as
+        // themselves, the tab and the control do not, and `/` is untouched.
+        let v = Value::Str("a\"b\\c\n\td/\u{1}\u{7f}\u{444}\u{1f600}".to_string());
+        assert_eq!(v.to_json(), "\"a\\\"b\\\\c\\n\\td/\\u0001\u{7f}\u{444}\u{1f600}\"");
     }
 
     #[test]

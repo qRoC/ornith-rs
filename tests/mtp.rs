@@ -276,6 +276,7 @@ fn speculative_tracks_autoregressive() {
     for p in prompts {
         let text = ornith_rs::chat::apply_chat_template(
             &[ornith_rs::chat::Message::text(ornith_rs::chat::Role::User, p)],
+            &[],
             true,
             false,
         )

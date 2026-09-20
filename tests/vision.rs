@@ -220,6 +220,8 @@ fn pad_expansion_matches_mtplx() {
         image_pad_token_id: pad,
         embeddings: rows,
         pad_counts: vec![3, 2],
+        // No cache to reuse in a test, so nothing keys the images.
+        keys: Vec::new(),
         cursor: 0,
     };
     assert_eq!(splice.total_rows(), 5);

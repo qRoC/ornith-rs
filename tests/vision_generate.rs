@@ -104,8 +104,9 @@ fn vision_greedy_matches_mtplx() {
             role: Role::User,
             content: Content::Parts(parts),
             reasoning_content: None,
+            tool_calls: Vec::new(),
         };
-        let prompt = apply_chat_template(&[msg], true, false).unwrap();
+        let prompt = apply_chat_template(&[msg], &[], true, false).unwrap();
         assert_eq!(&prompt, want_prompt, "case {i}: rendered prompt");
 
         let prompt_ids = tk.encode(&prompt);
@@ -116,7 +117,9 @@ fn vision_greedy_matches_mtplx() {
             image_pad_token_id: spec.image_token_id,
             embeddings: concat_leading(&ctx, &refs),
             pad_counts: pad_counts.clone(),
-            cursor: 0,
+            // No cache to reuse in a test, so nothing keys the images.
+        keys: Vec::new(),
+        cursor: 0,
         };
         assert_eq!(
             splice.total_rows(),

@@ -266,6 +266,7 @@ ORNITH_INVARIANT=1 cargo run --release -- --mtp      # ... and exactly what
 cargo run --release -- --mtp-depth 1         # shallower draft, see the table below
 cargo run --release -- --image p.bmp -p "..." # one image (repeat for more)
 cargo run --release -- --image p.rgb --image-size 768x448
+ORNITH_NO_REUSE=1 cargo run --release          # every REPL turn re-prefills
 ```
 
 There is no image *decoder* in Rust, on purpose: `--image` takes a binary PPM,
@@ -305,7 +306,7 @@ dispatch diverged.
 | `layer0.rs` | layer 0's gated-delta path step by step on real weights |
 | `model.rs` | **the whole 40-layer model**: 24-token prefill + 3 decode steps, checked at the embeddings, layers 0/1/2/3/4/7/8/39, pre-norm residual, final hidden and logits. `#[ignore]`d because it loads 25.5 GB |
 | `tokenizer.rs` | the split regex's character classes over **all 0x110000 codepoints**, NFC over every codepoint plus ~15k combining sequences, and `encode`/`decode` over a ~1200-case corpus -- in **both** tokenizer dialects |
-| `chat.rs` | 120 conversations through the chat template, compared as rendered text *and* as token ids |
+| `chat.rs` | **196** conversations through the chat template -- every branch of it, including the `tools` system block and the assistant `tool_calls` block -- compared as rendered text *and* as token ids. Plus the layer below: `json.dumps(v, ensure_ascii=False)` over 31 awkward values, because the two tool blocks render through it and a writer tested only through a template is tested only on what that template carries |
 | `resample.rs` | Pillow's bicubic resampler, **byte for byte** against Pillow, at ten (in -> out) size pairs: both axes down, both up, one axis only, a huge downscale, a tiny upscale and the pairs `smart_resize` produces for real photographs |
 | `vision_ops.rs` | the ops only the tower reaches: `layer_norm`, both GELUs over **every** bfloat16 input, `addmm` at ten shapes across split-K and the regular steel gemm, the 3D patch convolution, and mlx's *full* fused attention at head dim 72 -> 80 |
 | `vision.rs` | **the whole 27-block tower** at three image sizes (256x256, 320x224, 512x512), checked at the patch embedding, the interpolated position embedding, the 2D rotary tables, block 0's norm and attention, blocks 0/1/26 and the merger -- plus the preprocessing, from the file's bytes to the patch rows, including two sizes that `smart_resize` changes and so go through the resampler |
@@ -2486,12 +2487,15 @@ In order:
 
 Smaller gaps, each with an assert or a comment where it bites:
 
-- The chat template's `tools` system block and the assistant `tool_calls`
-  block are not ported. Both render through jinja's `tojson`, which
-  `transformers` replaces with `json.dumps(..., ensure_ascii=False)`, so they
-  need a JSON *writer* over an order-preserving value -- nothing else in this
-  port wants one yet. Every other branch of the template is there, including
-  `tool` messages and the reasoning-content split.
+- The chat template is **complete** as of Phase 40, `tools` system block and
+  assistant `tool_calls` block included. What kept them out was the JSON
+  *writer* they render through -- jinja's `tojson`, which `transformers`
+  replaces with `json.dumps(..., ensure_ascii=False)` -- and matching Python
+  there took two properties the reader did not have: objects that keep their
+  source order, and integers that stay integers. What is still not here is a
+  *parser* for what the model writes back; the template asks for
+  `<tool_call><function=...>` XML rather than JSON, and turning that into a
+  `ToolCall` is a caller's job.
 - MTPLX's runtime adds a lot on top of the draft/verify loop that is not here:
   the acceptance EMA with its suspend/backoff and probation, the copy-blocks,
   FR-Spec, the `last_window` history policy, and probability-ratio acceptance
@@ -2501,15 +2505,30 @@ Smaller gaps, each with an assert or a comment where it bites:
 - The REPL keeps one cache across turns and reuses it only when the new prompt
   extends what the cache already holds; anything else starts over. A
   gated-delta state cannot be trimmed, so that is not an optimization to fix
-  cheaply. A prompt carrying an image never reuses it at all: every image
+  cheaply. **A prompt carrying an image reuses it too, as of Phase 40**, and
+  what had to be built was the identity rather than the machinery: every image
   expands to the same `<|image_pad|>` id, so a token-id prefix match cannot
-  tell two pictures apart. MTPLX guards the same hazard from the other side,
-  with a content digest (`vision_bank_key_ids`) and `vision_image_spans`;
-  neither is ported, because this REPL has no session bank to key.
-- Video is not ported. `chat.rs` renders `Part::Video` as `<|video_pad|>`
-  because the template does, but nothing expands or splices it, and
-  `VisionTower::forward` asserts a single still frame -- which is also all
-  MTPLX ever hands it, since it runs the tower once per image.
+  tell two pictures apart, and `VisionSplice::keys` -- MTPLX's
+  `vision_bank_key_ids`, one digest per image over its preprocessed pixels --
+  is what answers that. The splice was already a cursor over a queue of tower
+  rows, so continuing a cache is one assignment: start at the number of pad
+  tokens already cached, because each pad is exactly one row. MTPLX's
+  `vision_image_spans` has no counterpart, and does not need one for the same
+  reason. **A reused cache is not bit-identical to a fresh prefill of the same
+  ids** -- it is exact while the widths are small and diverges by a token once
+  the re-prefill is a few hundred wide -- but that was already true of the text
+  path and is not what changed here; `REBUILD.md` Phase 40 measures it on both
+  paths and rules out two explanations for it. `ORNITH_NO_REUSE=1` is the
+  control.
+- Video is not ported, **and there is nothing to port it against**, which is
+  the stronger statement Phase 40 checked. `chat.rs` renders `Part::Video` as
+  `<|video_pad|>` because the template does, but nothing expands or splices
+  it, and `VisionTower::forward` asserts a single still frame. MTPLX does not
+  implement it either: its only use of `video_token_id` is
+  `build_mrope_positions` returning `None` the moment a video pad appears, and
+  nothing in `mtplx/vision/` expands or embeds one. So a video path here would
+  have no `max_abs == 0.0` behind it -- it would be invention, not a port, and
+  that is a different project from this one.
 
 Not ported, deliberately, with `assert!`s guarding each: the `*_nax` Metal 4
 kernels (M5 only, including the 72 -> 96 head-dim pad the vision attention
