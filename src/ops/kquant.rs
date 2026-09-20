@@ -811,6 +811,52 @@ pub fn qmm_t(ctx: &Context, x: &Array, w: &KMatrix) -> Array {
     out
 }
 
+/// [`qmm_t`] on mlx's steel tiling instead of ggml's, and **nothing in the
+/// model dispatches it**: it is Phase 38's spike, reached from
+/// `bin/arithmetic` alone.
+///
+/// The question it exists to answer is not "is it faster" but "is it the
+/// same numbers" -- see `kernels/kquant_steel.h`. The threadgroup tiles are
+/// `float`, because that is what `max_abs == 0.0` against [`qmm_t`]
+/// requires and it is exactly the thing mlx's own quantized gemm does not
+/// do.
+///
+/// Dense Q4_K, no partial tiles: every dimension must divide by 32, which
+/// is also the branch mlx's `aligned_N` arm runs, so the two are timed
+/// doing the same work.
+///
+/// `tile_t` takes mlx's own tile scalar -- the dequantized weight rounded to
+/// the activation type on the way into shared memory -- and it **produces
+/// different numbers on purpose**. It is the control that says whether a
+/// slow float arm is the tile type or is this loader.
+pub fn qmm_t_steel(ctx: &Context, x: &Array, w: &KMatrix, tile_t: bool) -> Array {
+    let (o, k) = (w.out_dims(), w.in_dims());
+    assert_eq!(w.kind, KQuant::Q4K, "the steel spike is instantiated for Q4_K only");
+    assert_eq!(w.num_experts(), 1, "the steel spike is the dense path");
+    let m = x.numel() / k;
+    assert!(
+        m % 32 == 0 && o % 32 == 0 && k % 32 == 0,
+        "the steel spike has no partial tiles: {m}x{o}x{k}"
+    );
+
+    let mut shape = x.shape.clone();
+    let n = shape.len();
+    shape[n - 1] = o;
+    let out = Array::empty(ctx, &shape, x.dtype);
+    let name = if tile_t { "steel_qmm_t_h" } else { "steel_qmm_t" };
+    ctx.kernel(&w.kernel(name, x.dtype))
+        .arr(&w.qs)
+        .arr(&w.scales)
+        .arr(&w.dm)
+        .arr(x)
+        .out(&out)
+        .bytes(&(k as i32))
+        .bytes(&(o as i32))
+        .bytes(&(m as i32))
+        .groups((o / 32, m / 32, 1), (32, 2, 2));
+    out
+}
+
 /// [`qmm_t`] with `Q4KFmt`'s arithmetic taken out, and nothing in the model
 /// dispatches it.
 ///

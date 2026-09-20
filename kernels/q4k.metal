@@ -28,6 +28,7 @@
 #include "mlx/backend/metal/kernels/utils.h"
 
 #include "kquant_mm.h"
+#include "kquant_steel.h"
 #include "ornith_rmsgate.h"
 
 #define QK_K 256
@@ -753,6 +754,8 @@ struct Q4KBareFmt {
       "q4k_qmm_t_bare_r64_" #tname, kquant_qmm_t, type, Q4KBareFmt, float, 64) \
   instantiate_kernel(                                                          \
       "q4k_qmm_t_bare_r32_" #tname, kquant_qmm_t, type, Q4KBareFmt, float, 32) \
+  instantiate_kernel(                                                          \
+      "q4k_steel_qmm_t_" #tname, kquant_steel_qmm_t, type, Q4KFmt, float, 32, 32, 32) \
   instantiate_kernel("q4k_qmv_" #tname, q4k_qmv, type, 2, 2)                   \
   instantiate_kernel("q4k_qmv_w4x2_" #tname, q4k_qmv, type, 4, 2) \
   instantiate_kernel("q4k_qmv_w2x4_" #tname, q4k_qmv, type, 2, 4) \
@@ -795,3 +798,8 @@ struct Q4KBareFmt {
       float, 16)
 
 instantiate_q4k(bfloat16, bfloat16_t) instantiate_q4k(float32, float)
+
+// The control arm of the spike, at bfloat16 tiles: only for bfloat16, because
+// at `type = float` it is the same instantiation as the arm above it.
+instantiate_kernel(
+    "q4k_steel_qmm_t_h_bfloat16", kquant_steel_qmm_t, bfloat16_t, Q4KFmt, bfloat16_t, 32, 32, 32)

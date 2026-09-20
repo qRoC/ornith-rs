@@ -6637,6 +6637,14 @@ the fragments too. Both say two to three points, and they are ratios inside
 one run rather than levels across sittings, which is what makes them
 readable on a machine at load 7.
 
+> **The +2.7% is one draw and Phase 39 ran it twice more: +17.3% and
+> +21.5%.** The cell is not resolved, so neither is the arithmetic below
+> it -- read "~6%" as 8.4% minus a term that was sampled rather than
+> measured. The mechanism in this section stands; its size does not. And
+> the spike Phase 39 then built says the eight points do not reproduce in
+> a first-draft steel port at all, which matters more than the tax
+> either way.
+
 So the target is 84 points less two or three:
 
     the four k-quant gemms are 82.6% of the stream, at 75.5% of the ceiling
@@ -6645,8 +6653,10 @@ So the target is 84 points less two or three:
       to 81.7%   less the 2.7% upper bound      7.6%                 6.3%
       to 81.0%   less the 3.6% ggml-tile term   6.8%                 5.6%
 
-**So ~6% of a chunk and not ~8%**, on a k-quant artifact, and on the affine
-parent still exactly nothing -- its gemms already run on mlx's kernel, with
+**So ~6% of a chunk and not ~8%** (but see the note above: Phase 39
+re-ran the term this rests on and it does not hold still, so the honest
+entry is "unknown, bounded above by 8.4%"), on a k-quant artifact, and on
+the affine parent still exactly nothing -- its gemms already run on mlx's kernel, with
 mlx's rounding, at 84%.
 
 ### It is not built, and that is recorded as an estimate rather than a debt
@@ -6711,6 +6721,133 @@ recorded levels would suggest. The share is unchanged either way: a chunk is
 now about **90% quantized gemm**, ~3% data movement and ~7% everything else,
 and the only object left in the gemm is the one above -- one artifact, ~6%,
 and a real kernel project.
+
+
+## Phase 39 -- the spike: the oracle holds, the prize does not reproduce, and one of Phase 38's own numbers was a single draw -- **DONE**
+
+Phase 38 left one open object and a plan for it: two loaders carrying Q4_K
+and Q6_K onto `mlx::steel::BlockMMA`, ~6% of a prefill chunk on a k-quant
+artifact. It also left an instruction, which is the only reason this phase
+is short: **spike the premise before writing the loader.** The premise was
+that steel with `float` threadgroup tiles is bit-identical to the tile it
+replaces. The spike is `kernels/kquant_steel.h` -- dense Q4_K only, no
+partial tiles, reached from `bin/arithmetic` and dispatched by nothing in
+the model.
+
+### The premise holds, and that is the durable result
+
+    Q4_K, M = 2048, N = K = 2048, against `kquant_qmm_t`
+
+      max_abs = 0.000e0, 4194304 of 4194304 identical    -- six runs of six
+
+**A steel-tiled k-quant gemm at `float` tiles is the same arithmetic as
+ggml's tile, exactly.** Both walk K in ascending 8-element fragments into a
+float accumulator; the 8-term dot product's internal order is the
+hardware's, and it does not depend on which operand plays which role. That
+was the one thing nobody could look up, it is now measured, and it is
+load-independent in a way nothing else in this phase is. Whoever resumes
+this does not have to fear the oracle.
+
+Two pieces of it were worth getting right and are worth keeping:
+
+- **the dequantize is `Q4KFmt::dequantize`'s expression, not its
+  arithmetic.** ggml compensates for not shifting the high nibble down by
+  dividing `d` by 16, so `(d / 16) * sc * (q & 0xF0)` and
+  `d * sc * (q >> 4)` are the same number in algebra and different floats.
+  The oracle is bit-exactness against the shipping kernel, so the shipping
+  expression is the one that goes in the loader;
+- **a 32-wide K tile is exactly one Q4_K sub-block**, so a thread's eight
+  weights share one `scale_min`, one mask and one `d`. That is the one
+  piece of luck in the format, and Q6_K does not have it -- its sub-block
+  is 16, so the same tile spans two.
+
+### And then the rate went the wrong way
+
+    M = 16384, N = K = 2048, three arms interleaved draw by draw, 5 draws,
+    minimum each, load 9-11
+
+      arm                                 set 1    set 2    set 3
+      steel bf16 against ggml's tile      +16.6%   +8.5%   +19.3%
+      float tile against bf16 tile         +0.7%  +10.5%    -5.0%
+      within-cell spread                3.5-15%  16-35%  8-43%
+
+**The second row straddles zero and the first does not.** Read them in that
+order, because the first is the one that decides:
+
+**A straightforward steel port is 8-19% slower than ggml's tile at mlx's
+own tile scalar** -- where mlx's own quantized gemm is 13% *faster* at the
+same shape. The bf16 arm exists precisely to separate "float tiles cost
+this" from "this loader is slow", and it answers the second. So the eight
+points Phase 37 attributed to *tiling* do not live in the tiling alone;
+they live in mlx's loader as much as in its `BlockMMA`, and swapping the
+tiling in does not collect them. **The plan's mechanism does not work**,
+which is what a spike is for.
+
+The float-tile tax, meanwhile, is **not resolved by this instrument on this
+machine**: +0.7%, +10.5%, -5.0% with cell spreads of up to 43%. An earlier,
+sequential-block version of the same cell read +11.4% and +11.7% and looked
+tight; interleaving the arms destroyed that agreement, which is the Phase
+36 lesson about block ordering arriving somewhere new.
+
+### And one of Phase 38's numbers was a single draw reported as a bound
+
+This is the correction, and it is mine from ninety minutes earlier. Phase 38
+priced the exactness contract at "**+2.7%**, an upper bound" from mlx's own
+quantized gemm at float operands, and built the ~6% prize on it. Run three
+times:
+
+      mlx affine qmm, float operands against bfloat16 operands
+
+        load ~7     +2.7%
+        load 11-14  +17.3%
+        load ~17    +21.5%
+
+**One draw was recorded as the number, and it was the lowest of three.**
+Nothing in the write-up was wrong about the *mechanism* -- mlx does round
+every dequantized weight to bfloat16 in threadgroup memory, and this port
+may not -- but the size of what that costs was never measured, only
+sampled. The rule this breaks is already in `HANDOFF.md` twice ("every A/B
+needs a control-against-itself row"; "when two readings of one cell
+disagree, the finding is the disagreement"), and the spread column that
+catches it is now printed by the cell that needed it.
+
+### So what the object is worth, stated honestly
+
+**Unresolved, and no longer ~6%.** The ~6% was 8.4% minus a term sampled
+once. What survives of the arithmetic is the 8.4% itself, from Phase 37 --
+and the spike says that even that is not reachable by the route the plan
+named, because a steel port has to match mlx's *loader* and not just its
+tiling to get there. The right entry in the ledger is:
+
+- the oracle premise: **confirmed**, bit-exact, six of six;
+- the tiling gain: **did not reproduce** in a first-draft port, 8-19% the
+  wrong way at mlx's own tile scalar, sign consistent across every draw;
+- the exactness tax: **not measured**, and two instruments that looked like
+  they measured it disagree by 8x;
+- the prize: **unknown**, bounded above by Phase 37's 8.4%, and requiring a
+  loader as good as mlx's before any of it is reachable.
+
+Nothing here is a reason the project could not be done; it is a reason the
+day it was priced at is wrong, and half a day of spike is what says so
+instead of a week of loader. **On the affine parent it remains exactly
+zero**, which no measurement in this phase touches.
+
+### What is held, and what is left in the tree
+
+`kernels/kquant_steel.h` stays, as a stand-in beside `Q4KBareFmt`: nothing
+in the model dispatches it, `ops::kquant::qmm_t_steel` reaches it from
+`bin/arithmetic` alone, and its `tile_t` arm **produces wrong answers on
+purpose** -- it is mlx's rounding, and it is the control that said the
+loader rather than the tile type is what is slow. The suite is green at
+**124 tests** with it in the tree, because nothing reaches it.
+
+**And the machine is why this stops here rather than concluding.** Every
+cell in this phase ran at load 9-17 with a VM at 209% and `node` at 105%,
+which is two to three times the threshold `HANDOFF.md` says to discard a
+cell at. The bit-exactness result does not care. Every number in the second
+table does, and the spread column is the evidence that they should not be
+read as levels. A quiet machine would settle the float-tile tax in one run
+of `bin/arithmetic`; nothing else here is waiting on anything.
 
 
 ## Disk

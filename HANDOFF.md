@@ -2165,6 +2165,23 @@ In order:
    longer the 6%: `mlx::steel::BlockMMA` is **the one thing this port
    consumes as a black box** rather than having written, and Phase 38
    showed it is fast partly for a reason nobody had read.
+   **PHASE 39 RAN THAT SPIKE, AND IT CHANGES THE ENTRY.** The oracle
+   premise **holds**: a steel-tiled k-quant gemm at `float` tiles is
+   bit-identical to `kquant_qmm_t`, `max_abs == 0.0` over 4194304
+   elements, six runs of six. The prize **does not reproduce**: a
+   first-draft steel port is **8-19% slower** than ggml's tile at mlx's
+   own tile scalar, sign consistent across every draw, where mlx's own
+   gemm is 13% faster -- so the eight points live in mlx's *loader* as
+   much as in its tiling, and swapping `BlockMMA` in does not collect
+   them. And the ~6% above rests on a term Phase 39 re-ran twice more
+   (+2.7%, then +17.3%, then +21.5%): that cell is **not resolved**, so
+   the honest entry is **"unknown, bounded above by Phase 37's 8.4%,
+   and requiring a loader as good as mlx's before any of it is
+   reachable"**. `kernels/kquant_steel.h` stays in the tree as a
+   stand-in; nothing in the model dispatches it. Every timing cell in
+   Phase 39 ran at load 9-17, which is why it stops at "unresolved"
+   rather than at a number.
+
    **Start with a spike, not a loader.** The plan's premise -- that steel
    with `float` threadgroup tiles is bit-identical to the tile it replaces
    (both walk K in ascending 8-element fragments into a float accumulator)

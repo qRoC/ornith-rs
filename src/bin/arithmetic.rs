@@ -43,9 +43,10 @@
 
 use ornith_rs::array::{Array, Dtype};
 use ornith_rs::metal::Context;
+use ornith_rs::refs::compare;
 use ornith_rs::ops::kquant::{
-    KMatrix, KQuant, QK_K, gather_qmm_t, qmm_t, qmm_t_bare, set_mm_half, set_mm_rows,
-    set_mm_rows_id,
+    KMatrix, KQuant, QK_K, gather_qmm_t, qmm_t, qmm_t_bare, qmm_t_steel, set_mm_half,
+    set_mm_rows, set_mm_rows_id,
 };
 use ornith_rs::ops::elementwise::{set_wide_elem, sigmoid_gate, swiglu};
 use ornith_rs::ops::layout::{slice_inner, transpose_hl, transpose_lh, transpose_would_widen};
@@ -680,6 +681,106 @@ fn transpose_width(ctx: &Context) {
     );
 }
 
+/// **The spike: is a steel-tiled k-quant gemm the same numbers, and is it
+/// faster?** In that order, because the first question can retire the second.
+///
+/// Phase 38 left one open object -- carrying Q4_K and Q6_K onto
+/// `mlx::steel::BlockMMA`, ~6% of a prefill chunk on a k-quant artifact --
+/// and one unverified premise under it: that steel with **`float`**
+/// threadgroup tiles is bit-identical to `kquant_qmm_t`. Both walk K in
+/// ascending 8-element fragments into a float accumulator, so it should
+/// hold; "should hold" is what the previous phase was about.
+///
+/// If `max_abs` is not zero this is a different project and wants
+/// re-pricing, not finishing. If it is zero and the rate has not moved, the
+/// eight points are not where they were counted. Either answer is worth
+/// more than a finished loader built on the guess.
+fn steel_spike(ctx: &Context, ceiling: f64) {
+    const K: usize = 2048;
+    const N: usize = 2048;
+    println!("\nthe spike: Q4_K on steel's tiling, float tiles\n");
+
+    // Exactness first, at the width a prefill chunk actually runs.
+    {
+        const M: usize = 2048;
+        let x = Array::from_f32_as_bf16(ctx, &vec![0.01f32; M * K], &[M, K]);
+        let w = fake(ctx, KQuant::Q4K, N, K);
+        let want = qmm_t(ctx, &x, &w).to_vec_f32(ctx);
+        let got = qmm_t_steel(ctx, &x, &w, false).to_vec_f32(ctx);
+        let d = compare(&got, &want);
+        let same = got.iter().zip(&want).filter(|(a, b)| a == b).count();
+        println!(
+            "  exactness at M={M}: max_abs = {:.3e}, {same} of {} identical",
+            d.max_abs,
+            got.len()
+        );
+        if d.max_abs != 0.0 {
+            println!("  -> NOT bit-exact. The oracle this project was handed is max_abs == 0.0");
+            println!("     against the tile being replaced, so this is a different task.");
+        }
+    }
+
+    // Then the rate, at `unpack_cost`'s shape so the rows line up with it.
+    //
+    // **Interleaved, not in blocks.** `best_of` takes a minimum over its own
+    // draws, which is robust to a spike; it is not robust to the base
+    // drifting under three arms measured one after another, and this machine
+    // drifts (`HANDOFF.md`, "This machine"). So the three arms alternate
+    // draw by draw and each keeps its own minimum, and the spread across
+    // draws is printed rather than hidden -- if the arms are not separated
+    // by more than their own spread, the cell has said nothing.
+    {
+        const M: usize = 16384;
+        let x = Array::from_f32_as_bf16(ctx, &vec![0.01f32; M * K], &[M, K]);
+        let w = fake(ctx, KQuant::Q4K, N, K);
+        let flop = 2.0 * M as f64 * N as f64 * K as f64;
+
+        const DRAWS: usize = 5;
+        let mut best = [f64::MAX; 3];
+        let mut worst = [0.0f64; 3];
+        for _ in 0..DRAWS {
+            for arm in 0..3 {
+                let t = best_of(ctx, 1, || {
+                    let _ = match arm {
+                        0 => qmm_t(ctx, &x, &w),
+                        1 => qmm_t_steel(ctx, &x, &w, false),
+                        _ => qmm_t_steel(ctx, &x, &w, true),
+                    };
+                });
+                best[arm] = best[arm].min(t);
+                worst[arm] = worst[arm].max(t);
+            }
+        }
+
+        let names = [
+            "ggml tile, as it ships",
+            "steel tile, float (exact)",
+            "steel tile, bf16 (wrong answers)",
+        ];
+        for arm in 0..3 {
+            let t = tflops(flop, best[arm]);
+            println!(
+                "  {:<34} {:>9.3} ms {t:>9.2} TFLOP/s {:>5.0}%  spread {:>4.1}%",
+                names[arm],
+                best[arm] * 1e3,
+                100.0 * t / ceiling,
+                100.0 * (worst[arm] / best[arm] - 1.0)
+            );
+        }
+        println!(
+            "  {:<34} {:>+7.1}%   <- the exactness contract, on the object itself",
+            "float tile against bf16 tile",
+            100.0 * (best[1] / best[2] - 1.0)
+        );
+        println!(
+            "  {:<34} {:>+7.1}%   <- this loader against ggml's, at mlx's own scalar",
+            "steel bf16 against ggml",
+            100.0 * (best[2] / best[0] - 1.0)
+        );
+    }
+
+}
+
 fn main() {
     let ctx = Context::new().unwrap();
     println!("{}", ctx.device_name());
@@ -691,6 +792,7 @@ fn main() {
     unpack_cost(&ctx, mma);
     elementwise_width(&ctx);
     transpose_width(&ctx);
+    steel_spike(&ctx, mma);
 
     // The flag the tile carries, on the real kernel, beside the synthetic
     // ratio above. If the matrix unit prefers half and the kernel does not,
