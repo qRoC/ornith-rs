@@ -2182,6 +2182,25 @@ In order:
    stand-in; nothing in the model dispatches it. Every timing cell in
    Phase 39 ran at load 9-17, which is why it stops at "unresolved"
    rather than at a number.
+   **PHASE 41 RAN IT ON A QUIET MACHINE, AND THE ENTRY IS NOW CLOSED.**
+   Load 4.6-5.9, three draws, and a fourth arm that is the first one
+   again -- one kernel against itself, the control this cell never had.
+   Phase 39's "8-19% slower" **does not reproduce**: it is **+1.5%** by
+   minima across runs against a control floor of 0.4%, and inside the
+   control within any single run. That does not weaken Phase 39's
+   conclusion, it re-founds it -- ggml's loader on steel's tiling at
+   mlx's own tile scalar is *the same speed* as ggml's tiling, so the
+   eight points are not in `BlockMMA` at all. The exactness tax is
+   measured against a control for the first time: **+7.3%** on the
+   stand-in and **+3.6 to +4.8%** on the shipping kernel
+   (`ORNITH_KQUANT_TILE_HALF`), sign consistent 3 of 3. **So the prize is
+   zero rather than unknown** -- a bit-exact steel-tiled k-quant gemm
+   buys nothing from the tiling and pays for `float` tiles on top -- and
+   the 8.4% of a chunk Phase 37 bounded it at lives in the rest of mlx's
+   loader, which this project was never going to write. The control also
+   earned itself in one sitting: in the draw whose load crept to 6.5 it
+   read +5.3% and swallowed both effects, which is the cell correctly
+   declining to answer.
 
    **Start with a spike, not a loader.** The plan's premise -- that steel
    with `float` threadgroup tiles is bit-identical to the tile it replaces

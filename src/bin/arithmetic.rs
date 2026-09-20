@@ -729,6 +729,13 @@ fn steel_spike(ctx: &Context, ceiling: f64) {
     // draw by draw and each keeps its own minimum, and the spread across
     // draws is printed rather than hidden -- if the arms are not separated
     // by more than their own spread, the cell has said nothing.
+    //
+    // **And a fourth arm that is the first one again**, added in Phase 40:
+    // two independent measurements of one unchanged kernel, interleaved with
+    // the rest. That is the control every A/B here owes, and it is the row
+    // that decides whether the other two may be read as levels at all -- an
+    // effect no larger than one kernel's distance from itself is the
+    // instrument, not the kernel.
     {
         const M: usize = 16384;
         let x = Array::from_f32_as_bf16(ctx, &vec![0.01f32; M * K], &[M, K]);
@@ -736,15 +743,17 @@ fn steel_spike(ctx: &Context, ceiling: f64) {
         let flop = 2.0 * M as f64 * N as f64 * K as f64;
 
         const DRAWS: usize = 5;
-        let mut best = [f64::MAX; 3];
-        let mut worst = [0.0f64; 3];
+        const ARMS: usize = 4;
+        let mut best = [f64::MAX; ARMS];
+        let mut worst = [0.0f64; ARMS];
         for _ in 0..DRAWS {
-            for arm in 0..3 {
+            for arm in 0..ARMS {
                 let t = best_of(ctx, 1, || {
                     let _ = match arm {
-                        0 => qmm_t(ctx, &x, &w),
                         1 => qmm_t_steel(ctx, &x, &w, false),
-                        _ => qmm_t_steel(ctx, &x, &w, true),
+                        2 => qmm_t_steel(ctx, &x, &w, true),
+                        // 0 and 3 are the same call. The second is the control.
+                        _ => qmm_t(ctx, &x, &w),
                     };
                 });
                 best[arm] = best[arm].min(t);
@@ -756,8 +765,9 @@ fn steel_spike(ctx: &Context, ceiling: f64) {
             "ggml tile, as it ships",
             "steel tile, float (exact)",
             "steel tile, bf16 (wrong answers)",
+            "ggml tile again, the same kernel",
         ];
-        for arm in 0..3 {
+        for arm in 0..ARMS {
             let t = tflops(flop, best[arm]);
             println!(
                 "  {:<34} {:>9.3} ms {t:>9.2} TFLOP/s {:>5.0}%  spread {:>4.1}%",
@@ -776,6 +786,11 @@ fn steel_spike(ctx: &Context, ceiling: f64) {
             "  {:<34} {:>+7.1}%   <- this loader against ggml's, at mlx's own scalar",
             "steel bf16 against ggml",
             100.0 * (best[2] / best[0] - 1.0)
+        );
+        println!(
+            "  {:<34} {:>+7.1}%   <- the control: one kernel against itself",
+            "ggml against ggml",
+            100.0 * (best[3] / best[0] - 1.0)
         );
     }
 

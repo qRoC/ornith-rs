@@ -7072,6 +7072,101 @@ project from this one.
 
 
 
+## Phase 41 -- the ten-minute tail on a quiet machine, and Phase 39's headline does not survive it -- **DONE**
+
+`ornith_next.md` called this the only unclosed measurement in the port: one
+run of `bin/arithmetic` when the machine is quiet, to settle what `float`
+threadgroup tiles cost. It settled more than that.
+
+Two things changed before the run. The cell got a **fourth arm that is the
+first one again** -- `qmm_t` twice, interleaved with the other two, five
+draws, minimum each -- which is the control against itself that every A/B
+here owes and this one did not have. And the machine went quiet: load
+**4.6-5.9** with one foreign core busy, against Phase 39's 9-17 with a VM
+at 209%.
+
+Three draws, because one is not a number and Phase 39 is the phase that
+learned it:
+
+    Q4_K, M = 16384, N = K = 2048, four arms interleaved, 5 draws, minimum each
+
+      arm                                  run 1     run 2     run 3
+      ggml tile, as it ships              12.276    12.269    12.289 ms
+      steel tile, float (exact)           13.360    13.393    13.466
+      steel tile, bf16 (wrong answers)    12.474    12.457    12.834
+      ggml tile again, the same kernel    12.517    12.218    12.937
+
+      float tile against bf16 tile         +7.1%     +7.5%     +4.9%
+      steel bf16 against ggml              +1.6%     +1.5%     +4.4%
+      control: ggml against ggml           +2.0%     -0.4%     +5.3%
+      load, before -> after              5.2->5.2  4.6->5.9  5.9->6.5
+
+### What the control says first
+
+**Run 3 is the cell refusing to answer, and it says so itself.** Its load
+crept to 6.5, its control went to +5.3%, and both effects fell inside it.
+Runs 1 and 2 ran at 4.6-5.9 with controls of +2.0% and -0.4%. The fourth
+arm cost one arm's worth of draws and it is the difference between three
+numbers and two numbers plus a warning.
+
+The other thing the three runs show is that **the minimum is a good
+estimator on this machine and the within-cell spread is not its error
+bar**: the spread column reads 4-13%, while `ggml`'s minimum across three
+whole runs is 12.269 / 12.276 / 12.289 ms -- 0.16% apart. Taking minima
+across all three runs, the instrument's own floor -- the control -- is
+**0.4%**.
+
+### Phase 39's headline was the load
+
+**"A first-draft steel port is 8-19% slower than ggml's tile, sign
+consistent across every draw" does not reproduce.** On a quiet machine it
+is **+1.5%** by minima across runs, against a control floor of 0.4%, and
+within any single run it sits inside the control. The sign was consistent
+in Phase 39 because the machine was consistently loaded.
+
+That *strengthens* the conclusion Phase 39 drew, and replaces its evidence
+with better evidence. The claim was "the eight points Phase 37 attributed
+to mlx's tiling are not collected by swapping `BlockMMA` in". Phase 39
+argued it from a port that was slower, which is a weak way to show that a
+swap buys nothing. This shows it directly: **ggml's loader on steel's
+tiling at mlx's own tile scalar is the same speed as ggml's tiling, to
+within the instrument.** The tiling is not where the eight points are.
+They are in the rest of what mlx's loader does, and nothing in this route
+touches it.
+
+### And the exactness contract is finally separated from its control
+
+    float tiles against bf16 tiles, by arm minima across three runs
+      13.360 / 12.457 = +7.3%,  against a control floor of 0.4%
+
+Sign consistent 3 of 3, and clear of its within-run control in the two
+clean draws (+7.1% and +7.5% against +2.0% and -0.4%). The same contract
+on the *shipping* kernel rather than the stand-in --
+`ORNITH_KQUANT_TILE_HALF`, 32-row tile, both arms -- reads **+4.8%, +3.6%,
++4.8%** across the same three runs, against Phase 38's 3.0-3.6%. Both
+numbers are real and the smaller one is the one that would be paid.
+
+### So the ledger entry, and it is the last one
+
+- **the oracle premise: confirmed again.** `max_abs = 0.000e0`, 4194304 of
+  4194304, three more runs on top of Phase 39's six;
+- **the tiling gain: zero.** +1.5% the wrong way by minima, inside the
+  control within a run. Not "slower", as Phase 39 had it -- *the same*,
+  which is the cleaner refutation;
+- **the exactness tax: +7.3% on the stand-in, +3.6 to +4.8% on the
+  shipping kernel**, measured against a control for the first time;
+- **the prize: zero, and no longer unknown.** A bit-exact steel-tiled
+  k-quant gemm buys nothing from the tiling and pays several points for
+  `float` tiles, so it is slower than what ships. The 8.4% of a chunk
+  Phase 37 bounded this at is real and is somewhere else entirely -- in
+  mlx's loader, which this project was never going to write.
+
+**`ornith_next.md` item 1 is closed, and with it the last open measurement
+in the port.** What remains on that list needs a different machine or a
+different question.
+
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:
