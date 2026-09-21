@@ -18,13 +18,29 @@ Nothing else about FR-Spec changes -- it still cannot alter what the model
 emits, because every committed token is the verify forward's own argmax
 (`src/frspec.rs`).
 
+**Two ways to choose what to add, and the cheaper one is not the better one.**
+
+    # by what a corpus needs
     cd tools && ORNITH_MODEL=~/.mtplx/models/<artifact> python3 merge_frspec.py \
         --min-count 2 --out ../refs/frspec/ids_64k_plus.bin <corpus paths>
 
+    # by what the vocabulary *is* -- no corpus at all
+    cd tools && ORNITH_MODEL=~/.mtplx/models/<artifact> python3 merge_frspec.py \
+        --script cyrillic --out ../refs/frspec/ids_64k_cyr.bin
+
 `--min-count 2` drops the hapaxes: an id seen once in the corpus is a poor bet
 for a list whose job is the *next* text. On 48k tokens of this project's own
-Russian it keeps 2032 of 3339 missing ids, takes coverage 68.6% -> 97.3% and
-grows the list by 3.1%.
+Russian it keeps 2011 of 3317 missing ids, takes coverage 68.2% -> 97.2% and
+grows the list by 3.1% -- **but only on text like the corpus**: on an
+unrelated Russian prompt the same list reaches 68.2% where the original
+reached 43.8%, i.e. half the gap.
+
+`--script cyrillic` does not ask a corpus anything. The vocabulary holds
+**18386 Cyrillic-majority ids and MTPLX's list contains 311 of them**, which
+is the code corpus seen from the other side. Adding all of them costs +27.6%
+of list and reaches **100.0% coverage on both Russian texts**, in-domain and
+out, with English and code untouched. A corpus can only tell you about the
+text it is; the vocabulary tells you about the language.
 
 Point the port at the result with `ORNITH_FRSPEC=<path>`, and measure before
 believing it: the cell is `--mtp-depth 1` with and without `--frspec`, three
@@ -68,6 +84,43 @@ def write_ids(path, ids):
     return len(ids)
 
 
+SCRIPTS = {"cyrillic": lambda c: "\u0430" <= c.lower() <= "\u044f" or c == "\u0451"}
+
+
+def ids_in_script(tok, name):
+    """Every id whose token is majority `name`, read off the vocabulary.
+
+    The tokens come back in byte-level BPE's own alphabet, so they have to be
+    mapped back through it first -- reading them raw finds **zero** Cyrillic
+    ids in a vocabulary that holds 18386 of them, which is what the first
+    version of this did.
+    """
+    want = SCRIPTS.get(name)
+    if want is None:
+        sys.exit(f"--script {name}: known scripts are {sorted(SCRIPTS)}")
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs, n = bs[:], 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    back = dict(zip([chr(c) for c in cs], bs))
+
+    out = set()
+    for i, s in enumerate(tok.convert_ids_to_tokens(list(range(VOCAB)))):
+        if s is None:
+            continue
+        try:
+            text = bytes(back[c] for c in s).decode("utf-8")
+        except (KeyError, UnicodeDecodeError):
+            continue
+        letters = [c for c in text if c.isalpha()]
+        if letters and sum(1 for c in letters if want(c)) / len(letters) > 0.5:
+            out.add(i)
+    return out
+
+
 def texts(paths):
     for p in paths:
         p = pathlib.Path(p)
@@ -81,7 +134,13 @@ def texts(paths):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("corpus", nargs="+", help="files or directories of plain text")
+    ap.add_argument("corpus", nargs="*", help="files or directories of plain text")
+    ap.add_argument(
+        "--script",
+        default=None,
+        help="also add every id whose token is majority this script (cyrillic); "
+        "needs no corpus at all -- see the note above",
+    )
     ap.add_argument("--base", default=str(DEFAULT_BASE))
     ap.add_argument("--out", default=None, help="default: <base>_plus.bin")
     ap.add_argument("--min-count", type=int, default=2)
@@ -90,6 +149,9 @@ def main():
     if not a.model:
         sys.exit("ORNITH_MODEL or --model: the tokenizer comes from the artifact")
     out = a.out or str(pathlib.Path(a.base).with_name(pathlib.Path(a.base).stem + "_plus.bin"))
+
+    if not a.corpus and not a.script:
+        sys.exit("nothing to add: give a corpus, or --script, or both")
 
     base = read_ids(a.base)
     inside = set(base)
@@ -100,6 +162,11 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(a.model)
 
+    script_ids = []
+    if a.script:
+        script_ids = sorted(ids_in_script(tok, a.script) - inside)
+        print(f"  --script {a.script}: {len(script_ids)} ids not already in the list")
+
     seen, files = collections.Counter(), 0
     total = 0
     for f, text in texts(a.corpus):
@@ -109,15 +176,19 @@ def main():
         files += 1
         total += len(ids)
         seen.update(ids)
-    if not total:
+    if a.corpus and not total:
         sys.exit("the corpus tokenized to nothing")
 
+    if not total:
+        print(f"{out}: {write_ids(out, base + script_ids)} ids "
+              f"(+{100 * len(script_ids) / len(base):.1f}%, script only)")
+        return
     covered = sum(v for i, v in seen.items() if i in inside)
     missing = collections.Counter({i: v for i, v in seen.items() if i not in inside})
     keep = sorted(i for i, v in missing.items() if v >= a.min_count)
     after = covered + sum(missing[i] for i in keep)
 
-    n = write_ids(out, base + keep)
+    n = write_ids(out, base + keep + script_ids)
     print(f"corpus: {files} files, {total} tokens")
     print(f"  coverage with {a.base}: {100 * covered / total:.1f}%")
     print(f"  missing ids: {len(missing)} distinct, {len(keep)} of them seen >= {a.min_count}")

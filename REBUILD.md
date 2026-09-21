@@ -8042,7 +8042,7 @@ produced it.
   bit-identical at `max_abs = 0`, on the artifact where both sides can run.
 
 
-## Phase 46 -- a sub-vocabulary that covers the text in front of it, and the half of the gap a local corpus cannot reach -- **PARTIAL: the wall is unmeasured**
+## Phase 46 -- a sub-vocabulary that covers the text in front of it, and the vocabulary that covers the language -- **PARTIAL: the wall is unmeasured**
 
 Phase 43 found that `--frspec` is a property of the text and Phase 43's
 coverage arithmetic said why: acceptance under it is the full head's
@@ -8137,7 +8137,42 @@ list should turn that into the +4-7% it is worth on English. **Predicted and
 unmeasured**, and it needs one quiet sitting: four arms, three interleaved
 draws, autoregression twice as the control.
 
-### What would close the other half
+### What closes the other half is the vocabulary, not a corpus
+
+Asked while the machine was too loaded to measure anything: the missing
+tokens are Russian word-pieces, and *which ids those are* is a property of
+the tokenizer rather than of any corpus. So count them.
+
+    vocabulary 248320 ids
+      cyrillic-majority                     18386  (7.4%)
+      of those, in MTPLX's list               311
+      base + all of them                    83611 ids, +27.6%
+
+**311 of 18386.** That is the code corpus seen from the other side, and it
+explains the whole phenomenon without a frequency table.
+
+    coverage of the emitted text   MTPLX   +corpus   +cyrillic
+      russian, in-domain            65.0%    97.0%     100.0%
+      russian, out-of-domain        43.8%    68.2%     100.0%
+      english prose                100.0%   100.0%     100.0%
+      code                          99.0%    99.0%      99.0%
+
+**The script-based list closes both halves**, including the out-of-domain one
+the corpus could only halve, and it needs no corpus, no generation and no
+judgement about what text is representative. It costs +27.6% of list against
++3.1% -- the draft head goes from 26.4% of the vocabulary to 33.7%, which is
+still a third of what it would read unpruned. `--script cyrillic` in
+`merge_frspec.py`, written into `refs/frspec/ids_64k_cyr.bin`.
+
+**A counting instrument lied first, and the way it lied is worth keeping.**
+The same count run against `convert_ids_to_tokens` output returned **zero**
+Cyrillic ids in a vocabulary that holds 18386, because byte-level BPE hands
+back its own alphabet (`Ð°Ð±`) rather than the text. A zero that *confirms* a
+hypothesis -- "the vocabulary has no Russian, that is why the list has none"
+-- is exactly the shape of wrong answer nobody checks. It was caught only
+because 0.0% of 248320 was too clean to be a measurement.
+
+### What a corpus would still be for
 
 Out-of-domain coverage is 68.2% and the ceiling is what a broader Russian
 corpus would give. The corpus here is 47k tokens of one project's technical

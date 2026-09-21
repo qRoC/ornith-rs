@@ -988,6 +988,16 @@ it where it does not. Byte-identity holds on both lists. **The wall is
 unmeasured**: that sitting was at load 4.3-7.0 and no tok/s figure from it is
 reported.
 
+**And the out-of-domain half closes off the vocabulary rather than off a
+corpus.** 18386 of the 248320 ids are Cyrillic-majority and MTPLX's list holds
+**311** of them, which is the code corpus seen from the other side.
+`merge_frspec.py --script cyrillic` adds all of them for +27.6% of list
+(`refs/frspec/ids_64k_cyr.bin`, 83611 ids, still a third of the vocabulary)
+and reaches **100.0% coverage on both Russian texts**, in-domain and out,
+with English and code untouched. A corpus can only describe the text it is;
+the vocabulary describes the language. Three lists now wait on one quiet
+sitting.
+
 **And it is predictable without running the model.** Acceptance under
 `--frspec` is the full head's acceptance times the fraction of emitted
 tokens that fall inside the 65536 rows: english prose 100.0% coverage and
