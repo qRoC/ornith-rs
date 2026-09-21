@@ -8042,6 +8042,127 @@ produced it.
   bit-identical at `max_abs = 0`, on the artifact where both sides can run.
 
 
+## Phase 46 -- a sub-vocabulary that covers the text in front of it, and the half of the gap a local corpus cannot reach -- **PARTIAL: the wall is unmeasured**
+
+Phase 43 found that `--frspec` is a property of the text and Phase 43's
+coverage arithmetic said why: acceptance under it is the full head's
+acceptance times the fraction of emitted tokens inside the 65536 rows it
+drafts from, and MTPLX's list is ranked on a **code** corpus. English prose
+covers 100.0%, code 99.0%, Russian prose 65%. This builds the obvious fix and
+finds out how far it goes.
+
+### The design: add, never swap
+
+`tools/merge_frspec.py`. The ranks are not in the shipped artifact --
+`dump_frspec.py` says the ids were ranked and **then sorted** -- so there is
+no tail to evict by rank, and evicting by a frequency measured on *this*
+corpus would fit the list to it and quietly lower coverage everywhere else.
+So the merged list is a **superset**: every id MTPLX chose is still there.
+
+That buys a property worth more than the bytes it costs: **English and code
+coverage cannot fall, by construction.** The only price is that the draft
+head reads 3.1% more rows.
+
+    corpus: 46649 tokens of this project's own technical Russian
+            (user_notes/ plus the Russian phase files)
+      coverage with MTPLX's list                68.2%
+      missing ids                       3317 distinct, 2011 seen >= 2
+      coverage with the merged list             97.2%
+      refs/frspec/ids_64k_plus.bin    67547 ids, 0.2720 of the vocabulary
+
+`--min-count 2` drops the hapaxes: an id seen once is a poor bet for a list
+whose job is the *next* text.
+
+### Measured on two Russian texts, because the corpus is one of them
+
+**The corpus includes this project's own writing about speculative decoding,
+and the obvious test prompt asks the model to explain speculative decoding.**
+That is training on the test set, so the cell has two Russian prompts: the
+in-domain one and an unrelated one (a medieval town's water supply). The gap
+between them is the finding.
+
+    acceptance at --mtp-depth 1, three draws, identical in all three
+      text                 no frspec   MTPLX's list   merged list
+        ru, in-domain         0.75         0.48          **0.74**
+        ru, out-of-domain     0.64         0.37          **0.52**
+        english prose         0.65         0.65            0.65
+        code                  0.88         0.88            0.88
+
+**In-domain it recovers 96% of what FR-Spec was giving up** (0.48 -> 0.74
+against a ceiling of 0.75). **Out-of-domain it recovers about half** (0.37 ->
+0.52 against 0.64). English and code do not move, as the superset construction
+promises -- and the Russian arm moving by 0.26 is the counter that says
+`ORNITH_FRSPEC` was honoured at all, which a pair of unchanged numbers could
+not.
+
+Every arm emitted **byte-identical text** -- 993 bytes `16e23946…` on one
+prompt and 1326 `95df918e…` on the other, across all four arms -- which is
+`src/frspec.rs`'s claim that the draft decides how many tokens a cycle
+commits and never which, now checked on a second list.
+
+### The coverage law is a lower bound, and this says by how much
+
+    text          list     coverage   full x coverage   measured
+      ru-in       base       65.0%        0.49            0.48
+      ru-in       plus       97.0%        0.73            0.74
+      ru-out      base       43.8%        0.28            0.37
+      ru-out      plus       68.2%        0.44            0.52
+
+Tight at high coverage and loose at low, always in the same direction: the
+measurement beats the prediction by 0.08-0.09 wherever coverage is poor.
+**The reason is mechanical.** The law assumes the full head is equally good at
+tokens inside and outside the list, and it is not: the tokens outside are the
+*rare* ones, which the full head predicts worse anyway, so pruning them raises
+the conditional hit rate. So the honest statement is
+
+    acceptance(frspec) = coverage x P(full head correct | token in the list)
+                       >= coverage x acceptance(full)
+
+with the bound tight exactly where it matters least.
+
+### What is not measured, and it is the prize
+
+**The wall.** The machine was at load 4.3-7.0 all through this phase -- above
+the project's own "discard above ~6" line -- and the cell behaved accordingly:
+single draws of 45.8 and 37.5 tok/s among otherwise 100-130, which is the
+swap-era signature `REBUILD.md` Phase 42 spent a whole window killing. So
+**no tok/s figure from this phase is reported**, and the only numbers above
+are the ones that cannot move with load: acceptance is deterministic and
+reproduced to the digit in all three draws, byte-identity is byte-identity,
+and coverage is a count.
+
+What that leaves open is the thing the phase was for. Phase 43 measured
+`--frspec` costing 11-19% of the wall on Russian at depths 1-3; the merged
+list should turn that into the +4-7% it is worth on English. **Predicted and
+unmeasured**, and it needs one quiet sitting: four arms, three interleaved
+draws, autoregression twice as the control.
+
+### What would close the other half
+
+Out-of-domain coverage is 68.2% and the ceiling is what a broader Russian
+corpus would give. The corpus here is 47k tokens of one project's technical
+notes -- it covers its own domain and nothing else, which is exactly what the
+in-domain/out-of-domain gap measures. Closing it needs Russian text this
+machine does not have, or text the model generates itself, which is a
+different bet: the sub-vocabulary's job is to cover what the model *emits*,
+so its own output is arguably the right distribution to rank on and costs
+~25 minutes of GPU for 200k tokens.
+
+**And it stays a second list rather than the default.** The port's
+`--frspec` still reads MTPLX's artifact; `ORNITH_FRSPEC=<path>` selects this
+one. Diverging from the artifact is a decision, the same shape as leaving
+`--mtp` at depth 3.
+
+### What was checked
+
+- The suite green: **128 tests, 0 failed, 0 ignored**, `--include-ignored`
+  with `--test-threads=1`. No Rust changed in this phase -- the tool is
+  Python and the list is data -- and the suite is run anyway because the
+  protocol does not have an exception for that.
+- Byte-identity across every arm of every prompt, with the byte count beside
+  every hash, on both lists.
+
+
 ## Disk
 
 84 GB free of 1.9 TB at the time of writing, so the choreography is tight:

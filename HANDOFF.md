@@ -975,6 +975,19 @@ acceptance falls 0.75 -> 0.48 and it costs 11-19%** -- a pruned head cannot
 propose a row it does not have. It is off by default and that is now a
 measured default.
 
+**And the gap is closable, which Phase 46 built and half-measured.**
+`tools/merge_frspec.py` extends the list rather than re-ranking it -- the
+ranks were discarded before the artifact shipped, and a superset cannot lower
+coverage anywhere, so English and code are unchanged **by construction** and
+verified unchanged (0.65 and 0.88 on both lists). 46649 tokens of this
+project's Russian give 2011 ids worth adding at `--min-count 2`, a 3.1% bigger
+list (`refs/frspec/ids_64k_plus.bin`, 67547 ids), and acceptance goes
+**0.48 -> 0.74 in-domain against a ceiling of 0.75, and 0.37 -> 0.52
+out-of-domain against 0.64** -- all of the gap where the corpus fits, half of
+it where it does not. Byte-identity holds on both lists. **The wall is
+unmeasured**: that sitting was at load 4.3-7.0 and no tok/s figure from it is
+reported.
+
 **And it is predictable without running the model.** Acceptance under
 `--frspec` is the full head's acceptance times the fraction of emitted
 tokens that fall inside the 65536 rows: english prose 100.0% coverage and
