@@ -17,9 +17,13 @@ of that and, in numbers, where it is better and where it is not.
 
 **The port is the product; the artifact is an option.**
 
-- On the **same published artifact**, this runtime is **5.5% faster at decode**
-  than `mlx_lm.generate` and **level at prefill**, measured in one sitting on
-  a quiet machine.
+- **Stack against stack, one quiet machine, one sitting: 101.0 tok/s → 133.7,
+  and 154.1 with speculation** — that is `mlx_lm.generate` on the published
+  artifact against this port on ours, **+32%** and **+53%**.
+- Taken apart, that is three separate things and only two of them are ours:
+  on the **same published artifact** this runtime is **5.5% faster at decode**
+  than `mlx_lm.generate` and **level at prefill**; our artifact adds another
+  **25%**; speculation at the measured depth adds the rest.
 - Its **speculative decoding is exact**: `--mtp --greedy` emits *byte-identical*
   text to `--greedy`. That is a correctness property, not a speed one, and it
   is worth **+7 points of acceptance** because it stops charging the draft for
@@ -91,16 +95,34 @@ tiling is slower than mlx's affine gemm at prefill width, and that is the
 price of the format. If your workload is long prompts and short answers, the
 published artifact is the better artifact.
 
-### Against `mlx_lm.generate`, same artifact, same sitting
+### Against `mlx_lm.generate`, same sitting
 
-This is the comparison that isolates the *runtime* from the *artifact*, and
-it is the one that argues for the port:
+Two comparisons, and they answer different questions. The first isolates the
+*runtime* from the *artifact*; the second is the one a user actually chooses
+between:
 
 | on the published artifact | mlx-lm | ornith-rs |
 |---|---:|---:|
 | decode | 100.9 - 101.2 tok/s | **106.4 - 106.8** (+5.5%) |
 | decode, `--mtp-depth 1 --frspec` | — | **133.8 - 134.2** (+32%) |
 | prefill, 6621 tokens | 1837 - 1843 tok/s | 1842 - 1844 (level) |
+
+| whole stack, decode | tok/s | against mlx-lm |
+|---|---:|---:|
+| `mlx_lm.generate` + published artifact | 100.9 - 101.2 | — |
+| ornith-rs + published artifact | 106.4 - 106.8 | +5.5% |
+| ornith-rs + `q6k-full` | **131.6 - 133.7** | **+32%** |
+| ornith-rs + `q6k-full`, `--mtp-depth 1 --frspec` | **149.5 - 154.1** | **+53%** |
+
+mlx-lm has no row on `q6k-full` because it cannot load a k-quant at all.
+
+**One arithmetic trap, since this project fell into the general case of it
+twice.** `HANDOFF.md` records this port at 82-92 tok/s and mlx-lm at 86 in an
+older sitting, and it is tempting to read "86 → 133" as the gain. It is not:
+that sitting ran on a machine carrying 18.5 GB of swap, and **mlx-lm alone
+goes 86 → 101 when the swap is gone**, on unchanged code. Only numbers from
+the same sitting may be subtracted, which is why every row above comes from
+one quiet window with a control against itself. `REBUILD.md` Phase 42.
 
 ---
 
