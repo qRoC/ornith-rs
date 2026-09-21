@@ -17,13 +17,21 @@ of that and, in numbers, where it is better and where it is not.
 
 **The port is the product; the artifact is an option.**
 
-- **Stack against stack, one quiet machine, one sitting: 101.0 tok/s → 133.7,
-  and 154.1 with speculation** — that is `mlx_lm.generate` on the published
-  artifact against this port on ours, **+32%** and **+53%**.
-- Taken apart, that is three separate things and only two of them are ours:
-  on the **same published artifact** this runtime is **5.5% faster at decode**
-  than `mlx_lm.generate` and **level at prefill**; our artifact adds another
-  **25%**; speculation at the measured depth adds the rest.
+**Most of the speed is free, and the part that is not is named.** One quiet
+machine, one sitting, decode:
+
+| | tok/s | against mlx-lm | quality cost |
+|---|---:|---:|---|
+| `mlx_lm.generate` + published artifact | 101.0 | — | — |
+| ornith-rs + published artifact | 106.8 | +5.5% | **none — identical weights** |
+| ornith-rs + published artifact, `--mtp-depth 1 --frspec` | **134.2** | **+33%** | **none — byte-identical output** |
+| ornith-rs + `q6k-full`, same flags | 154.1 | +53% | **this step, and only this step** |
+
+**+33% costs nothing.** Those are the published artifact's own weights: the
+port is bit-exact against MLX, and speculation under `ORNITH_INVARIANT` emits
+text that is *byte-identical* to greedy — checked with `cmp`, not with a
+tolerance. The last **+15%** is the trade: our k-quant artifact against 1.82x
+the median KL and +1.07% of perplexity.
 - Its **speculative decoding is exact**: `--mtp --greedy` emits *byte-identical*
   text to `--greedy`. That is a correctness property, not a speed one, and it
   is worth **+7 points of acceptance** because it stops charging the draft for
@@ -68,8 +76,16 @@ Perplexity over a fixed 6621-token corpus, both pinned:
 | published | 1.847123 | **6.3415** |
 | `q6k-full` (ours) | 1.857753 | 6.4093 |
 
-**+1.07%.** So: on the corpus the two are within a percent; on the probe tail
-they are not, and the published artifact is the more faithful one. It should
+**+1.07%.** Read the three numbers together, because they say different
+things: the **median** gap is 1.82x but both sides are small in absolute
+terms, **perplexity** is within a percent, and the published artifact is lower
+on **42 of 58 probes** — so this is a systematic difference and not one
+outlier. The **tail** is where it stops being modest: 5.12 nats on one probe,
+which is a top-1 flipping from an arithmetic continuation to a paragraph
+break, i.e. a behaviour change rather than a distribution wobble.
+
+Typically somewhat worse, and much worse on one known cliff. The published
+artifact is the more faithful one. It should
 be — it spends 4-bit affine at group 32 on the expert body with 8-bit
 attention, routing, embeddings and head, against our 187 Q4_K + 128 Q6_K +
 41 eight-bit affine modules.
@@ -191,6 +207,7 @@ was taken and then overturned; `HANDOFF.md` is the current state.
 
 | you want | use |
 |---|---|
+| speed at **no** quality cost | the **published artifact**, on this port, `--mtp-depth 1 --frspec` — +33% over mlx-lm on the same weights |
 | the best quality this family has | the **published artifact**, on this port |
 | the fastest decode, and 1% of perplexity is acceptable | **`q6k-full`**, on this port |
 | long prompts, short answers | the **published artifact** (prefill is 17% faster) |
